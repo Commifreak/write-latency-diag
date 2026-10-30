@@ -10,7 +10,7 @@
 # eine temporäre Testdatei in das angegebene Verzeichnis und löschen sie danach.
 #
 
-VERSION="1.0"
+VERSION="1.1"
 
 PASSIVE=""            # Dauer der passiven Beobachtung in Sekunden
 INTERVAL=1
@@ -110,6 +110,7 @@ warn()    { printf '  [!]  %s\n' "$*"; WARN+=("$*"); }
 hint()    { printf '  [?]  %s\n' "$*"; WARN+=("(prüfen) $*"); }
 
 declare -A ROLE
+MDMEMBERS=""          # physische Laufwerke in mdadm-Arrays (für die Auswertung)
 
 # ---------------------------------------------------------------------------
 # Systemcheck
@@ -171,7 +172,7 @@ static_check() {
 
   # Disks
   section "Laufwerke"
-  local p d dev rot sched wc disc ata host spd alpm model fw sm trim sata attrs crc realloc role
+  local p d dev rot sched wc disc ata host spd alpm model fw sm trim sata attrs crc realloc role kind wdsd
   for p in /sys/block/*; do
     d=${p##*/}
     [[ $d =~ $DEVRE ]] || continue
@@ -184,13 +185,25 @@ static_check() {
     model=$(cat "$p/device/model" 2>/dev/null | sed 's/ *$//')
     fw=$(cat "$p/device/rev" "$p/device/firmware_rev" 2>/dev/null | head -1 | sed 's/ *$//')
     role=${ROLE[$d]:-}
+    local real
+    real=$(readlink -f "$p/device" 2>/dev/null)
+    kind=$([ "$rot" = 0 ] && echo SSD || echo HDD)
+    [[ $real == */usb* ]] && kind="USB"
+    sm=""
+    if command -v smartctl >/dev/null 2>&1 && [ "$(id -u)" -eq 0 ]; then
+      sm=$(smartctl -i -A "$dev" 2>/dev/null)
+      local smodel sfw
+      smodel=$(sed -n 's/^\(Device Model\|Model Number\): *//p' <<<"$sm" | head -1)
+      sfw=$(sed -n 's/^Firmware Version: *//p' <<<"$sm" | head -1)
+      [ -n "$smodel" ] && model=$smodel
+      # sysfs liefert bei SATA nur 4 Zeichen der Firmware-Version
+      [ -n "$sfw" ] && fw=$sfw
+    fi
     printf '\n  %s  %s  (%s GB, %s, FW %s)%s\n' "$d" "${model:-?}" \
-      "$(awk '{printf "%.0f", $1*512/1e9}' "$p/size")" "$([ "$rot" = 0 ] && echo SSD || echo HDD)" "${fw:-?}" \
+      "$(awk '{printf "%.0f", $1*512/1e9}' "$p/size")" "$kind" "${fw:-?}" \
       "${role:+  Unraid: $role}"
 
     ata=""; host=""; spd=""; alpm=""
-    local real
-    real=$(readlink -f "$p/device" 2>/dev/null)
     ata=$(grep -o 'ata[0-9]*' <<<"$real" | head -1)
     host=$(grep -o 'host[0-9]*' <<<"$real" | head -1)
     [ -n "$ata" ] && spd=$(cat "/sys/class/ata_link/link${ata#ata}/sata_spd" 2>/dev/null)
@@ -210,21 +223,41 @@ static_check() {
         [ "$rot" = 0 ] && warn "$d: SSD im Unraid-Array ($role). Kein TRIM im Array und jede Schreiboperation erzeugt Paritäts-Read-Modify-Write - SSDs gehören in einen Pool." ;;
     esac
 
-    if command -v smartctl >/dev/null 2>&1 && [ "$(id -u)" -eq 0 ]; then
-      sm=$(smartctl -i -A "$dev" 2>/dev/null)
-      local smodel
-      smodel=$(sed -n 's/^\(Device Model\|Model Number\): *//p' <<<"$sm" | head -1)
-      [ -n "$smodel" ] && model=$smodel
+    if [ -n "$sm" ]; then
       trim=$(sed -n 's/^TRIM Command: *//p' <<<"$sm")
       sata=$(sed -n 's/^SATA Version is: *//p' <<<"$sm")
-      [ -n "$sata$trim" ] && info "SMART: ${smodel:-} ${sata:+| $sata} ${trim:+| TRIM: $trim}"
-      attrs=$(awk '$1 ~ /^(5|9|173|177|194|199|202|231|233|241)$/ && NF >= 10 {printf "%s=%s  ", $2, $10}' <<<"$sm")
+      [ -n "$sata$trim" ] && info "SMART: ${sata:+$sata} ${trim:+| TRIM: $trim}"
+      # SanDisk/WD-SSDs: 173 = Ø Löschzyklen, 233 = NAND-Schreibmenge (GiB), 241 = Host-Schreibmenge (GiB).
+      # Ältere smartctl-Datenbanken kennen die Namen nicht und zeigen falsche/Unknown-Bezeichnungen.
+      wdsd=0
+      grep -qE 'SanDisk|^SD |SDSSD|WDS[0-9]|WD (Blue|Red|Green)' <<<"$model" && [ "$rot" = 0 ] && wdsd=1
+      # Für Verschleiß-Attribute ist der normierte Wert (100 = neu) aussagekräftiger als der Rohwert.
+      attrs=$(awk -v wdsd=$wdsd '$1 ~ /^(5|9|169|173|177|194|199|202|230|231|232|233|234|241)$/ && NF >= 10 {
+          n = $2
+          if (wdsd) { if ($1 == 173) n = "Avg_Erase_Count"; else if ($1 == 230) n = "Media_Wearout"; else if ($1 == 233) n = "NAND_GiB_Written"
+                      else if ($1 == 234) n = "NAND_GiB_Written_SLC"; else if ($1 == 241) n = "Host_GiB_Written" }
+          printf "%s:%s=%s%s  ", $1, n, $10, ($1 ~ /^(169|173|177|202|230|231|232|233)$/ ? " (norm. " ($4 + 0) ")" : "") }' <<<"$sm")
       [ -z "$attrs" ] && attrs=$(grep -E '^(Temperature|Percentage Used|Data Units Written|Media and Data Integrity Errors|Unsafe Shutdowns):' <<<"$sm" | sed 's/  */ /g' | paste -sd'|' -)
       [ -n "$attrs" ] && info "SMART: $attrs"
       crc=$(awk '$1==199 {print $10+0}' <<<"$sm")
       realloc=$(awk '$1==5 {print $10+0}' <<<"$sm")
       [ "${crc:-0}" -gt 0 ] && warn "$d: UDMA_CRC_Error_Count=$crc - Übertragungsfehler (Kabel/Backplane). Fehler kosten Retries und damit Latenz. Steigt der Wert weiter?"
       [ "${realloc:-0}" -gt 0 ] && warn "$d: $realloc reallokierte Sektoren."
+      if [ $wdsd -eq 1 ]; then
+        local nand hostw poh erase
+        nand=$(awk '$1==233 {print $10+0}' <<<"$sm"); hostw=$(awk '$1==241 {print $10+0}' <<<"$sm")
+        poh=$(awk '$1==9 {print $10+0}' <<<"$sm"); erase=$(awk '$1==173 {print $10+0}' <<<"$sm")
+        if [ "${nand:-0}" -gt 0 ] && [ "${hostw:-0}" -gt 0 ]; then
+          awk -v d="$d" -v n="$nand" -v h="$hostw" -v poh="${poh:-0}" -v e="${erase:-}" 'BEGIN {
+            printf "      Schreibverstärkung (WAF = NAND/Host): %.1f", n / h
+            if (poh > 24) printf "   Host %.0f GiB/Tag, NAND %.0f GiB/Tag", h * 24 / poh, n * 24 / poh
+            if (e != "") printf "   Ø Löschzyklen %s", e
+            print "" }'
+          if [ "$nand" -ge $((hostw * 5)) ]; then
+            warn "$d: interne Schreibverstärkung $(awk -v n="$nand" -v h="$hostw" 'BEGIN{printf "%.0f", n/h}')x - die SSD schreibt intern ein Vielfaches dessen, was das System schreibt. Typisch für viele kleine fsync-Schreibzugriffe (Datenbanken, NVR, Logs) auf Consumer-SSDs ohne Power-Loss-Protection: Die SSD ist dauerhaft mit Garbage Collection beschäftigt (Latenzspitzen) und verschleißt schnell."
+          fi
+        fi
+      fi
     fi
 
     if [ "$rot" = 0 ] && grep -qiE 'QVO|BX500|A400|SU630|SU650|660p|665p|670p|Crucial P1|P3 Plus|WD ?Green|WDS[0-9]+G[0-9]A|SSD Plus|SDSSDA|Intenso|NV1|NV2|TM8FP' <<<"$model"; then
@@ -264,8 +297,18 @@ static_check() {
     for md in /sys/block/md*; do
       [ -f "$md/md/level" ] || continue
       lvl=$(cat "$md/md/level")
+      local s mem members=""
+      for s in "$md"/slaves/*; do
+        [ -e "$s" ] || continue
+        mem=${s##*/}
+        [ -e "/sys/block/$mem" ] || mem=$(basename "$(readlink -f "/sys/class/block/$mem/..")")
+        members="$members $mem"
+      done
+      MDMEMBERS="$MDMEMBERS$members"
       info "${md##*/}: $lvl, Bitmap: $(cat "$md/md/bitmap/location" 2>/dev/null || echo none)${lvl:+, }$( [ -f "$md/md/stripe_cache_size" ] && echo "stripe_cache_size=$(cat "$md/md/stripe_cache_size")")"
       case "$lvl" in
+        raid1|raid10|raid5|raid6)
+          info "${md##*/}: jedes fsync/Flush geht an alle Mitglieder (${members# }) - die jeweils langsamste SSD bestimmt die Latenz." ;;&
         raid5|raid6)
           hint "${md##*/} ist $lvl: kleine Schreibzugriffe brauchen Read-Modify-Write für die Parität, und die Paritätsberechnung läuft im Kernel-Thread ${md##*/}_$lvl (CPU). Für viele kleine/Sync-Writes ist RAID10 deutlich schneller."
           if [ "$(cat "$md/md/stripe_cache_size" 2>/dev/null || echo 0)" -le 256 ]; then
@@ -439,6 +482,7 @@ function interval(dt,   c, t, b, busy, iow, maxc, maxcn, dtot, pc, pis, pif, p, 
   }
 
   maxdevt = 0; totw = 0
+  delete I_stall; delete I_fast
   for (i = 1; i <= Ndev; i++) {
     d = Dlist[i]
     if (!(d in Dp_wios)) continue
@@ -470,9 +514,11 @@ function interval(dt,   c, t, b, busy, iow, maxc, maxcn, dtot, pc, pis, pif, p, 
       # langsam ist hohe Latenz bei wenig Durchsatz.
       if (dw >= 5 && ((wa >= 10 && wmbs < 100) || (wa >= 50 && wmbs < 200) || wa >= 1000)) flag = "<< LANGSAM"
       if (df >= 3 && fa >= 20) flag = "<< LANGSAM (Flush)"
-      if (flag != "") { A_stall[d]++; Nstall++ }
-      if (dw >= 5 && wa > A_wamax[d]) A_wamax[d] = wa
-      if (df >= 3 && fa > A_famax[d]) A_famax[d] = fa
+      # Wenige Anfragen, die aber hunderte ms hängen, während das Gerät voll belegt ist: Stall im Gerät.
+      if (flag == "" && util >= 50 && ((dw > 0 && wa >= 200) || (df > 0 && fa >= 200))) flag = "<< LANGSAM (Stall)"
+      if (flag != "") { A_stall[d]++; Nstall++; I_stall[d] = 1 } else I_fast[d] = 1
+      if ((dw >= 5 || wa >= 200) && wa > A_wamax[d]) A_wamax[d] = wa
+      if ((df >= 3 || fa >= 200) && fa > A_famax[d]) A_famax[d] = fa
       if (wmbs > 5) { A_tpn[d]++; A_tp[d, A_tpn[d]] = wmbs }
       if (!quiet)
         printf "   %-8s W %6.1f MB/s %6.0f/s %4.0fK  await %7.2f ms | Flush %4.0f/s %7.2f ms | R %6.1f MB/s | util %3.0f%% qd %4.1f %s\n",
@@ -482,6 +528,8 @@ function interval(dt,   c, t, b, busy, iow, maxc, maxcn, dtot, pc, pis, pif, p, 
       tclock, phase, d, wmbs, dw / dt, wa, df / dt, fa, rmbs, util, aqu, busy, iow, maxc, pc, pis, pif, TopName >> csv
   }
   if (totw >= 5) { Nact++; S_devt += (maxdevt > 100 ? 100 : maxdevt) }
+  # Intervalle, in denen ein Gerät hängt, während ein anderes gleichzeitig schnell antwortet
+  for (d in I_stall) for (i in I_fast) { Nsplit++; break }
 }
 function load_app(f,   line, a) {
   while ((getline line < f) > 0) if (split(line, a, "=") == 2) APP[a[1]] = a[2]
@@ -575,6 +623,19 @@ function summary(   i, d, k, n, x, aw, af, minaw, bf, first, last, tn, tops, wgb
         add("SSD", 2, sprintf("%s: Schreibrate fällt bei Dauerlast von %.0f auf %.0f MB/s - typisch für vollen SLC-Cache (QLC/TLC-Consumer-SSD) oder fehlendes TRIM.", d, first, last))
     }
   }
+  n = 0; dl = ""; x = 0
+  for (i = 1; i <= Ndev; i++) {
+    d = Dlist[i]
+    if (A_stall[d] > 0) { n++; dl = dl (dl == "" ? "" : ", ") d; if ((" " mdmembers " ") ~ (" " d " ")) x++ }
+  }
+  if (Nsplit > 0) {
+    if (n >= 2)
+      add("SSD", 1, sprintf("Die Stalls wechseln zwischen mehreren SSDs (%s), während die übrigen gleichzeitig schnell antworten. Das Gerät selbst hält an (interne Garbage Collection/Firmware) - kein Kabel-, Controller- oder CPU-Problem, und eher Modell-/Lastverhalten als ein einzelnes defektes Laufwerk.", dl))
+    else
+      add("SSD", 1, sprintf("Nur %s hängt, während die übrigen SSDs gleichzeitig schnell antworten - dieses Laufwerk gezielt prüfen (Firmware, Verschleiß, Kabel/Port tauschen).", dl))
+    if (x >= 1)
+      add("SSD", 0, "Im mdadm-RAID wartet jedes fsync auf alle Mitglieder: ein Stall auf irgendeiner SSD bremst das ganze Array. Mit mehr SSDs im Verbund steigt die Wahrscheinlichkeit, dass gerade eine davon hängt.")
+  }
   if (N_pi && S_pif / N_pi >= 10 && Nstall > 0) add("SSD", 1, sprintf("PSI io full Ø %.0f%%: Prozesse sind regelmäßig komplett durch IO blockiert.", S_pif / N_pi))
 
   if (mode != "passive" && TOP1 ~ /^(fio|dd)$/) sat = 0   # Testwerkzeug selbst lastet den Kern aus
@@ -640,7 +701,7 @@ start_sampler() { # label mode duration appfile
   rm -f "$CUR_STOP"
   ( trap '' INT; exec awk -v devre="$DEVRE" -v hz="$HZ" -v interval_arg="$INTERVAL" -v duration="$3" \
       -v stopfile="$CUR_STOP" -v csv="$CSV" -v phase="$PHASE_N" -v label="$1" -v mode="$2" \
-      -v appfile="$4" -v sumfile="$OUT/phase$PHASE_N.sum" -v quiet=0 -f "$OUT/sampler.awk" ) &
+      -v appfile="$4" -v sumfile="$OUT/phase$PHASE_N.sum" -v mdmembers="$MDMEMBERS" -v quiet=0 -f "$OUT/sampler.awk" ) &
   SAMPLER=$!
   SUMFILES+=("$OUT/phase$PHASE_N.sum")
 }

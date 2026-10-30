@@ -60,6 +60,8 @@ Report und Messwerte (`samples.csv`, eine Zeile pro Sekunde und Gerät) liegen u
 | **w_await / Flush-Latenz** pro SSD | Die Latenz, die das Gerät selbst liefert. Flush ist das, worauf `fsync` wartet. Richtwerte: gute SATA-SSD < 2 ms, Enterprise-SSD mit PLP < 0,1 ms. |
 | **LANGSAM-Intervalle** | Hohe Latenz bei geringem Durchsatz, also ein echter Einbruch und kein normaler Warteschlangenstau. |
 | **Ausreißer-SSD** | Eine SSD ist deutlich langsamer als die anderen. Dann dieses Laufwerk prüfen (Firmware, Verschleiß, Kabel). |
+| **Wechselnde Stalls** | Mal hängt die eine SSD, mal die andere, während die übrigen im selben Moment schnell antworten. Das Gerät hält intern an (Garbage Collection, Firmware). Ein einzelner Defekt ist das nicht, eher ein Modell- oder Lastproblem. Im mdadm-RAID wartet jedes `fsync` auf alle Mitglieder, darum bremst jeder Stall einer einzelnen SSD das ganze Array. |
+| **Schreibverstärkung (WAF)** | Bei SanDisk/WD-SSDs berechnet aus SMART 233 (NAND-GiB) und 241 (Host-GiB). Normal sind etwa 1–3. Werte ab 5 bedeuten, dass die SSD intern ein Vielfaches neu schreibt. Typisch ist das für viele kleine `fsync`-Schreibzugriffe auf Consumer-SSDs ohne PLP. Folgen sind Dauer-Garbage-Collection, Latenzspitzen und schneller Verschleiß. |
 | **Kern ≥ 95 % / PSI cpu** | Ein einzelner Thread ist der Engpass, oder Prozesse warten auf CPU-Zeit. |
 | **Top-Prozesse** | `md0_raid5`/`md0_raid6` steht für die RAID-Paritätsberechnung, `kcryptd`/`dmcrypt_write` für LUKS, `z_wr_*` für ZFS, `md0_resync` für einen laufenden RAID-Check. |
 | **iowait** | Das ist **keine** CPU-Last. Die CPU wartet auf IO. |
@@ -79,6 +81,10 @@ Report und Messwerte (`samples.csv`, eine Zeile pro Sekunde und Gerät) liegen u
 - **Einbruch bei Dauerlast**: Die SSD ist eine QLC- oder DRAM-lose SSD, oder TRIM fehlt.
   `systemctl enable --now fstrim.timer` aktivieren. Bei mdadm muss TRIM durch alle Schichten durchgereicht
   werden (`lsblk --discard`).
+- **Hohe Schreibverstärkung**: Ursache sind viele kleine Sync-Schreibzugriffe (Datenbanken, NVR wie Frigate,
+  Logs). Abhilfe: die Sync-Last verringern (z.B. Aufnahmen auf eigene Disks, Datenbank-`fsync`-Einstellungen
+  prüfen), Over-Provisioning (10–20 % unpartitioniert lassen) oder Enterprise-SSDs mit PLP verwenden. Die bestätigen
+  einen Flush sofort aus dem geschützten Cache.
 - **CRC-Fehler / ATA-Resets im dmesg**: Kabel, Backplane oder Port prüfen.
 - **Großer Dirty-Puffer**: Viele GB RAM mit `vm.dirty_ratio=20` bauen große Writeback-Stöße auf. Ein kleinerer
   `vm.dirty_bytes`-Wert glättet sie.
