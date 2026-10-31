@@ -10,7 +10,7 @@
 # eine temporäre Testdatei in das angegebene Verzeichnis und löschen sie danach.
 #
 
-VERSION="1.1"
+VERSION="1.2"
 
 PASSIVE=""            # Dauer der passiven Beobachtung in Sekunden
 INTERVAL=1
@@ -20,6 +20,9 @@ SEQ_SIZE=""
 OUTBASE="/tmp"
 DEVRE='^(sd[a-z]+|nvme[0-9]+n[0-9]+|vd[a-z]+|xvd[a-z]+)$'
 SKIP_STATIC=0
+QUIET=0
+TRACE=1
+STATE_DIR="/var/lib/write-latency-diag"   # SMART-Verlauf für die aktuelle Schreibverstärkung
 TARGETS=()
 
 usage() {
@@ -42,16 +45,19 @@ Aufruf: $0 [Optionen]
   -D REGEX   Nur diese Geräte beobachten (Standard: $DEVRE)
   -o DIR     Basisverzeichnis für Report/CSV (Standard: $OUTBASE)
   -n         Systemcheck überspringen
+  -q         Nur auffällige Intervalle ausgeben (für lange Läufe)
+  -T         Kein bpftrace-Tracing (fsync-Aufrufer, beendete Prozesse)
   -h         Hilfe
 
 Beispiele:
   $0 -d 300
+  $0 -d 86400 -q -i 5
   $0 -t /srv/.lattest
   $0 -t /srv/.lattest -S 30G
 EOF
 }
 
-while getopts "d:t:r:S:i:D:o:nh" opt; do
+while getopts "d:t:r:S:i:D:o:nqTh" opt; do
   case $opt in
     d) PASSIVE=$OPTARG ;;
     t) TARGETS+=("${OPTARG%/}") ;;
@@ -61,6 +67,8 @@ while getopts "d:t:r:S:i:D:o:nh" opt; do
     D) DEVRE=$OPTARG ;;
     o) OUTBASE=$OPTARG ;;
     n) SKIP_STATIC=1 ;;
+    q) QUIET=1 ;;
+    T) TRACE=0 ;;
     h) usage; exit 0 ;;
     *) usage; exit 1 ;;
   esac
@@ -85,6 +93,8 @@ done
 
 HAVE_FIO=0
 command -v fio >/dev/null 2>&1 && [ -z "${NO_FIO:-}" ] && HAVE_FIO=1
+HAVE_BT=0
+[ $TRACE -eq 1 ] && [ "$(id -u)" -eq 0 ] && command -v bpftrace >/dev/null 2>&1 && HAVE_BT=1
 HZ=$(getconf CLK_TCK 2>/dev/null || echo 100)
 
 OUT="$OUTBASE/wlat-$(date +%Y%m%d-%H%M%S)"
@@ -111,6 +121,33 @@ hint()    { printf '  [?]  %s\n' "$*"; WARN+=("(prüfen) $*"); }
 
 declare -A ROLE
 MDMEMBERS=""          # physische Laufwerke in mdadm-Arrays (für die Auswertung)
+
+# Die SMART-Zähler gelten für die ganze Lebensdauer. Jeder Lauf speichert sie, damit der
+# nächste Lauf die Schreibverstärkung seit dem letzten Messpunkt zeigt (aktueller Zustand).
+waf_history() { # dev serial num den host_gib nand_in_gib(0/1)
+  local f="$STATE_DIR/smart-history.csv" now prev
+  [ -n "$2" ] || return
+  now=$(date +%s)
+  # bevorzugt einen Messpunkt >= 12 h alt, sonst >= 1 h
+  [ -r "$f" ] && prev=$(awk -F, -v s="$2" -v now="$now" '$2 == s {
+      if (now - $1 >= 43200) l12 = $0; else if (now - $1 >= 3600) l1 = $0 }
+      END { print (l12 != "" ? l12 : l1) }' "$f")
+  if [ -n "$prev" ]; then
+    awk -F, -v now="$now" -v num="$3" -v den="$4" -v host="$5" -v gib="$6" -v l="$prev" 'BEGIN {
+      split(l, p, ","); h = (now - p[1]) / 3600
+      dn = num - p[3]; dd = den - p[4]; dh = host - p[5]
+      c = "date -d @" p[1] " \"+%F %H:%M\""; c | getline ts; close(c)
+      printf "      Seit %s (%.0f h): Host +%.0f GiB", ts, h, dh
+      if (gib) printf ", NAND +%.0f GiB", dn
+      if (dd > 0) printf "  =>  WAF in diesem Zeitraum %.1f", dn / dd
+      printf "   (Host %.0f GiB/Tag)\n", dh * 24 / h
+      exit (dd > 0 && dn >= 5 * dd) ? 3 : 0 }'
+    [ $? -eq 3 ] && warn "$1: Auch aktuell (seit dem letzten Messpunkt) hohe Schreibverstärkung - die Ursache besteht weiter."
+  else
+    info "Verlauf: Messpunkt gespeichert ($f). Der nächste Lauf (frühestens in 1 h, aussagekräftig ab ~12 h) zeigt die aktuelle WAF."
+  fi
+  mkdir -p "$STATE_DIR" 2>/dev/null && printf '%s,%s,%s,%s,%s\n' "$now" "$2" "$3" "$4" "$5" >> "$f"
+}
 
 # ---------------------------------------------------------------------------
 # Systemcheck
@@ -218,6 +255,17 @@ static_check() {
     fi
     [ "$rot" = 0 ] && [ "${disc:-0}" -eq 0 ] && hint "$d: Gerät/Schicht meldet kein TRIM - ohne TRIM werden SSDs bei Schreiblast langsamer."
     [ "$wc" = "write through" ] && [ "$rot" = 0 ] && hint "$d: Schreibcache ist 'write through' (aus) - deutlich langsamere Schreibzugriffe."
+    # Der Schreibcache-Schalter (SET FEATURES) ist laut ATA-Standard flüchtig: Nach dem Einschalten
+    # gilt die Werkseinstellung des Laufwerks, und manche BIOS/UEFI schalten ihn beim Start ab.
+    if [[ $d == sd* ]] && [ "$kind" != USB ] && [ "$(id -u)" -eq 0 ] && command -v hdparm >/dev/null 2>&1; then
+      local hw
+      hw=$(hdparm -W "$dev" 2>/dev/null | sed -n 's/.*write-caching *= *\([01]\).*/\1/p')
+      if [ "$hw" = 0 ]; then
+        warn "$d: Schreibcache im Laufwerk ist AUS (hdparm -W) - jeder Schreibzugriff geht direkt in den Flash: langsam und bei Consumer-SSDs sehr hohe Schreibverstärkung. Einschalten: hdparm -W1 $dev (gilt nur bis zum nächsten Kaltstart; prüfen, ob das BIOS ihn abschaltet, bei HPE z.B. 'Drive Write Cache' in den SATA-Optionen)."
+      elif [ "$hw" = 1 ] && [ "$wc" = "write through" ]; then
+        warn "$d: Das Laufwerk hat den Schreibcache AN, der Kernel hält ihn aber für aus ('write through') und schickt deshalb keine Flushes - bei Stromausfall droht Datenverlust. Abhilfe: echo 1 > /sys/block/$d/device/rescan"
+      fi
+    fi
     case "$role" in
       */Parity|*/Data)
         [ "$rot" = 0 ] && warn "$d: SSD im Unraid-Array ($role). Kein TRIM im Array und jede Schreiboperation erzeugt Paritäts-Read-Modify-Write - SSDs gehören in einen Pool." ;;
@@ -243,20 +291,34 @@ static_check() {
       realloc=$(awk '$1==5 {print $10+0}' <<<"$sm")
       [ "${crc:-0}" -gt 0 ] && warn "$d: UDMA_CRC_Error_Count=$crc - Übertragungsfehler (Kabel/Backplane). Fehler kosten Retries und damit Latenz. Steigt der Wert weiter?"
       [ "${realloc:-0}" -gt 0 ] && warn "$d: $realloc reallokierte Sektoren."
+      # Schreibverstärkung: WAF = num/den, host = Host-Schreibmenge in GiB.
+      # SanDisk/WD: 233 NAND-GiB / 241 Host-GiB. Crucial/Micron: (247 Host- + 248 FTL-Pages) / 247, Host über 246 (LBAs).
+      local nand hostw poh erase num="" den="" hgib="" serial
+      poh=$(awk '$1==9 {print $10+0}' <<<"$sm")
+      serial=$(sed -n 's/^Serial Number: *//p' <<<"$sm" | head -1)
       if [ $wdsd -eq 1 ]; then
-        local nand hostw poh erase
         nand=$(awk '$1==233 {print $10+0}' <<<"$sm"); hostw=$(awk '$1==241 {print $10+0}' <<<"$sm")
-        poh=$(awk '$1==9 {print $10+0}' <<<"$sm"); erase=$(awk '$1==173 {print $10+0}' <<<"$sm")
+        erase=$(awk '$1==173 {print $10+0}' <<<"$sm")
         if [ "${nand:-0}" -gt 0 ] && [ "${hostw:-0}" -gt 0 ]; then
-          awk -v d="$d" -v n="$nand" -v h="$hostw" -v poh="${poh:-0}" -v e="${erase:-}" 'BEGIN {
+          num=$nand; den=$hostw; hgib=$hostw
+          awk -v n="$nand" -v h="$hostw" -v poh="${poh:-0}" -v e="${erase:-}" 'BEGIN {
             printf "      Schreibverstärkung (WAF = NAND/Host): %.1f", n / h
             if (poh > 24) printf "   Host %.0f GiB/Tag, NAND %.0f GiB/Tag", h * 24 / poh, n * 24 / poh
             if (e != "") printf "   Ø Löschzyklen %s", e
             print "" }'
-          if [ "$nand" -ge $((hostw * 5)) ]; then
-            warn "$d: interne Schreibverstärkung $(awk -v n="$nand" -v h="$hostw" 'BEGIN{printf "%.0f", n/h}')x - die SSD schreibt intern ein Vielfaches dessen, was das System schreibt. Typisch für viele kleine fsync-Schreibzugriffe (Datenbanken, NVR, Logs) auf Consumer-SSDs ohne Power-Loss-Protection: Die SSD ist dauerhaft mit Garbage Collection beschäftigt (Latenzspitzen) und verschleißt schnell."
-          fi
         fi
+      elif grep -q 'FTL_Program_Page_Count' <<<"$sm"; then
+        read -r num den hgib < <(awk '$1==247 {h=$10} $1==248 {f=$10} $1==246 {l=$10}
+          END { if (h > 0) printf "%.0f %.0f %.1f\n", h + f, h, l * 512 / 2^30 }' <<<"$sm")
+        [ -n "$den" ] && awk -v n="$num" -v h="$den" -v g="$hgib" -v poh="${poh:-0}" 'BEGIN {
+            printf "      Schreibverstärkung (WAF = (Host+FTL-Pages)/Host-Pages): %.1f", n / h
+            if (poh > 24) printf "   Host %.0f GiB/Tag", g * 24 / poh
+            print "" }'
+      fi
+      if [ -n "$den" ]; then
+        awk -v n="$num" -v h="$den" 'BEGIN { exit !(n >= 5 * h) }' &&
+          warn "$d: interne Schreibverstärkung $(awk -v n="$num" -v h="$den" 'BEGIN{printf "%.0f", n/h}')x - die SSD schreibt intern ein Vielfaches dessen, was das System schreibt. Typisch für viele kleine fsync-Schreibzugriffe (Datenbanken, NVR, Logs) auf Consumer-SSDs ohne Power-Loss-Protection: Die SSD ist dauerhaft mit Garbage Collection beschäftigt (Latenzspitzen) und verschleißt schnell."
+        waf_history "$d" "$serial" "$num" "$den" "$hgib" "$wdsd"
       fi
     fi
 
@@ -306,6 +368,21 @@ static_check() {
       done
       MDMEMBERS="$MDMEMBERS$members"
       info "${md##*/}: $lvl, Bitmap: $(cat "$md/md/bitmap/location" 2>/dev/null || echo none)${lvl:+, }$( [ -f "$md/md/stripe_cache_size" ] && echo "stripe_cache_size=$(cat "$md/md/stripe_cache_size")")"
+      # RAID10 near-Layout: aufeinanderfolgende Slots bilden Spiegelgruppen, die immer dieselben Daten bekommen
+      if [ "$lvl" = raid10 ]; then
+        local layout nc ndev groups
+        layout=$(cat "$md/md/layout" 2>/dev/null); ndev=$(cat "$md/md/raid_disks" 2>/dev/null)
+        nc=$(( ${layout:-0} & 255 ))
+        if [ "$nc" -ge 2 ] && [ $(( (${layout:-0} >> 8) & 255 )) -eq 1 ] && [ "${ndev:-0}" -gt 0 ] && [ $((ndev % nc)) -eq 0 ]; then
+          groups=$(for s in "$md"/md/dev-*; do
+              sl=$(cat "$s/slot" 2>/dev/null); part=${s##*/dev-}
+              [[ $sl =~ ^[0-9]+$ ]] || continue
+              [ -e "/sys/block/$part" ] || part=$(basename "$(readlink -f "/sys/class/block/$part/..")")
+              echo "$((sl / nc)) $part"
+            done | sort -n | awk '{ g[$1] = g[$1] (g[$1] == "" ? "" : "+") $2 } END { for (i = 0; i in g; i++) printf "%s%s", (i ? ", " : ""), g[i] }')
+          [ -n "$groups" ] && info "${md##*/}: Spiegelgruppen (bekommen jeweils dieselben Schreibzugriffe): $groups"
+        fi
+      fi
       case "$lvl" in
         raid1|raid10|raid5|raid6)
           info "${md##*/}: jedes fsync/Flush geht an alle Mitglieder (${members# }) - die jeweils langsamste SSD bestimmt die Latenz." ;;&
@@ -391,7 +468,7 @@ function norm_comm(c) {
   return c
 }
 function read_procs(   cmd, pid, f, line, lp, a) {
-  delete P_cur
+  delete P_cur; delete P_wb
   cmd = "ls /proc 2>/dev/null"
   while ((cmd | getline pid) > 0) {
     if (pid !~ /^[0-9]+$/) continue
@@ -401,11 +478,18 @@ function read_procs(   cmd, pid, f, line, lp, a) {
       if (lp > 0 && match(line, /\)[^)]*$/)) {
         P_comm[pid] = norm_comm(substr(line, lp + 1, RSTART - lp - 1))
         split(substr(line, RSTART + 2), a, " ")
+        P_ppid[pid] = a[2]
         P_cur[pid] = a[12] + a[13]
       }
     }
     close(f)
   }
+  close(cmd)
+  # Schreibmenge je Prozess (inkl. beendeter Kindprozesse, die er abgeräumt hat); nur als root vollständig.
+  # Über grep statt getline: mawk bricht bei Lesefehlern (EACCES) auf /proc/<pid>/io komplett ab.
+  cmd = "grep -s -H \"^write_bytes\" /proc/[0-9]*/io"
+  while ((cmd | getline line) > 0)
+    if (split(line, a, "/") >= 4) { sub(/.* /, "", line); P_wb[a[3]] = line + 0 }
   close(cmd)
 }
 function sample() {
@@ -421,8 +505,9 @@ function remember(   k) {
     Dp_wios[k] = D_wios[k]; Dp_wsec[k] = D_wsec[k]; Dp_wtk[k] = D_wtk[k]
     Dp_iot[k] = D_iot[k]; Dp_tiq[k] = D_tiq[k]; Dp_fios[k] = D_fios[k]; Dp_ftk[k] = D_ftk[k]
   }
-  delete P_prev
+  delete P_prev; delete P_wbp
   for (k in P_cur) P_prev[k] = P_cur[k]
+  for (k in P_wb) { P_wbp[k] = P_wb[k]; if (!(k in P_first)) P_first[k] = P_wb[k] }
   Pc_p = Pc; Pis_p = Pis; Pif_p = Pif
 }
 function pct(cur, prev, dt,   v) {
@@ -443,9 +528,21 @@ function top3(arr, dt,   k, best, bv, s, j, used) {
   }
   return s
 }
+function topw(arr, dt, n,   k, best, bv, s, j, used) {
+  s = ""; TopW = "-"; TopWmbs = 0
+  for (j = 1; j <= n; j++) {
+    best = ""; bv = 0
+    for (k in arr) if (!(k in used) && arr[k] > bv) { bv = arr[k]; best = k }
+    if (best == "" || bv / 1048576 / dt < 0.05) break
+    used[best] = 1
+    s = s (s == "" ? "" : ", ") best " " sprintf("%.1f MB/s", bv / 1048576 / dt)
+    if (j == 1) { TopW = best; TopWmbs = bv / 1048576 / dt }
+  }
+  return s
+}
 function interval(dt,   c, t, b, busy, iow, maxc, maxcn, dtot, pc, pis, pif, p, dd, top, i, d,
                   dw, dws, dwt, dr, drs, drt, df, dft, diot, dtiq, wmbs, rmbs, wa, fa, util, devt, aqu, reqkb,
-                  flag, maxdevt, totw, tclock) {
+                  flag, maxdevt, totw, tclock, buf, iflag, wtop, k, V) {
   N++
   dtot = C_tot["cpu"] - Cp_tot["cpu"]
   busy = 0; iow = 0
@@ -474,12 +571,34 @@ function interval(dt,   c, t, b, busy, iow, maxc, maxcn, dtot, pc, pis, pif, p, 
   }
   top = top3(Cd, dt)
 
-  tclock = clock()
-  if (!quiet) {
-    if ((N - 1) % 20 == 0)
-      printf "%-8s %5s %11s %6s %7s %13s   %s\n", "Zeit", "CPU", "max.Kern", "iowait", "PSIcpu", "PSIio s/f", "Top-Prozesse (% eines Kerns)"
-    printf "%-8s %4.0f%% %5.0f%%(c%-3s) %5.0f%% %7s %6s/%-6s   %s\n", tclock, busy, maxc, substr(maxcn, 4), iow, fp(pc), fp(pis), fp(pif), top
+  # Beim Ende eines Prozesses rechnet der Kernel seine gesamte Schreibmenge dem abräumenden Elternprozess zu.
+  # Was bereits beim Kind gezählt wurde, wird dort wieder abgezogen, damit nichts doppelt erscheint.
+  # Kinder vor ihren Eltern abarbeiten, falls beide im selben Intervall enden (z.B. timeout -> dd).
+  delete V
+  for (p in P_wbp) if (!(p in P_wb) && (p in P_first)) V[p] = 1
+  for (i = 0; i < 50; i++) {
+    c = 0
+    for (p in V) {
+      for (k in V) if (P_ppid[k] == p) break
+      if (k in V && P_ppid[k] == p) continue
+      Cred[P_ppid[p]] += P_wbp[p] - P_first[p] + Cred[p]
+      delete Cred[p]; delete P_first[p]; delete P_ppid[p]; delete V[p]; c++
+    }
+    if (c == 0) break
   }
+  delete Wd
+  for (p in P_wb) if (p in P_wbp) {
+    dd = P_wb[p] - P_wbp[p]
+    if (dd > 0 && Cred[p] > 0) { c = (Cred[p] < dd) ? Cred[p] : dd; dd -= c; Cred[p] -= c }
+    if (dd > 0) { Wd[P_comm[p]] += dd; Wtot[P_comm[p]] += dd }
+  }
+  wtop = topw(Wd, dt, 3)
+
+  # Ausgabe sammeln: mit -q nur Intervalle zeigen, in denen ein Gerät auffällt
+  tclock = clock()
+  buf = sprintf("%-8s %4.0f%% %5.0f%%(c%-3s) %5.0f%% %7s %6s/%-6s   %s\n", tclock, busy, maxc, substr(maxcn, 4), iow, fp(pc), fp(pis), fp(pif), top)
+  if (wtop != "") buf = buf "   schreibt: " wtop "\n"
+  iflag = 0
 
   maxdevt = 0; totw = 0
   delete I_stall; delete I_fast
@@ -516,16 +635,23 @@ function interval(dt,   c, t, b, busy, iow, maxc, maxcn, dtot, pc, pis, pif, p, 
       if (df >= 3 && fa >= 20) flag = "<< LANGSAM (Flush)"
       # Wenige Anfragen, die aber hunderte ms hängen, während das Gerät voll belegt ist: Stall im Gerät.
       if (flag == "" && util >= 50 && ((dw > 0 && wa >= 200) || (df > 0 && fa >= 200))) flag = "<< LANGSAM (Stall)"
-      if (flag != "") { A_stall[d]++; Nstall++; I_stall[d] = 1 } else I_fast[d] = 1
+      if (flag != "") { A_stall[d]++; Nstall++; I_stall[d] = 1; iflag = 1 } else I_fast[d] = 1
       if ((dw >= 5 || wa >= 200) && wa > A_wamax[d]) A_wamax[d] = wa
       if ((df >= 3 || fa >= 200) && fa > A_famax[d]) A_famax[d] = fa
       if (wmbs > 5) { A_tpn[d]++; A_tp[d, A_tpn[d]] = wmbs }
-      if (!quiet)
-        printf "   %-8s W %6.1f MB/s %6.0f/s %4.0fK  await %7.2f ms | Flush %4.0f/s %7.2f ms | R %6.1f MB/s | util %3.0f%% qd %4.1f %s\n",
-          d, wmbs, dw / dt, reqkb, wa, df / dt, fa, rmbs, util, aqu, flag
+      buf = buf sprintf("   %-8s W %6.1f MB/s %6.0f/s %4.0fK  await %7.2f ms | Flush %4.0f/s %7.2f ms | R %6.1f MB/s | util %3.0f%% qd %4.1f %s\n",
+          d, wmbs, dw / dt, reqkb, wa, df / dt, fa, rmbs, util, aqu, flag)
     }
-    printf "%s,%s,%s,%.2f,%.1f,%.3f,%.1f,%.3f,%.2f,%.1f,%.2f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%s\n",
-      tclock, phase, d, wmbs, dw / dt, wa, df / dt, fa, rmbs, util, aqu, busy, iow, maxc, pc, pis, pif, TopName >> csv
+    printf "%s,%s,%s,%.2f,%.1f,%.3f,%.1f,%.3f,%.2f,%.1f,%.2f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%s,%s,%.2f\n",
+      tclock, phase, d, wmbs, dw / dt, wa, df / dt, fa, rmbs, util, aqu, busy, iow, maxc, pc, pis, pif, TopName, TopW, TopWmbs >> csv
+  }
+  if (iflag) { Nslow++; for (k in Wd) Wslow[k] += Wd[k] }
+  if (!quiet || iflag) {
+    if (Nprinted % 20 == 0)
+      printf "%-8s %5s %11s %6s %7s %13s   %s\n", "Zeit", "CPU", "max.Kern", "iowait", "PSIcpu", "PSIio s/f", "Top-Prozesse (% eines Kerns)"
+    Nprinted++
+    printf "%s", buf
+    fflush()
   }
   if (totw >= 5) { Nact++; S_devt += (maxdevt > 100 ? 100 : maxdevt) }
   # Intervalle, in denen ein Gerät hängt, während ein anderes gleichzeitig schnell antwortet
@@ -539,7 +665,7 @@ function add(side, pts, msg) {
   if (side == "SSD") Sd += pts; else if (side == "CPU") Sc += pts; else { Sd += pts; Sc += pts }
   Fn++; F[Fn] = sprintf("  [%s] %s", side, msg)
 }
-function summary(   i, d, k, n, x, aw, af, minaw, bf, first, last, tn, tops, wgb, busy, sat, verdict, cnt, avgp, dl, tpa) {
+function summary(   i, d, k, n, x, aw, af, minaw, bf, first, last, tn, tops, wgb, busy, sat, verdict, cnt, avgp, dl, tpa, nst) {
   printf "\n--- Auswertung: %s (%d Messpunkte à %ss) ---\n", label, N, interval_s
   if (N < 2) { print "  Zu wenige Messpunkte."; return }
   busy = S_busy / N; sat = 100 * Nsat / N
@@ -559,6 +685,34 @@ function summary(   i, d, k, n, x, aw, af, minaw, bf, first, last, tn, tops, wgb
     delete tn[x]
   }
   printf "Top-Prozesse (Ø %% eines Kerns): %s\n", (tops == "" ? "-" : tops)
+  tops = ""
+  for (k in tn) delete tn[k]
+  for (k in Wtot) tn[k] = Wtot[k]
+  for (i = 1; i <= 8; i++) {
+    x = ""; n = 0
+    for (k in tn) if (tn[k] > n) { n = tn[k]; x = k }
+    if (x == "" || n < 1048576) break
+    tops = tops sprintf("%s %.2f MB/s (%.2f GB)  ", x, n / 1048576 / (N * interval_s), n / 1e9)
+    delete tn[x]
+  }
+  for (k in tn) delete tn[k]
+  if (tops != "") {
+    printf "Top-Schreiber (Ø über die Phase): %s\n", tops
+    if (Nslow > 0) {
+      tops = ""
+      for (k in Wslow) tn[k] = Wslow[k]
+      for (i = 1; i <= 5; i++) {
+        x = ""; n = 0
+        for (k in tn) if (tn[k] > n) { n = tn[k]; x = k }
+        if (x == "" || n < 1048576) break
+        tops = tops sprintf("%s %.2f MB/s  ", x, n / 1048576 / (Nslow * interval_s))
+        delete tn[x]
+      }
+      for (k in tn) delete tn[k]
+      if (tops != "") printf "Schreiber in den %d langsamen Intervallen: %s\n", Nslow, tops
+    }
+    print "  (Elternprozesse wie systemd, cron oder containerd-shim enthalten die Schreibmenge ihrer beendeten Kindprozesse.)"
+  }
 
   printf "\n  %-8s %10s %9s %8s %10s %10s %9s %9s %7s %12s\n", "Gerät", "geschr.", "Ø Req", "Ø await", "max await", "Flush n", "Flush Ø", "Flush max", "Ø util", "Langsam"
   minaw = -1
@@ -598,6 +752,8 @@ function summary(   i, d, k, n, x, aw, af, minaw, bf, first, last, tn, tops, wgb
     else if (bf <= 35) add("CPU", 3, sprintf("Nur %.0f%% der Wartezeit entfallen auf die SSD; der Rest geht in CPU/Software verloren (Syscalls, shfs/FUSE, Dateisystem, Locks, Scheduling).", bf))
     else add("MIX", 1, sprintf("%.0f%% der Wartezeit auf der SSD, der Rest in CPU/Software - beide Seiten tragen bei.", bf))
   }
+  nst = 0
+  for (i = 1; i <= Ndev; i++) if (A_stall[Dlist[i]] > 0) nst++
   for (i = 1; i <= Ndev; i++) {
     d = Dlist[i]
     if (!(d in A_n) || A_n[d] < 3) continue
@@ -608,7 +764,8 @@ function summary(   i, d, k, n, x, aw, af, minaw, bf, first, last, tn, tops, wgb
       if (AF[d] >= 10) add("SSD", 2, sprintf("%s: Flush (fsync/Cache leeren) dauert Ø %.1f ms - sehr langsam (Consumer-SSD ohne Power-Loss-Protection, SLC-Cache voll oder Firmware).", d, AF[d]))
       else if (AF[d] >= 3) add("SSD", 1, sprintf("%s: Flush Ø %.1f ms - erhöht (gute SATA-SSDs < 2 ms, Enterprise mit PLP < 0.1 ms).", d, AF[d]))
     }
-    if (T_wios[d] >= 50 && minaw > 0 && AW[d] > 3 * minaw && AW[d] > 2)
+    # Hängen mehrere Geräte abwechselnd, ist ein einzelnes "langsamstes" Gerät kein Befund
+    if (T_wios[d] >= 50 && minaw > 0 && AW[d] > 3 * minaw && AW[d] > 2 && !(nst >= 2 && A_stall[d] > 0))
       add("SSD", 1, sprintf("%s ist deutlich langsamer als die übrigen Geräte (Ø await %.2f ms vs. bestes %.2f ms) - dieses Laufwerk gezielt prüfen.", d, AW[d], minaw))
     if ((mode == "seq" && A_tpn[d] >= 10) || A_tpn[d] >= 30) {
       # Spitze (3er-Mittel) in der ersten Hälfte vs. Mittel kurz vor Ende (letzte 2 Werte = Abschluss-Flush)
@@ -688,7 +845,106 @@ BEGIN {
 }
 AWK
 
-echo "time,phase,dev,w_mbs,w_iops,w_await_ms,flush_per_s,flush_await_ms,r_mbs,util_pct,queue,cpu_busy,cpu_iowait,max_core,psi_cpu,psi_io_some,psi_io_full,top_proc" > "$CSV"
+echo "time,phase,dev,w_mbs,w_iops,w_await_ms,flush_per_s,flush_await_ms,r_mbs,util_pct,queue,cpu_busy,cpu_iowait,max_core,psi_cpu,psi_io_some,psi_io_full,top_proc,top_writer,top_writer_mbs" > "$CSV"
+
+# ---------------------------------------------------------------------------
+# bpftrace (optional): wer ruft fsync & Co. auf, wie lange dauert es,
+# und wie viel haben Prozesse geschrieben, die während der Messung enden
+# ---------------------------------------------------------------------------
+cat > "$OUT/trace.bt" <<'BT'
+tracepoint:syscalls:sys_enter_fsync,
+tracepoint:syscalls:sys_enter_fdatasync,
+tracepoint:syscalls:sys_enter_sync_file_range,
+tracepoint:syscalls:sys_enter_syncfs,
+tracepoint:syscalls:sys_enter_sync
+{ @start[tid] = nsecs; @sync_n[curtask->group_leader->comm, comm] = count(); }
+
+tracepoint:syscalls:sys_enter_msync
+/args->flags & 4/
+{ @start[tid] = nsecs; @sync_n[curtask->group_leader->comm, comm] = count(); }
+
+tracepoint:syscalls:sys_exit_fsync,
+tracepoint:syscalls:sys_exit_fdatasync,
+tracepoint:syscalls:sys_exit_sync_file_range,
+tracepoint:syscalls:sys_exit_syncfs,
+tracepoint:syscalls:sys_exit_sync,
+tracepoint:syscalls:sys_exit_msync
+/@start[tid]/
+{
+  $us = (nsecs - @start[tid]) / 1000;
+  @sync_us[curtask->group_leader->comm, comm] = sum($us);
+  @sync_max[curtask->group_leader->comm, comm] = max($us);
+  delete(@start[tid]);
+}
+
+// Jeder Thread meldet beim Ende nur seine eigene Schreibmenge - nichts wird doppelt gezählt.
+tracepoint:sched:sched_process_exit
+{ $w = curtask->ioac.write_bytes; if ($w > 0) { @exit_wb[curtask->group_leader->comm] = sum($w); } }
+
+END { clear(@start); }
+BT
+
+BT_PID=""
+trace_start() {
+  [ $HAVE_BT -eq 1 ] || return
+  BT_OUT="$OUT/phase$PHASE_N.bt"
+  BT_T0=$(date +%s)
+  bpftrace "$OUT/trace.bt" > "$BT_OUT" 2> "$BT_OUT.err" &
+  BT_PID=$!
+  local i
+  for i in $(seq 50); do
+    grep -q '^Attaching' "$BT_OUT" 2>/dev/null && return
+    kill -0 "$BT_PID" 2>/dev/null || break
+    sleep 0.2
+  done
+}
+
+trace_stop() {
+  [ -n "$BT_PID" ] || return
+  local i dur=$(( $(date +%s) - BT_T0 ))
+  kill -INT "$BT_PID" 2>/dev/null
+  for i in $(seq 50); do kill -0 "$BT_PID" 2>/dev/null || break; sleep 0.2; done
+  kill "$BT_PID" 2>/dev/null
+  wait "$BT_PID" 2>/dev/null
+  BT_PID=""
+  if ! grep -q '^Attaching' "$BT_OUT" 2>/dev/null; then
+    printf '\nbpftrace-Tracing nicht möglich: %s\n' "$(grep -v RLIMIT_MEMLOCK "$BT_OUT.err" | grep -m1 -i error)"
+    return
+  fi
+  awk -v dur="$dur" '
+    function key(l) { sub(/^@[a-z_]+\[/, "", l); sub(/\]: -?[0-9]+$/, "", l); return l }
+    function val(l) { sub(/.*\]: /, "", l); return l + 0 }
+    function name(k,   a) { split(k, a, ", "); return (a[2] == "" || a[1] == a[2]) ? a[1] : a[1] "/" a[2] }
+    /^@sync_n\[/   { k = key($0); N[k] = val($0); tot += N[k] }
+    /^@sync_us\[/  { U[key($0)] = val($0) }
+    /^@sync_max\[/ { M[key($0)] = val($0) }
+    /^@exit_wb\[/  { E[key($0)] = val($0) }
+    END {
+      if (dur < 1) dur = 1
+      printf "\nfsync-Aufrufer (bpftrace, %d s): insgesamt %.1f pro Sekunde\n", dur, tot / dur
+      if (tot > 0) {
+        printf "  %-36s %8s %7s %8s %9s\n", "Prozess/Thread", "Aufrufe", "pro s", "Ø ms", "max ms"
+        for (i = 1; i <= 12; i++) {
+          b = ""; bv = 0
+          for (k in N) if (!(k in used) && N[k] > bv) { bv = N[k]; b = k }
+          if (b == "") break
+          used[b] = 1
+          printf "  %-36.36s %8d %7.2f %8.2f %9.1f%s\n", name(b), N[b], N[b] / dur, U[b] / N[b] / 1000, M[b] / 1000, (M[b] >= 200000 ? "  << hängt" : "")
+          if (i == 1) top = b
+        }
+        printf "=> Häufigster fsync-Aufrufer: %s (%.0f%% aller Aufrufe)\n", name(top), 100 * N[top] / tot
+      }
+      s = ""
+      for (i = 1; i <= 8; i++) {
+        b = ""; bv = 0
+        for (k in E) if (!(k in usedE) && E[k] > bv) { bv = E[k]; b = k }
+        if (b == "" || bv < 1048576) break
+        usedE[b] = 1
+        s = s sprintf("%s %.2f GB  ", b, bv / 1e9)
+      }
+      if (s != "") printf "Während der Messung beendete Prozesse (Schreibmenge über ihre ganze Laufzeit): %s\n", s
+    }' "$BT_OUT"
+}
 
 # ---------------------------------------------------------------------------
 # Phasen
@@ -701,7 +957,7 @@ start_sampler() { # label mode duration appfile
   rm -f "$CUR_STOP"
   ( trap '' INT; exec awk -v devre="$DEVRE" -v hz="$HZ" -v interval_arg="$INTERVAL" -v duration="$3" \
       -v stopfile="$CUR_STOP" -v csv="$CSV" -v phase="$PHASE_N" -v label="$1" -v mode="$2" \
-      -v appfile="$4" -v sumfile="$OUT/phase$PHASE_N.sum" -v mdmembers="$MDMEMBERS" -v quiet=0 -f "$OUT/sampler.awk" ) &
+      -v appfile="$4" -v sumfile="$OUT/phase$PHASE_N.sum" -v mdmembers="$MDMEMBERS" -v quiet="$QUIET" -f "$OUT/sampler.awk" ) &
   SAMPLER=$!
   SUMFILES+=("$OUT/phase$PHASE_N.sum")
 }
@@ -722,8 +978,11 @@ fio_terse_to_app() { # terse-file what
 phase_passive() {
   PHASE_N=$((PHASE_N + 1))
   section "Phase $PHASE_N: passive Beobachtung (${PASSIVE}s) - jetzt das Problem auslösen, Ctrl+C beendet"
+  [ $QUIET -eq 1 ] && info "(-q: es werden nur auffällige Intervalle angezeigt)"
+  trace_start
   start_sampler "passiv ${PASSIVE}s" passive "$PASSIVE" ""
   wait_sampler
+  trace_stop
 }
 
 phase_sync() { # dir
@@ -736,6 +995,7 @@ phase_sync() { # dir
   if [ $HAVE_FIO -eq 1 ]; then
     fio --name=wlat-prep --filename="$f" --rw=randwrite --bs=4k --size="$TEST_SIZE" --create_only=1 >/dev/null 2>&1
     sync
+    trace_start
     start_sampler "sync4k $dir" sync 0 "$app"
     sleep 2
     fio --name=wlat-sync4k --filename="$f" --rw=randwrite --bs=4k --ioengine=psync --sync=1 \
@@ -743,6 +1003,7 @@ phase_sync() { # dir
         > "$OUT/phase$PHASE_N.fio" 2> "$OUT/phase$PHASE_N.fio.err"
     fio_terse_to_app "$OUT/phase$PHASE_N.fio" "4k randwrite O_SYNC QD1" > "$app"
   else
+    trace_start
     start_sampler "sync4k $dir" sync 0 "$app"
     sleep 2
     LC_ALL=C timeout -s INT "$TEST_RUNTIME" dd if=/dev/zero of="$f" bs=4k count=1000000 oflag=dsync 2> "$OUT/phase$PHASE_N.dd"
@@ -754,6 +1015,7 @@ phase_sync() { # dir
   sleep 2
   touch "$CUR_STOP"
   wait_sampler
+  trace_stop
   rm -f "$f"; CUR_FILE=""
 }
 
@@ -764,6 +1026,7 @@ phase_seq() { # dir
   app="$OUT/phase$PHASE_N.app"
   CUR_FILE=$f
   section "Phase $PHASE_N: sequentielles Dauerschreiben $SEQ_SIZE in $dir"
+  trace_start
   start_sampler "seq $SEQ_SIZE $dir" seq 0 "$app"
   sleep 2
   if [ $HAVE_FIO -eq 1 ]; then
@@ -780,6 +1043,7 @@ phase_seq() { # dir
   sleep 3
   touch "$CUR_STOP"
   wait_sampler
+  trace_stop
   rm -f "$f"; CUR_FILE=""
 }
 
@@ -790,6 +1054,10 @@ echo "write-latency-diag $VERSION - $(date '+%F %T') - Ausgabe: $OUT"
 if [ ${#TARGETS[@]} -gt 0 ] && [ $HAVE_FIO -eq 0 ]; then
   section "Hinweis"
   info "fio nicht gefunden - nutze dd als Ersatz (nur Mittelwert, keine Perzentile)."
+fi
+if [ $HAVE_BT -eq 0 ] && [ $TRACE -eq 1 ]; then
+  section "Hinweis"
+  info "bpftrace nicht verfügbar (oder nicht root) - ohne Auswertung der fsync-Aufrufer. Installieren: apt install bpftrace"
 fi
 
 [ "$PASSIVE" -gt 0 ] 2>/dev/null && phase_passive
