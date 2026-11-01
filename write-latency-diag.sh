@@ -126,6 +126,7 @@ MDMEMBERS=""          # physische Laufwerke in mdadm-Arrays (für die Auswertung
 # nächste Lauf die Schreibverstärkung seit dem letzten Messpunkt zeigt (aktueller Zustand).
 waf_history() { # dev serial num den host_gib nand_in_gib(0/1)
   local f="$STATE_DIR/smart-history.csv" now prev
+  WH_RATE=""   # NAND-Schreibmenge pro Tag seit dem Vergleichspunkt (Einheit wie num), für die Verschleiß-Prognose
   [ -n "$2" ] || return
   now=$(date +%s)
   # bevorzugt einen Messpunkt >= 12 h alt, sonst >= 1 h
@@ -143,10 +144,47 @@ waf_history() { # dev serial num den host_gib nand_in_gib(0/1)
       printf "   (Host %.0f GiB/Tag)\n", dh * 24 / h
       exit (dd > 0 && dn >= 5 * dd) ? 3 : 0 }'
     [ $? -eq 3 ] && warn "$1: Auch aktuell (seit dem letzten Messpunkt) hohe Schreibverstärkung - die Ursache besteht weiter."
+    WH_RATE=$(awk -F, -v now="$now" -v num="$3" -v l="$prev" 'BEGIN { split(l, p, ","); d = (now - p[1]) / 86400; if (d > 0 && num > p[3]) printf "%.6f", (num - p[3]) / d }')
   else
     info "Verlauf: Messpunkt gespeichert ($f). Der nächste Lauf (frühestens in 1 h, aussagekräftig ab ~12 h) zeigt die aktuelle WAF."
   fi
   mkdir -p "$STATE_DIR" 2>/dev/null && printf '%s,%s,%s,%s,%s\n' "$now" "$2" "$3" "$4" "$5" >> "$f"
+}
+
+# Verschleiß in % (0 = neu) aus den SMART-Daten: zuerst der standardisierte Wert (ATA Device Statistics,
+# NVMe "Percentage Used"), sonst herstellerspezifisch.
+wear_used() { # dev smartctl-ausgabe(-i -A) wdsd
+  local u
+  u=$(smartctl -l devstat "$1" 2>/dev/null | awk '/Percentage Used Endurance Indicator/ {print $4 + 0; exit}')
+  [ -n "$u" ] || u=$(awk -v wdsd="$3" '
+    /^Percentage Used:/ { v = $3; gsub("%", "", v); print v + 0; exit }
+    wdsd && $1 == 230 && NF >= 10 { print $10 + 0; exit }
+    ($1 == 169 || $1 == 202 || $1 == 177 || $1 == 231) && NF >= 10 { print 100 - $4; exit }' <<<"$2")
+  echo "$u"
+}
+
+# Restlaufzeit: Bei x % Verschleiß nach num NAND-Einheiten reicht das Budget für num*(100-x)/x weitere.
+# "Bisheriger Ø" rechnet mit der ganzen Laufzeit, "aktuelles Tempo" mit der NAND-Rate seit dem letzten Messpunkt.
+wear_forecast() { # dev used% poh num rate_per_day
+  [ -n "$2" ] || return
+  awk -v u="$2" -v poh="${3:-0}" -v num="${4:-0}" -v r="${5:-0}" '
+    function fmt(d) { return d >= 730 ? sprintf("~%.1f Jahre", d / 365) : d >= 60 ? sprintf("~%.0f Monate", d / 30.4) : sprintf("~%.0f Tage", d) }
+    BEGIN {
+      if (u <= 0) { print "      Verschleiß: 0 % (praktisch neu)"; exit }
+      if (u >= 100) { print "      Verschleiß: " u " % - Nennlebensdauer erreicht"; exit 3 }
+      printf "      Verschleiß: %d %% - Restlaufzeit", u
+      lt = (poh > 24) ? (100 - u) / u * poh / 24 : -1
+      cur = (r > 0 && num > 0) ? num * (100 - u) / u / r : -1
+      if (lt >= 0) printf " bei bisherigem Ø %s", fmt(lt)
+      if (cur >= 0) printf "%s bei aktuellem Tempo %s", (lt >= 0 ? "," : ""), fmt(cur)
+      if (lt < 0 && cur < 0) printf " unbekannt"
+      print ""
+      d = (cur >= 0) ? cur : lt
+      exit (d >= 0 && d < 365) ? 3 : (d >= 0 && d < 730) ? 4 : 0 }'
+  case $? in
+    3) warn "$1: Bei diesem Tempo ist die SSD in unter einem Jahr am Ende ihrer Nennlebensdauer - Ersatz einplanen." ;;
+    4) hint "$1: Bei diesem Tempo ist die SSD in unter zwei Jahren am Ende ihrer Nennlebensdauer." ;;
+  esac
 }
 
 # Reicht wöchentliches TRIM? ext4 merkt sich, welche Blockgruppen schon getrimmt sind. Jeder weitere
@@ -369,7 +407,7 @@ static_check() {
       # Schreibverstärkung: WAF = num/den, host = Host-Schreibmenge in GiB.
       # SanDisk/WD: 233 NAND-GiB / 241 Host-GiB. Crucial/Micron: (247 Host- + 248 FTL-Pages) / 247, Host über 246 (LBAs).
       local nand hostw poh erase num="" den="" hgib="" serial
-      poh=$(awk '$1==9 {print $10+0}' <<<"$sm")
+      poh=$(awk '$1 == 9 && NF >= 10 {print $10 + 0; exit} /^Power On Hours:/ {gsub(",", "", $4); print $4 + 0; exit}' <<<"$sm")
       serial=$(sed -n 's/^Serial Number: *//p' <<<"$sm" | head -1)
       if [ $wdsd -eq 1 ]; then
         nand=$(awk '$1==233 {print $10+0}' <<<"$sm"); hostw=$(awk '$1==241 {print $10+0}' <<<"$sm")
@@ -395,6 +433,7 @@ static_check() {
           warn "$d: interne Schreibverstärkung $(awk -v n="$num" -v h="$den" 'BEGIN{printf "%.0f", n/h}')x - die SSD schreibt intern ein Vielfaches dessen, was das System schreibt. Typisch für viele kleine fsync-Schreibzugriffe (Datenbanken, NVR, Logs) auf Consumer-SSDs ohne Power-Loss-Protection: Die SSD ist dauerhaft mit Garbage Collection beschäftigt (Latenzspitzen) und verschleißt schnell."
         waf_history "$d" "$serial" "$num" "$den" "$hgib" "$wdsd"
       fi
+      [ "$rot" = 0 ] && wear_forecast "$d" "$(wear_used "$dev" "$sm" "$wdsd")" "$poh" "$num" "$([ -n "$den" ] && echo "$WH_RATE")"
     fi
 
     if [ "$rot" = 0 ] && grep -qiE 'QVO|BX500|A400|SU630|SU650|660p|665p|670p|Crucial P1|P3 Plus|WD ?Green|WDS[0-9]+G[0-9]A|SSD Plus|SDSSDA|Intenso|NV1|NV2|TM8FP' <<<"$model"; then
