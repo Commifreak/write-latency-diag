@@ -255,15 +255,33 @@ static_check() {
     fi
     [ "$rot" = 0 ] && [ "${disc:-0}" -eq 0 ] && hint "$d: Gerät/Schicht meldet kein TRIM - ohne TRIM werden SSDs bei Schreiblast langsamer."
     [ "$wc" = "write through" ] && [ "$rot" = 0 ] && hint "$d: Schreibcache ist 'write through' (aus) - deutlich langsamere Schreibzugriffe."
-    # Der Schreibcache-Schalter (SET FEATURES) ist laut ATA-Standard flüchtig: Nach dem Einschalten
+    # Der Schreibcache-Schalter (SET FEATURES, hdparm -W) ist laut ATA-Standard flüchtig: Nach dem Einschalten
     # gilt die Werkseinstellung des Laufwerks, und manche BIOS/UEFI schalten ihn beim Start ab.
-    if [[ $d == sd* ]] && [ "$kind" != USB ] && [ "$(id -u)" -eq 0 ] && command -v hdparm >/dev/null 2>&1; then
-      local hw
-      hw=$(hdparm -W "$dev" 2>/dev/null | sed -n 's/.*write-caching *= *\([01]\).*/\1/p')
-      if [ "$hw" = 0 ]; then
-        warn "$d: Schreibcache im Laufwerk ist AUS (hdparm -W) - jeder Schreibzugriff geht direkt in den Flash: langsam und bei Consumer-SSDs sehr hohe Schreibverstärkung. Einschalten: hdparm -W1 $dev (gilt nur bis zum nächsten Kaltstart; prüfen, ob das BIOS ihn abschaltet, bei HPE z.B. 'Drive Write Cache' in den SATA-Optionen)."
+    # Dauerhaft im Laufwerk lässt er sich nur über SCT Feature Control setzen (smartctl -s wcache-sct,on,p).
+    if [[ $d == sd* ]] && [ "$kind" != USB ] && [ "$(id -u)" -eq 0 ]; then
+      local hw="" sct="" boot="" fix wcinfo=""
+      command -v hdparm >/dev/null 2>&1 && hw=$(hdparm -W "$dev" 2>/dev/null | sed -n 's/.*write-caching *= *\([01]\).*/\1/p')
+      command -v smartctl >/dev/null 2>&1 && sct=$(smartctl -g wcache-sct "$dev" 2>/dev/null | sed -n 's/^SCT Write Cache Control: *//p' | head -1)
+      grep -qiE 'not supported|unavailable' <<<"$sct" && sct=""
+      # Erster Eintrag dieses Starts = Zustand bei der Erkennung, bevor udev-Regeln o.ä. eingreifen
+      boot=$( (journalctl -k -b -o cat 2>/dev/null || dmesg 2>/dev/null) | grep -m1 "\[$d\] Write cache:" | sed -n 's/.*Write cache: *\([a-z]*\).*/\1/p')
+      [ -n "$hw" ] && wcinfo="Laufwerk $([ "$hw" = 1 ] && echo an || echo aus)"
+      [ -n "$boot" ] && wcinfo="${wcinfo:+$wcinfo, }beim Start $([ "$boot" = enabled ] && echo an || echo aus)"
+      [ -n "$sct" ] && wcinfo="${wcinfo:+$wcinfo, }SCT: $sct"
+      [ -n "$wcinfo" ] && info "Schreibcache: $wcinfo"
+      if [ -n "$sct" ]; then
+        fix="dauerhaft im Laufwerk einschalten: smartctl -s wcache-sct,on,p $dev (danach Kaltstart und prüfen: journalctl -k -b | grep -i 'write cache')"
+      else
+        fix="bei jedem Start einschalten, z.B. per udev-Regel mit hdparm -W1 $dev (das Laufwerk kennt kein SCT Feature Control)"
+      fi
+      if grep -qi 'force disabled' <<<"$sct"; then
+        warn "$d: Der Schreibcache ist per SCT dauerhaft abgeschaltet - hdparm -W1 wirkt nicht. Einschalten: smartctl -s wcache-sct,on,p $dev"
+      elif [ "$hw" = 0 ]; then
+        warn "$d: Schreibcache im Laufwerk ist AUS - jeder Schreibzugriff geht direkt in den Flash: langsam und bei Consumer-SSDs sehr hohe Schreibverstärkung. Abhilfe: $fix."
       elif [ "$hw" = 1 ] && [ "$wc" = "write through" ]; then
         warn "$d: Das Laufwerk hat den Schreibcache AN, der Kernel hält ihn aber für aus ('write through') und schickt deshalb keine Flushes - bei Stromausfall droht Datenverlust. Abhilfe: echo 1 > /sys/block/$d/device/rescan"
+      elif [ "$boot" = disabled ] && ! grep -qi 'force enabled' <<<"$sct"; then
+        hint "$d: Der Schreibcache ist beim Start aus (BIOS oder Firmware) und wird erst danach eingeschaltet (udev-Regel/hdparm). Greift das einmal nicht, läuft die SSD ohne Cache. Besser: $fix."
       fi
     fi
     case "$role" in

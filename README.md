@@ -90,7 +90,7 @@ Report und Messwerte (`samples.csv`, eine Zeile pro Sekunde und Gerät) liegen u
 | **Wechselnde Stalls** | Mal hängt die eine SSD, mal die andere, während die übrigen im selben Moment schnell antworten. Das Gerät hält intern an (Garbage Collection, Firmware). Ein einzelner Defekt ist das nicht, eher ein Modell- oder Lastproblem. Im mdadm-RAID wartet jedes `fsync` auf alle Mitglieder, darum bremst jeder Stall einer einzelnen SSD das ganze Array. |
 | **Schreibverstärkung (WAF)** | Bei SanDisk/WD-SSDs berechnet aus SMART 233 (NAND-GiB) und 241 (Host-GiB), bei Crucial/Micron aus 247/248 (Host- und FTL-Pages). Normal sind etwa 1–3. Werte ab 5 bedeuten, dass die SSD intern ein Vielfaches neu schreibt. Typisch ist das für viele kleine `fsync`-Schreibzugriffe auf Consumer-SSDs ohne PLP. Folgen sind Dauer-Garbage-Collection, Latenzspitzen und schneller Verschleiß. |
 | **Spiegelgruppen** (mdadm RAID10) | Welche SSDs immer dieselben Schreibzugriffe bekommen. Sie verschleißen gleich schnell und halten oft auch gleichzeitig für die Garbage Collection an. |
-| **Schreibcache** | Ist der Cache im Laufwerk aus (`hdparm -W`), geht jeder Schreibzugriff direkt in den Flash. Hält der Kernel ihn für aus, obwohl er an ist, schickt er keine Flushes, und bei Stromausfall droht Datenverlust. |
+| **Schreibcache** | Zeigt den Zustand im Laufwerk (`hdparm -W`), beim Start (erste Kernel-Meldung, bevor udev-Regeln greifen) und die SCT-Einstellung. Ist der Cache aus, geht jeder Schreibzugriff direkt in den Flash. Hält der Kernel ihn für aus, obwohl er an ist, schickt er keine Flushes, und bei Stromausfall droht Datenverlust. |
 | **Kern ≥ 95 % / PSI cpu** | Ein einzelner Thread ist der Engpass, oder Prozesse warten auf CPU-Zeit. |
 | **Top-Prozesse** | `md0_raid5`/`md0_raid6` steht für die RAID-Paritätsberechnung, `kcryptd`/`dmcrypt_write` für LUKS, `z_wr_*` für ZFS, `md0_resync` für einen laufenden RAID-Check. |
 | **iowait** | Das ist **keine** CPU-Last. Die CPU wartet auf IO. |
@@ -119,9 +119,11 @@ Report und Messwerte (`samples.csv`, eine Zeile pro Sekunde und Gerät) liegen u
   `innodb_flush_log_at_trx_commit = 2` gehen bei Stromausfall höchstens ~1 s Transaktionen verloren, die Datenbank
   bleibt konsistent. Ein größerer `innodb_buffer_pool_size` und ein kleinerer `innodb_io_capacity` (MySQL 8.4:
   Standard 10000) lassen InnoDB Änderungen sammeln, statt jede Seite sofort zurückzuschreiben.
-- **Schreibcache aus**: Der Schalter (`hdparm -W1`) ist laut ATA-Standard nicht dauerhaft. Schaltet ihn das BIOS
-  beim Start ab (bei HPE z.B. „Drive Write Cache“ in den SATA-Optionen), dort einschalten oder per udev-Regel bei
-  jedem Start setzen.
+- **Schreibcache aus**: Der Schalter (`hdparm -W1`) ist laut ATA-Standard nicht dauerhaft. Kommt das Laufwerk beim
+  Start ohne Cache hoch (BIOS oder Firmware), lässt er sich bei vielen Laufwerken über SCT Feature Control dauerhaft
+  im Laufwerk einschalten: `smartctl -s wcache-sct,on,p /dev/sdX`. Danach einen Kaltstart machen und mit
+  `journalctl -k -b | grep -i 'write cache'` prüfen. Zurück: `smartctl -s wcache-sct,ata,p /dev/sdX`. Ohne SCT bleibt
+  nur, den Cache bei jedem Start per udev-Regel mit `hdparm -W1` einzuschalten.
 - **CRC-Fehler / ATA-Resets im dmesg**: Kabel, Backplane oder Port prüfen.
 - **Großer Dirty-Puffer**: Viele GB RAM mit `vm.dirty_ratio=20` bauen große Writeback-Stöße auf. Ein kleinerer
   `vm.dirty_bytes`-Wert glättet sie.
