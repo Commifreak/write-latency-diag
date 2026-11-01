@@ -690,7 +690,7 @@ function add(side, pts, msg) {
   Fn++; F[Fn] = sprintf("  [%s] %s", side, msg)
 }
 function summary(   i, d, k, n, x, aw, af, minaw, bf, first, last, tn, tops, wgb, busy, sat, verdict, cnt, avgp, dl, tpa, nst) {
-  printf "\n--- Auswertung: %s (%d Messpunkte à %ss, %.1f h) ---\n", label, N, interval_s, S_dt / 3600
+  printf "\n--- Auswertung: %s (%d Messpunkte à %ss, %s) ---\n", label, N, interval_s, (S_dt < 3600 ? sprintf("%.0f s", S_dt) : sprintf("%.1f h", S_dt / 3600))
   if (N < 2) { print "  Zu wenige Messpunkte."; return }
   busy = S_busy / N; sat = 100 * Nsat / N
   printf "CPU:  Ø Auslastung %.0f%%, Ø iowait %.0f%% (= Warten auf IO, keine CPU-Last), ein Kern >=95%% in %.0f%% der Intervalle\n", busy, S_iow / N, sat
