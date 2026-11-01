@@ -89,6 +89,7 @@ Report und Messwerte (`samples.csv`, eine Zeile pro Sekunde und Gerät) liegen u
 | **Ausreißer-SSD** | Eine SSD ist deutlich langsamer als die anderen. Dann dieses Laufwerk prüfen (Firmware, Verschleiß, Kabel). |
 | **Wechselnde Stalls** | Mal hängt die eine SSD, mal die andere, während die übrigen im selben Moment schnell antworten. Das Gerät hält intern an (Garbage Collection, Firmware). Ein einzelner Defekt ist das nicht, eher ein Modell- oder Lastproblem. Im mdadm-RAID wartet jedes `fsync` auf alle Mitglieder, darum bremst jeder Stall einer einzelnen SSD das ganze Array. |
 | **Schreibverstärkung (WAF)** | Bei SanDisk/WD-SSDs berechnet aus SMART 233 (NAND-GiB) und 241 (Host-GiB), bei Crucial/Micron aus 247/248 (Host- und FTL-Pages). Normal sind etwa 1–3. Werte ab 5 bedeuten, dass die SSD intern ein Vielfaches neu schreibt. Typisch ist das für viele kleine `fsync`-Schreibzugriffe auf Consumer-SSDs ohne PLP. Folgen sind Dauer-Garbage-Collection, Latenzspitzen und schneller Verschleiß. |
+| **TRIM-Zeitplan** | Bei ext4 meldet jeder `fstrim`-Lauf ungefähr, wie viel seit dem letzten Lauf gelöscht wurde (der erste Lauf nach einem Neustart zählt nicht). Daraus rechnet das Skript, wie viel gelöschter, aber noch nicht getrimmter Platz bis zum nächsten Lauf auflaufen kann. Ab etwa 2 % der Kapazität empfiehlt es tägliches TRIM: Für die SSD ist dieser Platz bis dahin belegt, und Consumer-SSDs haben nur ~7 % Reserve. |
 | **Spiegelgruppen** (mdadm RAID10) | Welche SSDs immer dieselben Schreibzugriffe bekommen. Sie verschleißen gleich schnell und halten oft auch gleichzeitig für die Garbage Collection an. |
 | **Schreibcache** | Zeigt den Zustand im Laufwerk (`hdparm -W`), beim Start (erste Kernel-Meldung, bevor udev-Regeln greifen) und die SCT-Einstellung. Ist der Cache aus, geht jeder Schreibzugriff direkt in den Flash. Hält der Kernel ihn für aus, obwohl er an ist, schickt er keine Flushes, und bei Stromausfall droht Datenverlust. |
 | **Kern ≥ 95 % / PSI cpu** | Ein einzelner Thread ist der Engpass, oder Prozesse warten auf CPU-Zeit. |
@@ -108,7 +109,8 @@ Report und Messwerte (`samples.csv`, eine Zeile pro Sekunde und Gerät) liegen u
 - **Hohe Flush-Latenz**: Consumer-SSDs ohne Power-Loss-Protection. Bei ZFS hilft `sync=standard`
   (nicht `always`). Für Datenbanken sind Enterprise-SSDs mit PLP sinnvoll.
 - **Einbruch bei Dauerlast**: Die SSD ist eine QLC- oder DRAM-lose SSD, oder TRIM fehlt.
-  `systemctl enable --now fstrim.timer` aktivieren. Bei mdadm muss TRIM durch alle Schichten durchgereicht
+  `systemctl enable --now fstrim.timer` aktivieren. Wird viel gelöscht (Backups, NVR-Aufnahmen), täglich statt
+  wöchentlich trimmen: `systemctl edit fstrim.timer`, dort `[Timer]`, `OnCalendar=` und `OnCalendar=daily`. Bei mdadm muss TRIM durch alle Schichten durchgereicht
   werden (`lsblk --discard`).
 - **Hohe Schreibverstärkung**: Ursache sind viele kleine Sync-Schreibzugriffe (Datenbanken, NVR wie Frigate,
   Logs). Abhilfe: die Sync-Last verringern (z.B. Aufnahmen auf eigene Disks, Datenbank-`fsync`-Einstellungen

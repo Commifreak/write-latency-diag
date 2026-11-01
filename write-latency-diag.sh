@@ -149,6 +149,63 @@ waf_history() { # dev serial num den host_gib nand_in_gib(0/1)
   mkdir -p "$STATE_DIR" 2>/dev/null && printf '%s,%s,%s,%s,%s\n' "$now" "$2" "$3" "$4" "$5" >> "$f"
 }
 
+# Reicht wöchentliches TRIM? ext4 merkt sich, welche Blockgruppen schon getrimmt sind. Jeder weitere
+# fstrim-Lauf im selben Boot meldet deshalb ungefähr, wie viel seit dem letzten Lauf gelöscht wurde
+# (eher etwas zu viel, weil ganze Gruppen neu getrimmt werden). Der erste Lauf nach einem Neustart
+# gibt den ganzen freien Platz frei und zählt nicht. Bei XFS/btrfs ist die Zahl nicht aussagekräftig.
+# Bis zum nächsten TRIM verhält sich Gelöschtes für die SSD wie belegter Platz. Consumer-SSDs haben nur
+# ~7 % Reserve: Sammelt sich mehr als ~2 % der Kapazität an, lohnt tägliches TRIM.
+trim_advice() { # OnCalendar-Wert des fstrim.timer
+  command -v journalctl >/dev/null 2>&1 || return
+  local mnt src size rota res period
+  while read -r src mnt; do
+    rota=$(lsblk -ndo ROTA "$src" 2>/dev/null | tr -d ' ')
+    [ "$rota" = 0 ] || continue
+    size=$(df -B1 --output=size "$mnt" 2>/dev/null | tail -1 | tr -d ' ')
+    case "$1" in
+      daily|*-*-*\ 0*) period=1 ;; weekly|"") period=7 ;; monthly) period=30 ;; *) period="" ;;
+    esac
+    res=$(journalctl -u fstrim.service -o json --no-pager -q -n 1000 2>/dev/null | awk -v m="$mnt" '
+      {
+        if (!match($0, /"MESSAGE":"[^"]*"/)) next
+        msg = substr($0, RSTART + 11, RLENGTH - 12)
+        if (index(msg, m ": ") != 1 || msg !~ /bytes\) trimmed/) next
+        b = msg; sub(/.*\(/, "", b); sub(/ bytes.*/, "", b)
+        match($0, /"__REALTIME_TIMESTAMP":"[0-9]+"/); t = substr($0, RSTART + 24, RLENGTH - 25) / 1e6
+        match($0, /"_BOOT_ID":"[^"]*"/); boot = substr($0, RSTART, RLENGTH)
+        if (boot == lastboot && t - last > 3600) { n++; R[n] = b / (t - last) * 86400; I[n] = (t - last) / 86400 }
+        lastboot = boot; last = t
+      }
+      END {
+        if (n == 0) { print "none"; exit }
+        # Median der letzten (bis zu) 5 Läufe
+        k = 0; for (i = (n > 5 ? n - 4 : 1); i <= n; i++) { k++; r[k] = R[i]; d[k] = I[i] }
+        for (i = 1; i <= k; i++) for (j = i + 1; j <= k; j++) {
+          if (r[j] < r[i]) { x = r[i]; r[i] = r[j]; r[j] = x }
+          if (d[j] < d[i]) { x = d[i]; d[i] = d[j]; d[j] = x }
+        }
+        printf "%.0f %.2f %d\n", r[int((k + 1) / 2)], d[int((k + 1) / 2)], k
+      }')
+    [ -n "$res" ] || continue
+    if [ "$res" = none ]; then
+      info "TRIM $mnt: noch keine Empfehlung möglich - es braucht mindestens zwei fstrim-Läufe ohne Neustart dazwischen."
+      continue
+    fi
+    local rate interval runs
+    read -r rate interval runs <<<"$res"
+    [ -n "$period" ] || period=$interval
+    awk -v m="$mnt" -v rate="$rate" -v p="$period" -v size="${size:-0}" -v runs="$runs" -v cal="${1:-?}" 'BEGIN {
+      back = rate * p; pct = size > 0 ? 100 * back / size : 0
+      printf "      TRIM %s: Ø %.1f GiB/Tag gelöscht (aus %d fstrim-Läufen) - bei Zeitplan \"%s\" bis zu %.0f GiB (%.1f %% der Kapazität) ungetrimmt\n", m, rate / 2^30, runs, cal, back / 2^30, pct
+      exit (p > 1 && pct >= 2) ? 3 : (p <= 1 && rate * 7 < 0.02 * size) ? 4 : (p > 1) ? 5 : 0 }'
+    case $? in
+      3) hint "TRIM $mnt: Zwischen zwei TRIM-Läufen sammelt sich viel gelöschter Platz an, den die SSD noch für belegt hält (mehr Garbage Collection, höhere Schreibverstärkung). Täglich trimmen: systemctl edit fstrim.timer und dort [Timer] OnCalendar= sowie OnCalendar=daily eintragen." ;;
+      4) info "TRIM $mnt: Es wird wenig gelöscht - wöchentliches TRIM würde hier auch reichen." ;;
+      5) ok "TRIM $mnt: Der Zeitplan reicht - bis zum nächsten Lauf sammelt sich wenig gelöschter Platz an." ;;
+    esac
+  done < <(awk '$3 == "ext4" && $1 ~ "^/dev/" {print $1, $2}' /proc/mounts | sort -u -k2,2)
+}
+
 # ---------------------------------------------------------------------------
 # Systemcheck
 # ---------------------------------------------------------------------------
@@ -360,7 +417,10 @@ static_check() {
   fi
   if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
     if [ "$(systemctl is-enabled fstrim.timer 2>/dev/null)" = "enabled" ]; then
-      ok "fstrim.timer aktiv (wöchentliches TRIM)."
+      local cal
+      cal=$(systemctl show fstrim.timer -p TimersCalendar --value 2>/dev/null | sed -n 's/.*OnCalendar=\([^ ;]*\).*/\1/p' | head -1)
+      ok "fstrim.timer aktiv (${cal:-Zeitplan unbekannt})."
+      trim_advice "$cal"
     elif ! grep -qE '(^|,)discard' <(awk '{print $4}' /proc/mounts); then
       hint "fstrim.timer ist nicht aktiv und kein Dateisystem nutzt 'discard' - ohne TRIM werden SSDs bei Schreiblast langsamer (systemctl enable --now fstrim.timer)."
     fi
