@@ -1,0 +1,166 @@
+#!/bin/bash
+#
+# CheckMK Local Check (langsamer Teil): Schreibcache, Schreibverstärkung der letzten 24 h,
+# Verschleiß und Restlaufzeit je SSD sowie der TRIM-Zeitplan.
+#
+# Installation: nach /usr/lib/check_mk_agent/local/1800/write_latency_smart kopieren und ausführbar
+# machen. Der Unterordner 1800 lässt den Agent den Check nur alle 30 Minuten ausführen.
+# Braucht smartctl (smartmontools), für den Schreibcache zusätzlich hdparm.
+#
+
+STATE_DIR="/var/lib/write-latency-diag"
+HIST="$STATE_DIR/checkmk-smart.csv"
+DEVRE='^(sd[a-z]+|nvme[0-9]+n[0-9]+)$'
+
+WAF_WARN=5; WAF_CRIT=10              # Schreibverstärkung
+LIFE_WARN_DAYS=730; LIFE_CRIT_DAYS=365  # Restlaufzeit
+TRIM_BACKLOG_PCT=2                   # ungetrimmt aufgelaufener Platz in % der Kapazität
+
+command -v smartctl >/dev/null 2>&1 || { echo "3 \"SSD SMART\" - smartctl nicht gefunden (apt install smartmontools)"; exit 0; }
+mkdir -p "$STATE_DIR" 2>/dev/null
+now=$(date +%s)
+
+# Ältere Messpunkte als 35 Tage verwerfen
+if [ -f "$HIST" ]; then
+  awk -F, -v now="$now" 'now - $1 <= 35 * 86400' "$HIST" > "$HIST.tmp" && mv "$HIST.tmp" "$HIST"
+fi
+
+for p in /sys/block/*; do
+  d=${p##*/}
+  [[ $d =~ $DEVRE ]] || continue
+  [ "$(cat "$p/queue/rotational" 2>/dev/null)" = 0 ] || continue
+  [[ $(readlink -f "$p/device" 2>/dev/null) == */usb* ]] && continue
+  dev=/dev/$d
+  sm=$(smartctl -i -A "$dev" 2>/dev/null)
+  model=$(sed -n 's/^\(Device Model\|Model Number\): *//p' <<<"$sm" | head -1)
+  serial=$(sed -n 's/^Serial Number: *//p' <<<"$sm" | head -1)
+  poh=$(awk '$1 == 9 && NF >= 10 {print $10 + 0; exit} /^Power On Hours:/ {gsub(",", "", $4); print $4 + 0; exit}' <<<"$sm")
+
+  # --- Schreibcache (SATA): Laufwerk, Kernel, Zustand beim Start, SCT ---
+  if [[ $d == sd* ]] && command -v hdparm >/dev/null 2>&1; then
+    hw=$(hdparm -W "$dev" 2>/dev/null | sed -n 's/.*write-caching *= *\([01]\).*/\1/p')
+    wc=$(cat "$p/queue/write_cache" 2>/dev/null)
+    sct=$(smartctl -g wcache-sct "$dev" 2>/dev/null | sed -n 's/^SCT Write Cache Control: *//p' | head -1)
+    grep -qiE 'not supported|unavailable' <<<"$sct" && sct=""
+    boot=$( (journalctl -k -b -o cat 2>/dev/null || dmesg 2>/dev/null) | grep -m1 "\[$d\] Write cache:" | sed -n 's/.*Write cache: *\([a-z]*\).*/\1/p')
+    st=0; txt="Laufwerk $([ "$hw" = 1 ] && echo an || ([ "$hw" = 0 ] && echo aus || echo ?))"
+    [ -n "$boot" ] && txt="$txt, beim Start $([ "$boot" = enabled ] && echo an || echo aus)"
+    [ -n "$sct" ] && txt="$txt, SCT: $sct"
+    if [ "$hw" = 1 ] && [ "$wc" = "write through" ]; then
+      st=2; txt="$txt - Kernel hält den Cache für aus und schickt keine Flushes (Datenverlust bei Stromausfall möglich): echo 1 > /sys/block/$d/device/rescan"
+    elif [ "$hw" = 0 ] || grep -qi 'force disabled' <<<"$sct"; then
+      st=1; txt="$txt - Cache aus: langsame Schreibzugriffe, hohe Schreibverstärkung$([ -n "$sct" ] && echo ". Dauerhaft einschalten: smartctl -s wcache-sct,on,p $dev")"
+    elif [ "$boot" = disabled ] && ! grep -qi 'force enabled' <<<"$sct"; then
+      txt="$txt - beim Start aus, erst danach eingeschaltet$([ -n "$sct" ] && echo "; dauerhaft im Laufwerk: smartctl -s wcache-sct,on,p $dev")"
+    fi
+    echo "$st \"SSD $d Schreibcache\" write_cache=$([ "$hw" = 1 ] && echo 1 || echo 0);;;0;1 $txt"
+  fi
+
+  # --- Schreibverstärkung: SanDisk/WD 233/241 (GiB), Crucial/Micron (247+248)/247 (Pages) ---
+  num=""; den=""; hgib=""; gib=0
+  if grep -qE 'SanDisk|^SD |SDSSD|WDS[0-9]|WD (Blue|Red|Green)' <<<"$model"; then
+    read -r num den < <(awk '$1 == 233 {n = $10} $1 == 241 {h = $10} END { if (n > 0 && h > 0) print n, h }' <<<"$sm")
+    hgib=$den; gib=1
+  elif grep -q 'FTL_Program_Page_Count' <<<"$sm"; then
+    read -r num den hgib < <(awk '$1 == 247 {h = $10} $1 == 248 {f = $10} $1 == 246 {l = $10}
+      END { if (h > 0) printf "%.0f %.0f %.1f\n", h + f, h, l * 512 / 2^30 }' <<<"$sm")
+  fi
+  rate=""
+  if [ -n "$den" ] && [ -n "$serial" ]; then
+    # Vergleichspunkt: möglichst ~24 h alt (>= 20 h), sonst >= 1 h
+    prev=$([ -r "$HIST" ] && awk -F, -v s="$serial" -v now="$now" '$2 == s {
+        if (now - $1 >= 72000) l20 = $0; else if (now - $1 >= 3600) l1 = $0 }
+        END { print (l20 != "" ? l20 : l1) }' "$HIST")
+    printf '%s,%s,%s,%s,%s\n' "$now" "$serial" "$num" "$den" "$hgib" >> "$HIST"
+    if [ -n "$prev" ]; then
+      out=$(awk -F, -v now="$now" -v num="$num" -v den="$den" -v host="$hgib" -v gib="$gib" -v l="$prev" \
+              -v w=$WAF_WARN -v c=$WAF_CRIT -v d="$d" 'BEGIN {
+        split(l, p, ","); h = (now - p[1]) / 3600; dn = num - p[3]; dd = den - p[4]; dh = host - p[5]
+        waf = dd > 0 ? dn / dd : 0
+        st = waf >= c ? 2 : waf >= w ? 1 : 0
+        printf "%d \"SSD %s Schreibverstärkung\" waf=%.2f;%d;%d|host_gib_day=%.1f", st, d, waf, w, c, dh * 24 / h
+        if (gib) printf "|nand_gib_day=%.1f", dn * 24 / h
+        printf " WAF %.1f in den letzten %.0f h, Host %.0f GiB/Tag", waf, h, dh * 24 / h
+        if (gib) printf ", NAND %.0f GiB/Tag", dn * 24 / h
+        printf " (gesamte Laufzeit: WAF %.1f)\n", num / den
+        printf "RATE %.6f\n", dn / (h / 24) }')
+      grep -v '^RATE ' <<<"$out"
+      rate=$(sed -n 's/^RATE //p' <<<"$out")
+    else
+      awk -v d="$d" -v n="$num" -v h="$den" 'BEGIN { printf "0 \"SSD %s Schreibverstärkung\" - Erster Messpunkt gespeichert, die WAF der letzten 24 h folgt mit den nächsten Läufen (gesamte Laufzeit: WAF %.1f)\n", d, n / h }'
+    fi
+  fi
+
+  # --- Verschleiß und Restlaufzeit ---
+  used=$(smartctl -l devstat "$dev" 2>/dev/null | awk '/Percentage Used Endurance Indicator/ {print $4 + 0; exit}')
+  [ -n "$used" ] || used=$(awk -v wdsd="$gib" '
+    /^Percentage Used:/ { v = $3; gsub("%", "", v); print v + 0; exit }
+    wdsd && $1 == 230 && NF >= 10 { print $10 + 0; exit }
+    ($1 == 169 || $1 == 202 || $1 == 177 || $1 == 231) && NF >= 10 { print 100 - $4; exit }' <<<"$sm")
+  if [ -n "$used" ]; then
+    awk -v d="$d" -v u="$used" -v poh="${poh:-0}" -v num="${num:-0}" -v r="${rate:-0}" -v w=$LIFE_WARN_DAYS -v c=$LIFE_CRIT_DAYS '
+      function fmt(x) { return x >= 730 ? sprintf("%.1f Jahre", x / 365) : x >= 60 ? sprintf("%.0f Monate", x / 30.4) : sprintf("%.0f Tage", x) }
+      BEGIN {
+        lt = (u > 0 && poh > 24) ? (100 - u) / u * poh / 24 : -1
+        cur = (u > 0 && r > 0 && num > 0) ? num * (100 - u) / u / r : -1
+        rem = cur >= 0 ? cur : lt
+        if (u >= 100) rem = 0
+        st = (rem >= 0 && rem < c) ? 2 : (rem >= 0 && rem < w) ? 1 : 0
+        printf "%d \"SSD %s Verschleiß\" wear_used=%d;;;0;100", st, d, u
+        if (rem >= 0) printf "|remaining_days=%.0f", rem
+        printf " Verschleiß %d %%", u
+        if (u <= 0) printf " (praktisch neu)"
+        else {
+          if (cur >= 0) printf ", Restlaufzeit bei aktuellem Tempo ~%s", fmt(cur)
+          if (lt >= 0) printf "%s bei bisherigem Durchschnitt ~%s", (cur >= 0 ? "," : ", Restlaufzeit"), fmt(lt)
+        }
+        print "" }'
+  fi
+done
+
+# --- TRIM: läuft der Timer, wann lief er zuletzt, und reicht der Zeitplan? ---
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+  if [ "$(systemctl is-enabled fstrim.timer 2>/dev/null)" != enabled ]; then
+    grep -qE '(^|,)discard(,|$)' <(awk '{print $4}' /proc/mounts) ||
+      echo "1 \"SSD TRIM\" - fstrim.timer ist nicht aktiv und kein Dateisystem nutzt discard: systemctl enable --now fstrim.timer"
+  else
+    cal=$(systemctl show fstrim.timer -p TimersCalendar --value 2>/dev/null | sed -n 's/.*OnCalendar=\([^ ;]*\).*/\1/p' | head -1)
+    case "$cal" in daily|*-*-*\ 0*) period=1 ;; monthly) period=30 ;; *) period=7 ;; esac
+    while read -r src mnt; do
+      [ "$(lsblk -ndo ROTA "$src" 2>/dev/null | tr -d ' ')" = 0 ] || continue
+      size=$(df -B1 --output=size "$mnt" 2>/dev/null | tail -1 | tr -d ' ')
+      # Bei ext4 meldet jeder fstrim-Lauf nach dem ersten eines Boots ungefähr, wie viel seither gelöscht wurde
+      journalctl -u fstrim.service -o json --no-pager -q -n 1000 2>/dev/null | awk -v m="$mnt" -v now="$now" \
+        -v size="${size:-0}" -v p="$period" -v cal="${cal:-weekly}" -v lim=$TRIM_BACKLOG_PCT '
+        {
+          if (!match($0, /"MESSAGE":"[^"]*"/)) next
+          msg = substr($0, RSTART + 11, RLENGTH - 12)
+          if (index(msg, m ": ") != 1 || msg !~ /bytes\) trimmed/) next
+          b = msg; sub(/.*\(/, "", b); sub(/ bytes.*/, "", b)
+          match($0, /"__REALTIME_TIMESTAMP":"[0-9]+"/); t = substr($0, RSTART + 24, RLENGTH - 25) / 1e6
+          match($0, /"_BOOT_ID":"[^"]*"/); boot = substr($0, RSTART, RLENGTH)
+          if (boot == lastboot && t - last > 3600) { n++; R[n] = b / (t - last) * 86400 }
+          lastboot = boot; last = t
+        }
+        END {
+          st = 0; txt = ""
+          if (last == 0) { st = 1; txt = "noch kein fstrim-Lauf im Journal" }
+          else {
+            age = (now - last) / 86400
+            txt = sprintf("letzter Lauf vor %.1f Tagen (Zeitplan %s)", age, cal)
+            if (age > p + 1) { st = 1; txt = txt " - überfällig" }
+          }
+          perf = sprintf("trim_age_days=%.1f;%d", (last ? (now - last) / 86400 : 0), p + 1)
+          if (n > 0) {
+            k = 0; for (i = (n > 5 ? n - 4 : 1); i <= n; i++) r[++k] = R[i]
+            for (i = 1; i <= k; i++) for (j = i + 1; j <= k; j++) if (r[j] < r[i]) { x = r[i]; r[i] = r[j]; r[j] = x }
+            rate = r[int((k + 1) / 2)]; back = rate * p; pct = size > 0 ? 100 * back / size : 0
+            perf = perf sprintf("|deleted_gib_day=%.1f|untrimmed_pct=%.2f;%d", rate / 2^30, pct, lim)
+            txt = txt sprintf(", Ø %.1f GiB/Tag gelöscht, bis zum nächsten Lauf bis zu %.0f GiB (%.1f %%) ungetrimmt", rate / 2^30, back / 2^30, pct)
+            if (p > 1 && pct >= lim) { if (st < 1) st = 1; txt = txt " - täglich trimmen: systemctl edit fstrim.timer, [Timer] OnCalendar= und OnCalendar=daily" }
+          }
+          printf "%d \"SSD TRIM %s\" %s %s\n", st, m, perf, txt
+        }'
+    done < <(awk '$3 == "ext4" && $1 ~ "^/dev/" {print $1, $2}' /proc/mounts | sort -u -k2,2)
+  fi
+fi

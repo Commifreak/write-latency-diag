@@ -79,6 +79,48 @@ Report und Messwerte (`samples.csv`, eine Zeile pro Sekunde und Gerät) liegen u
   12 h oder mehr) zeigt das Skript die Schreibverstärkung seit dem letzten Messpunkt. So sieht man, ob eine Änderung
   gewirkt hat.
 
+## Dauerhaft überwachen mit CheckMK
+
+Im Ordner `checkmk/` liegen zwei Local Checks für den CheckMK-Agent:
+
+| Datei | Läuft | Services |
+|---|---|---|
+| `write_latency` | bei jedem Agent-Aufruf | `SSD sdX Latenz` (Flush- und Write-Latenz, Flushes/s, Durchsatz, Auslastung), `IO-Druck` und `CPU-Druck` (PSI), `Top-Schreiber` (netto, nach Prozessname) |
+| `write_latency_smart` | alle 30 Minuten | `SSD sdX Schreibcache`, `SSD sdX Schreibverstärkung` (letzte 24 h), `SSD sdX Verschleiß` (mit Restlaufzeit), `SSD TRIM <Mountpunkt>` |
+
+Installation auf dem überwachten Server:
+
+```bash
+sudo wget -O /usr/lib/check_mk_agent/local/write_latency https://raw.githubusercontent.com/Commifreak/write-latency-diag/main/checkmk/write_latency
+```
+
+```bash
+sudo mkdir -p /usr/lib/check_mk_agent/local/1800 && sudo wget -O /usr/lib/check_mk_agent/local/1800/write_latency_smart https://raw.githubusercontent.com/Commifreak/write-latency-diag/main/checkmk/write_latency_smart
+```
+
+```bash
+sudo chmod +x /usr/lib/check_mk_agent/local/write_latency /usr/lib/check_mk_agent/local/1800/write_latency_smart
+```
+
+Danach in CheckMK die Services des Hosts neu erkennen lassen. Beide Checks lassen sich zum Testen auch direkt
+aufrufen. Die Werte beziehen sich immer auf den Zeitraum seit dem letzten Aufruf (Zustand unter
+`/var/lib/write-latency-diag/`). Der erste Aufruf liefert deshalb nur Startwerte, die Schreibverstärkung der letzten
+24 h steht nach einem Tag fest. Die Schwellwerte stehen oben in den Dateien:
+
+| Service | WARN | CRIT |
+|---|---|---|
+| Flush-Latenz Ø | 10 ms | 50 ms |
+| Write-await Ø | 20 ms | 100 ms |
+| IO-Druck (PSI io full, avg60) | 10 % | 25 % |
+| CPU-Druck (PSI cpu some, avg60) | 20 % | 40 % |
+| Schreibverstärkung (24 h) | 5 | 10 |
+| Restlaufzeit | < 2 Jahre | < 1 Jahr |
+| Schreibcache | aus | Kernel hält ihn für aus, obwohl er an ist |
+| TRIM | überfällig oder mehr als 2 % der Kapazität ungetrimmt | – |
+
+Kurze Hänger innerhalb einer Minute sieht der Latenz-Service nur, wenn sie den Minuten-Schnitt deutlich anheben.
+Für die genaue Analyse mit fsync-Aufrufern bleibt das Skript.
+
 ## Wie wird entschieden?
 
 | Messgröße | Bedeutung |

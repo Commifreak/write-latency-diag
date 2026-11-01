@@ -1,0 +1,102 @@
+#!/bin/bash
+#
+# CheckMK Local Check (schneller Teil, läuft bei jedem Agent-Aufruf):
+# Latenz und Flush-Zeiten je SSD, IO- und CPU-Druck (PSI) sowie die größten Schreiber.
+#
+# Installation: nach /usr/lib/check_mk_agent/local/write_latency kopieren und ausführbar machen.
+# Gemessen wird jeweils seit dem letzten Aufruf (Zustandsdatei), der erste Aufruf liefert nur Startwerte.
+#
+
+STATE_DIR="/var/lib/write-latency-diag"
+STATE="$STATE_DIR/checkmk-fast.state"
+DEVRE='^(sd[a-z]+|nvme[0-9]+n[0-9]+|vd[a-z]+|xvd[a-z]+)$'
+
+# Schwellwerte (ms bzw. %)
+FLUSH_WARN=10;  FLUSH_CRIT=50
+WAWAIT_WARN=20; WAWAIT_CRIT=100
+PSI_IO_WARN=10; PSI_IO_CRIT=25
+PSI_CPU_WARN=20; PSI_CPU_CRIT=40
+
+mkdir -p "$STATE_DIR" 2>/dev/null
+now=$(awk '{print $1}' /proc/uptime)
+
+# Nur nicht rotierende, nicht per USB angeschlossene Laufwerke
+ssds=""
+for p in /sys/block/*; do
+  d=${p##*/}
+  [[ $d =~ $DEVRE ]] || continue
+  [ "$(cat "$p/queue/rotational" 2>/dev/null)" = 0 ] || continue
+  [[ $(readlink -f "$p/device" 2>/dev/null) == */usb* ]] && continue
+  ssds="$ssds $d"
+done
+
+# Aktuelle Werte: Laufwerke (diskstats), Schreibmenge je Prozess (netto, ohne vor dem Zurückschreiben Gelöschtes)
+cur=$(
+  echo "T $now"
+  awk -v list=" $ssds " 'index(list, " " $3 " ") { print "D", $3, $8, $10, $11, $13, ($19 == "" ? 0 : $19), ($20 == "" ? 0 : $20) }' /proc/diskstats
+  grep -s -H -E '^(cancelled_)?write_bytes' /proc/[0-9]*/io | awk -F'[/: ]+' '
+    { v = $NF; if ($5 ~ /^cancelled/) w[$3] -= v; else w[$3] += v }
+    END { for (p in w) print "P", p, w[p] }'
+  grep -s -H . /proc/[0-9]*/comm | awk '{ pid = $0; sub(/^\/proc\//, "", pid); sub(/\/.*/, "", pid); c = $0; sub(/^[^:]*:/, "", c); gsub(/ /, "_", c); print "C", pid, c }'
+)
+
+prev=""
+[ -r "$STATE" ] && prev=$(cat "$STATE")
+printf '%s\n' "$cur" | grep -v '^C ' > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
+
+if [ -z "$prev" ]; then
+  for d in $ssds; do echo "0 \"SSD $d Latenz\" - Erste Messung, Werte ab dem nächsten Agent-Aufruf"; done
+  echo "0 \"Top-Schreiber\" - Erste Messung, Werte ab dem nächsten Agent-Aufruf"
+else
+  { printf '%s\n' "$prev" | sed 's/^/O /'; printf '%s\n' "$cur"; } | awk \
+    -v fw=$FLUSH_WARN -v fc=$FLUSH_CRIT -v ww=$WAWAIT_WARN -v wc=$WAWAIT_CRIT '
+    $1 == "O" && $2 == "T" { t0 = $3; next }
+    $1 == "O" && $2 == "D" { for (i = 4; i <= 9; i++) od[$3, i] = $i; seen[$3] = 1; next }
+    $1 == "O" && $2 == "P" { ow[$3] = $4; next }
+    $1 == "T" { t1 = $2; next }
+    $1 == "D" { for (i = 3; i <= 8; i++) nd[$2, i + 1] = $i; dev[$2] = 1; next }
+    $1 == "P" { nw[$2] = $3; next }
+    $1 == "C" { comm[$2] = $3; next }
+    END {
+      dt = t1 - t0; if (dt <= 0) dt = 1
+      for (d in dev) {
+        if (!(d in seen)) continue
+        dw = nd[d, 4] - od[d, 4]; ds = nd[d, 5] - od[d, 5]; dwt = nd[d, 6] - od[d, 6]
+        dio = nd[d, 7] - od[d, 7]; df = nd[d, 8] - od[d, 8]; dft = nd[d, 9] - od[d, 9]
+        wa = dw > 0 ? dwt / dw : 0; fa = df > 0 ? dft / df : 0
+        util = 100 * dio / (dt * 1000); if (util > 100) util = 100
+        st = 0
+        # Erst ab einigen Anfragen bewerten, einzelne Ausreißer bei Leerlauf sind kein Befund
+        if (df >= 10) { if (fa >= fc) st = 2; else if (fa >= fw && st < 1) st = 1 }
+        if (dw >= 10) { if (wa >= wc) st = 2; else if (wa >= ww && st < 1) st = 1 }
+        printf "%d \"SSD %s Latenz\" flush_ms=%.2f;%d;%d|write_await_ms=%.2f;%d;%d|flush_per_s=%.1f|write_mbs=%.2f|util=%.1f;;;0;100 Flush %.2f ms (%.1f/s), Write-await %.2f ms, %.2f MB/s, Auslastung %.0f %% (Mittel über %.0f s)\n",
+          st, d, fa, fw, fc, wa, ww, wc, df / dt, ds * 512 / 1048576 / dt, util, fa, df / dt, wa, ds * 512 / 1048576 / dt, util, dt
+      }
+      # Top-Schreiber: Zuwachs je Prozess, zusammengefasst nach Name. Beendete Kindprozesse erscheinen
+      # beim Elternprozess, der sie abräumt (z.B. systemd).
+      for (p in nw) if (p in ow) { x = nw[p] - ow[p]; if (x > 0) { c = (p in comm) ? comm[p] : "pid" p; W[c] += x; tot += x } }
+      s = ""
+      for (i = 1; i <= 3; i++) {
+        b = ""; bv = 0
+        for (c in W) if (!(c in used) && W[c] > bv) { bv = W[c]; b = c }
+        if (b == "" || bv / 1048576 / dt < 0.01) break
+        used[b] = 1
+        s = s (s == "" ? "" : ", ") b " " sprintf("%.2f MB/s", bv / 1048576 / dt)
+      }
+      printf "0 \"Top-Schreiber\" write_total_mbs=%.2f %s\n", tot / 1048576 / dt, (s == "" ? "kaum Schreibzugriffe" : s)
+    }'
+fi
+
+# PSI: Anteil der Zeit, in der Prozesse auf IO bzw. CPU warten (Mittel der letzten 60 s)
+psi() { awk -v k="$2" '$1 == k { for (i = 2; i <= NF; i++) if ($i ~ /^avg60=/) { sub("avg60=", "", $i); print $i } }' "/proc/pressure/$1" 2>/dev/null; }
+io_some=$(psi io some); io_full=$(psi io full); cpu_some=$(psi cpu some)
+if [ -n "$io_full" ]; then
+  awk -v s="$io_some" -v f="$io_full" -v w=$PSI_IO_WARN -v c=$PSI_IO_CRIT 'BEGIN {
+    st = f >= c ? 2 : f >= w ? 1 : 0
+    printf "%d \"IO-Druck\" psi_io_full=%.2f;%d;%d|psi_io_some=%.2f Prozesse komplett durch IO blockiert: %.1f %%, teilweise: %.1f %% (avg60)\n", st, f, w, c, s, f, s }'
+fi
+if [ -n "$cpu_some" ]; then
+  awk -v s="$cpu_some" -v w=$PSI_CPU_WARN -v c=$PSI_CPU_CRIT 'BEGIN {
+    st = s >= c ? 2 : s >= w ? 1 : 0
+    printf "%d \"CPU-Druck\" psi_cpu_some=%.2f;%d;%d Prozesse warten auf CPU-Zeit: %.1f %% (avg60)\n", st, s, w, c, s }'
+fi
