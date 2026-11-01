@@ -467,7 +467,7 @@ function norm_comm(c) {
   sub(/\/[0-9]+$/, "", c)
   return c
 }
-function read_procs(   cmd, pid, f, line, lp, a) {
+function read_procs(   cmd, pid, f, line, lp, a, v) {
   delete P_cur; delete P_wb
   cmd = "ls /proc 2>/dev/null"
   while ((cmd | getline pid) > 0) {
@@ -486,10 +486,14 @@ function read_procs(   cmd, pid, f, line, lp, a) {
   }
   close(cmd)
   # Schreibmenge je Prozess (inkl. beendeter Kindprozesse, die er abgeräumt hat); nur als root vollständig.
+  # Netto: Daten, die vor dem Zurückschreiben wieder gelöscht werden (cancelled_write_bytes), erreichen die Platte nie.
   # Über grep statt getline: mawk bricht bei Lesefehlern (EACCES) auf /proc/<pid>/io komplett ab.
-  cmd = "grep -s -H \"^write_bytes\" /proc/[0-9]*/io"
+  cmd = "grep -s -H -E \"^(cancelled_)?write_bytes\" /proc/[0-9]*/io"
   while ((cmd | getline line) > 0)
-    if (split(line, a, "/") >= 4) { sub(/.* /, "", line); P_wb[a[3]] = line + 0 }
+    if (split(line, a, "/") >= 4) {
+      v = line; sub(/.* /, "", v)
+      if (line ~ /:cancelled_/) P_wb[a[3]] -= v; else P_wb[a[3]] += v
+    }
   close(cmd)
 }
 function sample() {
@@ -558,7 +562,7 @@ function interval(dt,   c, t, b, busy, iow, maxc, maxcn, dtot, pc, pis, pif, p, 
     b = 100 * (t - (C_idle[c] - Cp_idle[c]) - (C_iow[c] - Cp_iow[c])) / t
     if (b > maxc) { maxc = b; maxcn = c }
   }
-  S_busy += busy; S_iow += iow
+  S_busy += busy; S_iow += iow; S_dt += dt
   if (maxc >= 95) Nsat++
   pc = pct(Pc, Pc_p, dt); pis = pct(Pis, Pis_p, dt); pif = pct(Pif, Pif_p, dt)
   if (pc >= 0) { S_pc += pc; N_pc++ }
@@ -590,7 +594,9 @@ function interval(dt,   c, t, b, busy, iow, maxc, maxcn, dtot, pc, pis, pif, p, 
   for (p in P_wb) if (p in P_wbp) {
     dd = P_wb[p] - P_wbp[p]
     if (dd > 0 && Cred[p] > 0) { c = (Cred[p] < dd) ? Cred[p] : dd; dd -= c; Cred[p] -= c }
-    if (dd > 0) { Wd[P_comm[p]] += dd; Wtot[P_comm[p]] += dd }
+    # Gelöschtes kann ein Intervall später als das Schreiben zählen: in der Summe verrechnen, in der Zeile nicht
+    if (dd != 0) Wtot[P_comm[p]] += dd
+    if (dd > 0) Wd[P_comm[p]] += dd
   }
   wtop = topw(Wd, dt, 3)
 
@@ -645,7 +651,7 @@ function interval(dt,   c, t, b, busy, iow, maxc, maxcn, dtot, pc, pis, pif, p, 
     printf "%s,%s,%s,%.2f,%.1f,%.3f,%.1f,%.3f,%.2f,%.1f,%.2f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%s,%s,%.2f\n",
       tclock, phase, d, wmbs, dw / dt, wa, df / dt, fa, rmbs, util, aqu, busy, iow, maxc, pc, pis, pif, TopName, TopW, TopWmbs >> csv
   }
-  if (iflag) { Nslow++; for (k in Wd) Wslow[k] += Wd[k] }
+  if (iflag) { Nslow++; S_dtslow += dt; for (k in Wd) Wslow[k] += Wd[k] }
   if (!quiet || iflag) {
     if (Nprinted % 20 == 0)
       printf "%-8s %5s %11s %6s %7s %13s   %s\n", "Zeit", "CPU", "max.Kern", "iowait", "PSIcpu", "PSIio s/f", "Top-Prozesse (% eines Kerns)"
@@ -666,7 +672,7 @@ function add(side, pts, msg) {
   Fn++; F[Fn] = sprintf("  [%s] %s", side, msg)
 }
 function summary(   i, d, k, n, x, aw, af, minaw, bf, first, last, tn, tops, wgb, busy, sat, verdict, cnt, avgp, dl, tpa, nst) {
-  printf "\n--- Auswertung: %s (%d Messpunkte à %ss) ---\n", label, N, interval_s
+  printf "\n--- Auswertung: %s (%d Messpunkte à %ss, %.1f h) ---\n", label, N, interval_s, S_dt / 3600
   if (N < 2) { print "  Zu wenige Messpunkte."; return }
   busy = S_busy / N; sat = 100 * Nsat / N
   printf "CPU:  Ø Auslastung %.0f%%, Ø iowait %.0f%% (= Warten auf IO, keine CPU-Last), ein Kern >=95%% in %.0f%% der Intervalle\n", busy, S_iow / N, sat
@@ -677,7 +683,7 @@ function summary(   i, d, k, n, x, aw, af, minaw, bf, first, last, tn, tops, wgb
     x = ""; n = 0
     for (k in tn) if (tn[k] > n) { n = tn[k]; x = k }
     if (x == "") break
-    avgp = 100 * n / hz / (N * interval_s)
+    avgp = 100 * n / hz / S_dt
     if (avgp < 1) break
     TOP[x] = avgp
     if (i == 1) TOP1 = x
@@ -692,7 +698,7 @@ function summary(   i, d, k, n, x, aw, af, minaw, bf, first, last, tn, tops, wgb
     x = ""; n = 0
     for (k in tn) if (tn[k] > n) { n = tn[k]; x = k }
     if (x == "" || n < 1048576) break
-    tops = tops sprintf("%s %.2f MB/s (%.2f GB)  ", x, n / 1048576 / (N * interval_s), n / 1e9)
+    tops = tops sprintf("%s %.2f MB/s (%.2f GB)  ", x, n / 1048576 / S_dt, n / 1e9)
     delete tn[x]
   }
   for (k in tn) delete tn[k]
@@ -705,7 +711,7 @@ function summary(   i, d, k, n, x, aw, af, minaw, bf, first, last, tn, tops, wgb
         x = ""; n = 0
         for (k in tn) if (tn[k] > n) { n = tn[k]; x = k }
         if (x == "" || n < 1048576) break
-        tops = tops sprintf("%s %.2f MB/s  ", x, n / 1048576 / (Nslow * interval_s))
+        tops = tops sprintf("%s %.2f MB/s  ", x, n / 1048576 / S_dtslow)
         delete tn[x]
       }
       for (k in tn) delete tn[k]
@@ -878,8 +884,13 @@ tracepoint:syscalls:sys_exit_msync
 }
 
 // Jeder Thread meldet beim Ende nur seine eigene Schreibmenge - nichts wird doppelt gezählt.
+// Getrennt davon, wie viel er vor dem Zurückschreiben wieder gelöscht hat (erreicht die Platte nie).
 tracepoint:sched:sched_process_exit
-{ $w = curtask->ioac.write_bytes; if ($w > 0) { @exit_wb[curtask->group_leader->comm] = sum($w); } }
+{
+  $w = curtask->ioac.write_bytes; $c = curtask->ioac.cancelled_write_bytes;
+  if ($w > 0) { @exit_wb[curtask->group_leader->comm] = sum($w); }
+  if ($c > 0) { @exit_cw[curtask->group_leader->comm] = sum($c); }
+}
 
 END { clear(@start); }
 BT
@@ -911,7 +922,10 @@ trace_stop() {
     printf '\nbpftrace-Tracing nicht möglich: %s\n' "$(grep -v RLIMIT_MEMLOCK "$BT_OUT.err" | grep -m1 -i error)"
     return
   fi
-  awk -v dur="$dur" '
+  # Läuft ein Prozess noch, waren es nur beendete Threads; die stecken schon in den Top-Schreibern.
+  local running
+  running=$(cat /proc/[0-9]*/comm 2>/dev/null | sort -u | tr '\n' '|')
+  awk -v dur="$dur" -v running="|$running" '
     function key(l) { sub(/^@[a-z_]+\[/, "", l); sub(/\]: -?[0-9]+$/, "", l); return l }
     function val(l) { sub(/.*\]: /, "", l); return l + 0 }
     function name(k,   a) { split(k, a, ", "); return (a[2] == "" || a[1] == a[2]) ? a[1] : a[1] "/" a[2] }
@@ -919,6 +933,7 @@ trace_stop() {
     /^@sync_us\[/  { U[key($0)] = val($0) }
     /^@sync_max\[/ { M[key($0)] = val($0) }
     /^@exit_wb\[/  { E[key($0)] = val($0) }
+    /^@exit_cw\[/  { C[key($0)] = val($0) }
     END {
       if (dur < 1) dur = 1
       printf "\nfsync-Aufrufer (bpftrace, %d s): insgesamt %.1f pro Sekunde\n", dur, tot / dur
@@ -937,12 +952,15 @@ trace_stop() {
       s = ""
       for (i = 1; i <= 8; i++) {
         b = ""; bv = 0
-        for (k in E) if (!(k in usedE) && E[k] > bv) { bv = E[k]; b = k }
+        for (k in E) if (!(k in usedE) && index(running, "|" k "|") == 0 && E[k] > bv) { bv = E[k]; b = k }
         if (b == "" || bv < 1048576) break
         usedE[b] = 1
-        s = s sprintf("%s %.2f GB  ", b, bv / 1e9)
+        s = s sprintf("%s %.2f GB%s  ", b, bv / 1e9, C[b] > 0.1 * bv ? sprintf(" (davon %.2f GB gleich wieder gelöscht)", (C[b] < bv ? C[b] : bv) / 1e9) : "")
       }
-      if (s != "") printf "Während der Messung beendete Prozesse (Schreibmenge über ihre ganze Laufzeit): %s\n", s
+      if (s != "") {
+        printf "Während der Messung beendete Prozesse (Schreibmenge über ihre ganze Laufzeit): %s\n", s
+        print "  (Steckt oben auch beim Elternprozess, der sie abgeräumt hat, z.B. systemd. Gleich wieder Gelöschtes erreicht die Platte nicht.)"
+      }
     }' "$BT_OUT"
 }
 
