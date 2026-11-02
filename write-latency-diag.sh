@@ -94,6 +94,8 @@ done
 HAVE_FIO=0
 command -v fio >/dev/null 2>&1 && [ -z "${NO_FIO:-}" ] && HAVE_FIO=1
 HAVE_BT=0
+# Rotierende Laufwerke (HDDs): 5-20 ms pro Anfrage und Flush sind dort normal, sie zählen nicht als SSD-Befund
+ROTDEVS=$(for p in /sys/block/*; do [ "$(cat "$p/queue/rotational" 2>/dev/null)" = 1 ] && printf '%s ' "${p##*/}"; done)
 [ $TRACE -eq 1 ] && [ "$(id -u)" -eq 0 ] && command -v bpftrace >/dev/null 2>&1 && HAVE_BT=1
 HZ=$(getconf CLK_TCK 2>/dev/null || echo 100)
 
@@ -187,6 +189,18 @@ wear_forecast() { # dev used% poh num rate_per_day
   esac
 }
 
+# Abstand in Tagen für einen OnCalendar-Ausdruck. systemd zeigt daily als "*-*-* 00:00:00",
+# weekly als "Mon *-*-* 00:00:00" und monthly als "*-*-01 00:00:00". Unbekanntes: leer (dann gemessen).
+trim_period() {
+  case "$1" in
+    *..*|*,*) echo "" ;;
+    weekly|Mon*|Tue*|Wed*|Thu*|Fri*|Sat*|Sun*|"") echo 7 ;;
+    daily|'*-*-* '*|'*-*-*') echo 1 ;;
+    monthly|'*-*-'[0-9]*) echo 30 ;;
+    *) echo "" ;;
+  esac
+}
+
 # Reicht wöchentliches TRIM? ext4 merkt sich, welche Blockgruppen schon getrimmt sind. Jeder weitere
 # fstrim-Lauf im selben Boot meldet deshalb ungefähr, wie viel seit dem letzten Lauf gelöscht wurde
 # (eher etwas zu viel, weil ganze Gruppen neu getrimmt werden). Der erste Lauf nach einem Neustart
@@ -200,9 +214,7 @@ trim_advice() { # OnCalendar-Wert des fstrim.timer
     rota=$(lsblk -ndo ROTA "$src" 2>/dev/null | tr -d ' ')
     [ "$rota" = 0 ] || continue
     size=$(df -B1 --output=size "$mnt" 2>/dev/null | tail -1 | tr -d ' ')
-    case "$1" in
-      daily|*-*-*\ 0*) period=1 ;; weekly|"") period=7 ;; monthly) period=30 ;; *) period="" ;;
-    esac
+    period=$(trim_period "$1")
     res=$(journalctl -u fstrim.service -o json --no-pager -q -n 1000 2>/dev/null | awk -v m="$mnt" '
       {
         if (!match($0, /"MESSAGE":"[^"]*"/)) next
@@ -457,7 +469,7 @@ static_check() {
   if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
     if [ "$(systemctl is-enabled fstrim.timer 2>/dev/null)" = "enabled" ]; then
       local cal
-      cal=$(systemctl show fstrim.timer -p TimersCalendar --value 2>/dev/null | sed -n 's/.*OnCalendar=\([^ ;]*\).*/\1/p' | head -1)
+      cal=$(systemctl show fstrim.timer -p TimersCalendar --value 2>/dev/null | sed -n 's/.*OnCalendar=\([^;]*[^ ;]\) *;.*/\1/p' | head -1)
       ok "fstrim.timer aktiv (${cal:-Zeitplan unbekannt})."
       trim_advice "$cal"
     elif ! grep -qE '(^|,)discard' <(awk '{print $4}' /proc/mounts); then
@@ -758,6 +770,7 @@ function interval(dt,   c, t, b, busy, iow, maxc, maxcn, dtot, pc, pis, pif, p, 
       if (df >= 3 && fa >= 20) flag = "<< LANGSAM (Flush)"
       # Wenige Anfragen, die aber hunderte ms hängen, während das Gerät voll belegt ist: Stall im Gerät.
       if (flag == "" && util >= 50 && ((dw > 0 && wa >= 200) || (df > 0 && fa >= 200))) flag = "<< LANGSAM (Stall)"
+      if (index(" " rotdevs " ", " " d " ")) flag = ""
       if (flag != "") { A_stall[d]++; Nstall++; I_stall[d] = 1; iflag = 1 } else I_fast[d] = 1
       if ((dw >= 5 || wa >= 200) && wa > A_wamax[d]) A_wamax[d] = wa
       if ((df >= 3 || fa >= 200) && fa > A_famax[d]) A_famax[d] = fa
@@ -845,10 +858,11 @@ function summary(   i, d, k, n, x, aw, af, minaw, bf, first, last, tn, tops, wgb
     aw = T_wios[d] ? T_wtk[d] / T_wios[d] : 0
     af = T_fios[d] ? T_ftk[d] / T_fios[d] : 0
     wgb = T_wsec[d] * 512 / 1e9
-    printf "  %-8s %7.2f GB %7.0fK %6.2fms %8.1fms %10d %7.2fms %7.1fms %6.0f%% %6d/%-5d\n", d, wgb,
-      T_wios[d] ? T_wsec[d] * 512 / 1024 / T_wios[d] : 0, aw, A_wamax[d], T_fios[d], af, A_famax[d], A_util[d] / A_n[d], A_stall[d], A_n[d]
+    hdd = index(" " rotdevs " ", " " d " ") > 0
+    printf "  %-8s %7.2f GB %7.0fK %6.2fms %8.1fms %10d %7.2fms %7.1fms %6.0f%% %6d/%-5d%s\n", d, wgb,
+      T_wios[d] ? T_wsec[d] * 512 / 1024 / T_wios[d] : 0, aw, A_wamax[d], T_fios[d], af, A_famax[d], A_util[d] / A_n[d], A_stall[d], A_n[d], (hdd ? " (HDD)" : "")
     AW[d] = aw; AF[d] = af
-    if (T_wios[d] >= 50 && (minaw < 0 || aw < minaw)) minaw = aw
+    if (!hdd && T_wios[d] >= 50 && (minaw < 0 || aw < minaw)) minaw = aw
   }
 
   if (APP["tool"] != "") {
@@ -880,6 +894,7 @@ function summary(   i, d, k, n, x, aw, af, minaw, bf, first, last, tn, tops, wgb
   for (i = 1; i <= Ndev; i++) {
     d = Dlist[i]
     if (!(d in A_n) || A_n[d] < 3) continue
+    if (index(" " rotdevs " ", " " d " ")) continue   # HDDs: Latenzen im ms-Bereich sind dort normal
     x = 100 * A_stall[d] / A_n[d]
     if (x >= 20) add("SSD", 2, sprintf("%s: in %.0f%% der aktiven Intervalle extrem langsame Schreib-/Flush-Zeiten (max await %.0f ms%s).", d, x, A_wamax[d], A_famax[d] > 0 ? sprintf(", max Flush %.0f ms", A_famax[d]) : ""))
     else if (x >= 5) add("SSD", 1, sprintf("%s: gelegentliche Schreib-Stalls (%d Intervalle, max await %.0f ms).", d, A_stall[d], A_wamax[d]))
@@ -1092,7 +1107,7 @@ start_sampler() { # label mode duration appfile
   rm -f "$CUR_STOP"
   ( trap '' INT; exec awk -v devre="$DEVRE" -v hz="$HZ" -v interval_arg="$INTERVAL" -v duration="$3" \
       -v stopfile="$CUR_STOP" -v csv="$CSV" -v phase="$PHASE_N" -v label="$1" -v mode="$2" \
-      -v appfile="$4" -v sumfile="$OUT/phase$PHASE_N.sum" -v mdmembers="$MDMEMBERS" -v quiet="$QUIET" -f "$OUT/sampler.awk" ) &
+      -v appfile="$4" -v sumfile="$OUT/phase$PHASE_N.sum" -v mdmembers="$MDMEMBERS" -v rotdevs="$ROTDEVS" -v quiet="$QUIET" -f "$OUT/sampler.awk" ) &
   SAMPLER=$!
   SUMFILES+=("$OUT/phase$PHASE_N.sum")
 }

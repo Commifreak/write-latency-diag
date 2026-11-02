@@ -124,8 +124,14 @@ if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
     grep -qE '(^|,)discard(,|$)' <(awk '{print $4}' /proc/mounts) ||
       echo "1 \"SSD TRIM\" - fstrim.timer ist nicht aktiv und kein Dateisystem nutzt discard: systemctl enable --now fstrim.timer"
   else
-    cal=$(systemctl show fstrim.timer -p TimersCalendar --value 2>/dev/null | sed -n 's/.*OnCalendar=\([^ ;]*\).*/\1/p' | head -1)
-    case "$cal" in daily|*-*-*\ 0*) period=1 ;; monthly) period=30 ;; *) period=7 ;; esac
+    cal=$(systemctl show fstrim.timer -p TimersCalendar --value 2>/dev/null | sed -n 's/.*OnCalendar=\([^;]*[^ ;]\) *;.*/\1/p' | head -1)
+    # systemd zeigt daily als "*-*-* 00:00:00", weekly als "Mon *-*-* 00:00:00", monthly als "*-*-01 00:00:00"
+    case "$cal" in
+      weekly|Mon*|Tue*|Wed*|Thu*|Fri*|Sat*|Sun*|"") period=7 ;;
+      daily|'*-*-* '*|'*-*-*') period=1 ;;
+      monthly|'*-*-'[0-9]*) period=30 ;;
+      *) period=7 ;;
+    esac
     while read -r src mnt; do
       [ "$(lsblk -ndo ROTA "$src" 2>/dev/null | tr -d ' ')" = 0 ] || continue
       size=$(df -B1 --output=size "$mnt" 2>/dev/null | tail -1 | tr -d ' ')
