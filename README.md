@@ -20,6 +20,13 @@ chmod +x /tmp/wlat.sh
 
 Das Skript als root starten (`sudo`). Sonst fehlen SMART-Daten.
 
+**Automatisches Update:** Bei jedem Start lädt das Skript die aktuelle Version von GitHub (`main`), prüft sie
+(vollständig, gültige Bash-Syntax) und startet sich bei Änderungen neu. Ist der CheckMK-Agent installiert
+(`/usr/lib/check_mk_agent`), installiert bzw. aktualisiert es außerdem die beiden Local Checks (siehe unten).
+Ohne Netzverbindung läuft die vorhandene Version weiter. Liegt das Skript in einer Git-Arbeitskopie, wird es nicht
+überschrieben. Abschalten mit `-U` oder `WLAT_NO_UPDATE=1`. Da das Skript als root läuft, führt das Update Code aus
+diesem Repository mit root-Rechten aus. Wer das nicht möchte, startet immer mit `-U`.
+
 ## Vorgehen
 
 **1. Aktiver Test (ca. 1 Minute)**
@@ -102,7 +109,8 @@ sudo mkdir -p /usr/lib/check_mk_agent/local/1800 && sudo wget -O /usr/lib/check_
 sudo chmod +x /usr/lib/check_mk_agent/local/write_latency /usr/lib/check_mk_agent/local/1800/write_latency_smart
 ```
 
-Danach in CheckMK die Services des Hosts neu erkennen lassen. Beide Checks lassen sich zum Testen auch direkt
+Danach in CheckMK die Services des Hosts neu erkennen lassen. Einfacher: Das Skript einmal als root starten. Es
+installiert die Checks bei vorhandenem Agent selbst und hält sie bei jedem weiteren Start aktuell. Beide Checks lassen sich zum Testen auch direkt
 aufrufen. Die Werte beziehen sich immer auf den Zeitraum seit dem letzten Aufruf (Zustand unter
 `/var/lib/write-latency-diag/`). Der erste Aufruf liefert deshalb nur Startwerte, die Schreibverstärkung der letzten
 24 h steht nach einem Tag fest. Die Schwellwerte stehen oben in den Dateien:

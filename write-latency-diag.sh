@@ -10,7 +10,7 @@
 # eine temporäre Testdatei in das angegebene Verzeichnis und löschen sie danach.
 #
 
-VERSION="1.2"
+VERSION="1.3"
 
 PASSIVE=""            # Dauer der passiven Beobachtung in Sekunden
 INTERVAL=1
@@ -24,6 +24,10 @@ QUIET=0
 TRACE=1
 STATE_DIR="/var/lib/write-latency-diag"   # SMART-Verlauf für die aktuelle Schreibverstärkung
 TARGETS=()
+AUTO_UPDATE=1
+UPDATE_URL="${WLAT_UPDATE_URL:-https://raw.githubusercontent.com/Commifreak/write-latency-diag/main}"
+CMK_LOCAL="/usr/lib/check_mk_agent/local"
+ORIG_ARGS=("$@")
 
 usage() {
   cat <<EOF
@@ -47,6 +51,7 @@ Aufruf: $0 [Optionen]
   -n         Systemcheck überspringen
   -q         Nur auffällige Intervalle ausgeben (für lange Läufe)
   -T         Kein bpftrace-Tracing (fsync-Aufrufer, beendete Prozesse)
+  -U         Kein automatisches Update (Skript und CheckMK-Checks)
   -h         Hilfe
 
 Beispiele:
@@ -57,7 +62,7 @@ Beispiele:
 EOF
 }
 
-while getopts "d:t:r:S:i:D:o:nqTh" opt; do
+while getopts "d:t:r:S:i:D:o:nqTUh" opt; do
   case $opt in
     d) PASSIVE=$OPTARG ;;
     t) TARGETS+=("${OPTARG%/}") ;;
@@ -69,10 +74,71 @@ while getopts "d:t:r:S:i:D:o:nqTh" opt; do
     n) SKIP_STATIC=1 ;;
     q) QUIET=1 ;;
     T) TRACE=0 ;;
+    U) AUTO_UPDATE=0 ;;
     h) usage; exit 0 ;;
     *) usage; exit 1 ;;
   esac
 done
+
+# ---------------------------------------------------------------------------
+# Automatisches Update: Skript und, falls der CheckMK-Agent installiert ist, die Local Checks
+# auf den Stand von GitHub (main) bringen. Abschalten mit -U oder WLAT_NO_UPDATE=1.
+# ---------------------------------------------------------------------------
+UPDATE_MSGS=()
+fetch() { # url ziel
+  if command -v curl >/dev/null 2>&1; then curl -fsSL --max-time 15 -o "$2" "$1" 2>/dev/null
+  elif command -v wget >/dev/null 2>&1; then wget -q -T 15 -O "$2" "$1" 2>/dev/null
+  else return 1; fi
+}
+# Nur vollständige, syntaktisch korrekte Bash-Skripte übernehmen (abgebrochener Download, Fehlerseite)
+valid_script() { [ -s "$1" ] && head -1 "$1" | grep -q '^#!/bin/bash' && bash -n "$1" 2>/dev/null; }
+
+self_update() {
+  local self tmp new
+  [ "${WLAT_UPDATED:-}" = 1 ] && return   # gerade aktualisiert und neu gestartet
+  self=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null)
+  [ -f "$self" ] && [ -w "$self" ] || return
+  [ -e "$(dirname "$self")/.git" ] && return   # Git-Arbeitskopie: lokale Änderungen nicht überschreiben
+  tmp=$(mktemp "$(dirname "$self")/.wlat-update.XXXXXX" 2>/dev/null) || return
+  if ! fetch "$UPDATE_URL/write-latency-diag.sh" "$tmp"; then
+    UPDATE_MSGS+=("Update: GitHub nicht erreichbar - nutze die vorhandene Version $VERSION.")
+  elif valid_script "$tmp" && ! cmp -s "$tmp" "$self"; then
+    new=$(sed -n 's/^VERSION="\(.*\)"/\1/p' "$tmp" | head -1)
+    chmod --reference="$self" "$tmp" 2>/dev/null || chmod 755 "$tmp"
+    if mv -f "$tmp" "$self"; then
+      exec env WLAT_UPDATED=1 WLAT_UPDATE_MSG="Skript aktualisiert: $VERSION -> ${new:-?}" bash "$self" "${ORIG_ARGS[@]}"
+    fi
+  fi
+  rm -f "$tmp"
+}
+
+cmk_update() {
+  local name dest tmp fresh
+  [ -d "${CMK_LOCAL%/local}" ] && [ "$(id -u)" -eq 0 ] || return
+  for name in write_latency write_latency_smart; do
+    # Vorhandene Installation an ihrem Ort aktualisieren, sonst Standardort (der langsame Teil alle 30 min)
+    dest=$(find "$CMK_LOCAL" -maxdepth 2 -type f -name "$name" 2>/dev/null | head -1)
+    fresh=0
+    if [ -z "$dest" ]; then
+      fresh=1
+      if [ "$name" = write_latency ]; then dest="$CMK_LOCAL/$name"; else dest="$CMK_LOCAL/1800/$name"; fi
+    fi
+    tmp=$(mktemp 2>/dev/null) || return
+    if fetch "$UPDATE_URL/checkmk/$name" "$tmp" && valid_script "$tmp" && ! cmp -s "$tmp" "$dest"; then
+      mkdir -p "$(dirname "$dest")" && install -m 755 "$tmp" "$dest" &&
+        UPDATE_MSGS+=("CheckMK-Check $([ $fresh = 1 ] && echo installiert || echo aktualisiert): $dest")
+    fi
+    rm -f "$tmp"
+  done
+  [ ${#UPDATE_MSGS[@]} -gt 0 ] && grep -q 'CheckMK-Check installiert' <<<"${UPDATE_MSGS[*]}" &&
+    UPDATE_MSGS+=("Neue CheckMK-Checks: in CheckMK die Services des Hosts neu erkennen lassen.")
+}
+
+if [ $AUTO_UPDATE -eq 1 ] && [ -z "${WLAT_NO_UPDATE:-}" ]; then
+  self_update
+  cmk_update
+fi
+[ -n "${WLAT_UPDATE_MSG:-}" ] && UPDATE_MSGS=("$WLAT_UPDATE_MSG" "${UPDATE_MSGS[@]}")
 
 if [ -z "$PASSIVE" ]; then
   if [ ${#TARGETS[@]} -eq 0 ]; then PASSIVE=60; else PASSIVE=0; fi
@@ -1199,6 +1265,7 @@ phase_seq() { # dir
 
 # ---------------------------------------------------------------------------
 echo "write-latency-diag $VERSION - $(date '+%F %T') - Ausgabe: $OUT"
+for m in "${UPDATE_MSGS[@]}"; do echo "  $m"; done
 [ $SKIP_STATIC -eq 0 ] && static_check
 
 if [ ${#TARGETS[@]} -gt 0 ] && [ $HAVE_FIO -eq 0 ]; then
