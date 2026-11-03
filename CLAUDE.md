@@ -64,3 +64,14 @@ Die Entwicklungsumgebung ist eine VM ohne echte SATA-SSDs, ohne systemd und ohne
   hell, dunkel und 390 px breit. Auf Browser-Fehler und horizontales Scrollen prüfen.
 - Testprozesse gezielt beenden (`pkill -f '^python3 service/wlat-service.py'`), nicht mit einem Muster, das auch auf
   die eigene Shell passt.
+
+## Zusammenfassung des Kontexts
+
+Bei einer Zusammenfassung (automatisch oder `/compact`) vollständig behalten:
+
+- Den Stand der Analyse am Zielserver des Benutzers: Befunde mit den wichtigsten Messwerten, gekaufte oder geplante
+  Hardware, bereits umgesetzte Änderungen und die offenen Schritte dort, jeweils mit den Befehlen, die noch
+  auszuführen sind. Diese Daten stehen absichtlich nicht im Repo und gibt es nur in der Unterhaltung.
+- Widerlegte Annahmen und warum sie falsch waren, damit sie nicht erneut vorgeschlagen werden.
+- Was der Benutzer für später angekündigt hat („behalte im Hinterkopf“).
+- Laufende Arbeit am Code: was geändert, getestet und gepusht ist und was noch fehlt.
