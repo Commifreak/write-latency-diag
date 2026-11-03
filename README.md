@@ -86,6 +86,50 @@ Report und Messwerte (`samples.csv`, eine Zeile pro Sekunde und Gerät) liegen u
   12 h oder mehr) zeigt das Skript die Schreibverstärkung seit dem letzten Messpunkt. So sieht man, ob eine Änderung
   gewirkt hat.
 
+## Dauerhaft aufzeichnen mit Web-Oberfläche
+
+Statt einzelner Messläufe kann ein Dienst dauerhaft aufzeichnen. Die Ergebnisse zeigt er auf einer eigenen
+Web-Seite (Standard: Port 81):
+
+```bash
+sudo /tmp/wlat.sh --install-service
+```
+
+Danach im Browser `http://<server-ip>:81/` öffnen. Die Seite zeigt:
+
+- **Befund**: dieselben Regeln wie Skript und CheckMK (Schreibcache, Schreibverstärkung, Restlaufzeit, Hänger,
+  TRIM, IO- und CPU-Druck)
+- **Laufwerke**: aktuelle Latenz und Flushes, Schreibverstärkung der letzten 24 h, Verschleiß mit Restlaufzeit,
+  Schreibcache
+- **Verlauf** (1 h bis 90 Tage): maximale Wartezeit je Gerät, Flushes pro Sekunde, Schreibmenge, PSI und CPU
+- **Hänger**: jede Phase, in der eine SSD hängt (Wartezeit ab 100 ms oder offene Anfragen ohne Fortschritt), mit
+  Dauer, Gerät, den Prozessen, die gerade geschrieben haben, und denen, die per fsync darauf gewartet haben
+- **fsync-Aufrufer und Schreiber** über den gewählten Zeitraum, **Schreibverstärkung pro Tag**
+
+Die Seite ist nur lesend und hat keinen Login. Sie gehört deshalb nur ins LAN, nicht ins Internet. Der Dienst
+braucht nur Python 3 (Standardbibliothek). Mit `bpftrace`, `smartmontools` und `hdparm` liefert er alle Werte.
+Die Daten liegen in `/var/lib/write-latency-diag/metrics.db` (SQLite): 5-Sekunden-Werte 7 Tage, Minutenwerte
+90 Tage, Hänger ein Jahr. Der Dienst schreibt gebündelt einmal pro Minute und erzeugt dabei selbst kaum fsyncs.
+
+Einstellungen (Port, Adresse, Aufbewahrung, Schwelle für Hänger) stehen in `/etc/write-latency-diag.conf`.
+Danach `systemctl restart write-latency-diag`. Der Dienst prüft täglich auf eine neue Version, und jeder
+Skriptlauf aktualisiert ihn ebenfalls.
+
+```bash
+sudo systemctl stop write-latency-diag
+```
+
+```bash
+sudo systemctl disable --now write-latency-diag
+```
+
+```bash
+sudo /tmp/wlat.sh --uninstall-service
+```
+
+Der erste Befehl hält den Dienst an, der zweite schaltet ihn dauerhaft ab, der dritte entfernt ihn. Daten und
+Konfiguration bleiben dabei erhalten.
+
 ## Dauerhaft überwachen mit CheckMK
 
 Im Ordner `checkmk/` liegen zwei Local Checks für den CheckMK-Agent:

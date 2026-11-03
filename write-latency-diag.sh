@@ -10,7 +10,7 @@
 # eine temporäre Testdatei in das angegebene Verzeichnis und löschen sie danach.
 #
 
-VERSION="1.3"
+VERSION="1.4"
 
 PASSIVE=""            # Dauer der passiven Beobachtung in Sekunden
 INTERVAL=1
@@ -28,6 +28,15 @@ AUTO_UPDATE=1
 UPDATE_URL="${WLAT_UPDATE_URL:-https://raw.githubusercontent.com/Commifreak/write-latency-diag/main}"
 CMK_LOCAL="/usr/lib/check_mk_agent/local"
 ORIG_ARGS=("$@")
+SVC_DIR="/usr/local/lib/write-latency-diag"
+SVC_FILE="$SVC_DIR/wlat-service.py"
+SVC_UNIT="/etc/systemd/system/write-latency-diag.service"
+SVC_CONF="/etc/write-latency-diag.conf"
+ACTION=""
+case "${1:-}" in
+  --install-service) ACTION=install; shift ;;
+  --uninstall-service) ACTION=uninstall; shift ;;
+esac
 
 usage() {
   cat <<EOF
@@ -51,7 +60,10 @@ Aufruf: $0 [Optionen]
   -n         Systemcheck überspringen
   -q         Nur auffällige Intervalle ausgeben (für lange Läufe)
   -T         Kein bpftrace-Tracing (fsync-Aufrufer, beendete Prozesse)
-  -U         Kein automatisches Update (Skript und CheckMK-Checks)
+  -U         Kein automatisches Update (Skript, CheckMK-Checks, Dienst)
+
+  --install-service    Dienst mit Web-Oberfläche installieren und starten (Port 81)
+  --uninstall-service  Dienst entfernen (Daten und Konfiguration bleiben)
   -h         Hilfe
 
 Beispiele:
@@ -134,10 +146,107 @@ cmk_update() {
     UPDATE_MSGS+=("Neue CheckMK-Checks: in CheckMK die Services des Hosts neu erkennen lassen.")
 }
 
+# Dienst mit Web-Oberfläche (service/wlat-service.py): installieren, aktualisieren, entfernen
+py_valid() { [ -s "$1" ] && python3 -c 'import sys; compile(open(sys.argv[1], "rb").read(), sys.argv[1], "exec")' "$1" 2>/dev/null; }
+
+service_fetch() { # ziel: lokale Kopie aus einer Git-Arbeitskopie bevorzugen, sonst von GitHub
+  local local_copy
+  local_copy="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/service/wlat-service.py"
+  if [ -f "$local_copy" ] && [ -e "$(dirname "$local_copy")/../.git" ]; then cp "$local_copy" "$1"
+  else fetch "$UPDATE_URL/service/wlat-service.py" "$1"; fi
+}
+
+service_update() {
+  local tmp
+  [ -f "$SVC_FILE" ] && [ "$(id -u)" -eq 0 ] && command -v python3 >/dev/null 2>&1 || return
+  tmp=$(mktemp) || return
+  if service_fetch "$tmp" && py_valid "$tmp" && ! cmp -s "$tmp" "$SVC_FILE"; then
+    install -m 755 "$tmp" "$SVC_FILE" && systemctl try-restart write-latency-diag.service 2>/dev/null &&
+      UPDATE_MSGS+=("Dienst aktualisiert und neu gestartet: $SVC_FILE")
+  fi
+  rm -f "$tmp"
+}
+
+service_install() {
+  local tmp port ip
+  [ "$(id -u)" -eq 0 ] || { echo "Bitte als root starten (sudo)." >&2; exit 1; }
+  [ -d /run/systemd/system ] || { echo "Der Dienst braucht systemd (z.B. Ubuntu, Debian)." >&2; exit 1; }
+  command -v python3 >/dev/null 2>&1 || { echo "python3 fehlt: apt install python3" >&2; exit 1; }
+  tmp=$(mktemp)
+  if ! service_fetch "$tmp" || ! py_valid "$tmp"; then
+    echo "Konnte den Dienst nicht laden ($UPDATE_URL/service/wlat-service.py)." >&2; rm -f "$tmp"; exit 1
+  fi
+  install -D -m 755 "$tmp" "$SVC_FILE"; rm -f "$tmp"
+  if [ ! -f "$SVC_CONF" ]; then
+    cat > "$SVC_CONF" <<'CONF'
+# write-latency-diag Dienst - Änderungen wirken nach: systemctl restart write-latency-diag
+# Web-Oberfläche (ohne Login, nur lesend - nur im LAN erreichbar machen)
+bind = 0.0.0.0
+port = 81
+# Datenbank: 5-Sekunden-Werte 7 Tage, Minutenwerte 90 Tage, Hänger 365 Tage
+db = /var/lib/write-latency-diag/metrics.db
+keep_5s_days = 7
+keep_1m_days = 90
+keep_events_days = 365
+# Ab dieser Wartezeit zählt eine Sekunde als Hänger
+stall_ms = 100
+# fsync-Aufrufer per bpftrace aufzeichnen (1/0)
+bpftrace = 1
+# Täglich auf neue Version prüfen (1/0)
+auto_update = 1
+CONF
+  fi
+  port=$(sed -n 's/^ *port *= *\([0-9]*\).*/\1/p' "$SVC_CONF" | tail -1); port=${port:-81}
+  if ! systemctl is-active -q write-latency-diag.service && command -v ss >/dev/null 2>&1 &&
+     ss -ltnH "sport = :$port" 2>/dev/null | grep -q .; then
+    echo "Achtung: Port $port ist schon belegt. Port in $SVC_CONF ändern, dann: systemctl restart write-latency-diag" >&2
+  fi
+  cat > "$SVC_UNIT" <<UNIT
+[Unit]
+Description=write-latency-diag: Schreiblatenz-Aufzeichnung mit Web-Oberfläche
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/env python3 $SVC_FILE
+Restart=always
+RestartSec=10
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload && systemctl enable --now write-latency-diag.service >/dev/null 2>&1 &&
+    systemctl restart write-latency-diag.service
+  sleep 2
+  ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+  if systemctl is-active -q write-latency-diag.service; then
+    echo "Dienst läuft: http://${ip:-<server-ip>}:$port/"
+  else
+    echo "Dienst startet nicht - Details: journalctl -u write-latency-diag -n 30" >&2
+  fi
+  for t in bpftrace smartctl hdparm; do
+    command -v $t >/dev/null 2>&1 || echo "Empfohlen: $t fehlt (apt install $( [ $t = smartctl ] && echo smartmontools || echo $t ))"
+  done
+  echo "Stoppen: systemctl stop write-latency-diag   Dauerhaft aus: systemctl disable --now write-latency-diag"
+  echo "Konfiguration: $SVC_CONF"
+  exit 0
+}
+
+service_uninstall() {
+  [ "$(id -u)" -eq 0 ] || { echo "Bitte als root starten (sudo)." >&2; exit 1; }
+  systemctl disable --now write-latency-diag.service 2>/dev/null
+  rm -f "$SVC_UNIT"; rm -rf "$SVC_DIR"; systemctl daemon-reload 2>/dev/null
+  echo "Dienst entfernt. Daten und Konfiguration sind noch da: /var/lib/write-latency-diag/metrics.db, $SVC_CONF"
+  exit 0
+}
+
 if [ $AUTO_UPDATE -eq 1 ] && [ -z "${WLAT_NO_UPDATE:-}" ]; then
   self_update
   cmk_update
+  service_update
 fi
+[ "$ACTION" = install ] && service_install
+[ "$ACTION" = uninstall ] && service_uninstall
 [ -n "${WLAT_UPDATE_MSG:-}" ] && UPDATE_MSGS=("$WLAT_UPDATE_MSG" "${UPDATE_MSGS[@]}")
 
 if [ -z "$PASSIVE" ]; then
