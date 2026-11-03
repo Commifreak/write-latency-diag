@@ -24,7 +24,7 @@ from collections import defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.0"
+VERSION = "1.1"
 CONF_FILE = os.environ.get("WLAT_CONF", "/etc/write-latency-diag.conf")
 DEFAULTS = {
     "bind": "0.0.0.0",
@@ -100,6 +100,7 @@ CREATE TABLE IF NOT EXISTS smart (ts INTEGER, dev TEXT, serial TEXT, model TEXT,
   wc_drive TEXT, wc_kernel TEXT, wc_boot TEXT, sct TEXT);
 CREATE INDEX IF NOT EXISTS smart_serial ON smart (serial, ts);
 CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS smart_runs (start REAL, end REAL);
 """
 
 
@@ -585,6 +586,7 @@ def smart_sample(store, conf):
     if not shutil_which("smartctl"):
         store.kv_set("smart", {"error": "smartctl nicht installiert (apt install smartmontools)"})
         return
+    t0 = time.time()
     boot_log = run(["journalctl", "-k", "-b", "-o", "cat"]) or run(["dmesg"])
     now = int(time.time())
     for d, info in devices(conf["devices"]).items():
@@ -640,6 +642,8 @@ def smart_sample(store, conf):
         store.add("INSERT INTO smart VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                   (now, d, serial, model, int(info["rot"]), int(info["usb"]), poh, used, num, den, host, nand, temp,
                    attr(sm, 5), attr(sm, 199), wc_drive, wc_kernel, wc_boot, sct))
+    # SMART-/hdparm-Befehle laufen am NCQ-Puffer vorbei: Zeitraum merken, um Hänger in dieser Zeit zu kennzeichnen
+    store.add("INSERT INTO smart_runs VALUES (?, ?)", (round(t0, 1), round(time.time(), 1)))
     store.kv_set("trim", trim_status())
     store.flush()
 
@@ -854,6 +858,12 @@ def series(con, rng):
 
 
 FELT_EV = "(MAX(max_w, max_f) >= ? OR end - start >= 2)"
+SMART_OVERLAP = "EXISTS (SELECT 1 FROM smart_runs r WHERE r.start <= events.end + 1 AND r.end >= events.start - 1)"
+
+
+def event_dict(r):
+    return {"id": r[0], "dev": r[1], "start": r[2], "dur": round(r[3] - r[2], 1), "max_w": r[4], "max_f": r[5],
+            "writers": json.loads(r[6] or "[]"), "waiters": json.loads(r[7] or "[]"), "smart": bool(r[8])}
 
 
 def felt(con, rng, felt_ms):
@@ -887,19 +897,20 @@ def felt(con, rng, felt_ms):
                              "GROUP BY 1", (since,)):
         hours[t]["app_max"] = round(mx / 1000, 2)
     out["hours"] = [{"t": t, **v} for t, v in sorted(hours.items())]
+    out["list"] = [event_dict(r) for r in con.execute(
+        f"SELECT id, dev, start, end, max_w, max_f, writers, waiters, {SMART_OVERLAP} FROM events "
+        f"WHERE start > ? AND {FELT_EV} ORDER BY start DESC LIMIT 200", (since, felt_ms))]
     out["since"], out["now"] = since, now
     return out
 
 
 def events(con, rng, min_ms):
     since = time.time() - RANGES.get(rng, 604800)
-    rows = con.execute("SELECT id, dev, start, end, max_w, max_f, writers, waiters FROM events WHERE start > ? AND "
-                       "MAX(max_w, max_f) >= ? ORDER BY start DESC LIMIT 500", (since, min_ms)).fetchall()
+    rows = con.execute(f"SELECT id, dev, start, end, max_w, max_f, writers, waiters, {SMART_OVERLAP} FROM events "
+                       f"WHERE start > ? AND MAX(max_w, max_f) >= ? ORDER BY start DESC LIMIT 500", (since, min_ms)).fetchall()
     per_hour = con.execute("SELECT CAST(start / 3600 AS INTEGER) * 3600, COUNT(*), SUM(end - start) FROM events "
                            "WHERE start > ? AND MAX(max_w, max_f) >= ? GROUP BY 1 ORDER BY 1", (since, min_ms)).fetchall()
-    return {"events": [{"id": r[0], "dev": r[1], "start": r[2], "dur": round(r[3] - r[2], 1), "max_w": r[4],
-                        "max_f": r[5], "writers": json.loads(r[6] or "[]"), "waiters": json.loads(r[7] or "[]")}
-                       for r in rows],
+    return {"events": [event_dict(r) for r in rows],
             "per_hour": [{"t": r[0], "n": r[1], "secs": round(r[2] or 0, 1)} for r in per_hour],
             "since": since, "now": time.time()}
 
@@ -938,6 +949,112 @@ def smart_history(con):
                              "used": b["used"]})
         res[f"{pts[-1]['dev']} ({serial})"] = days
     return res
+
+
+# ---------------------------------------------------------------------------
+# Textbericht zum Kopieren (z.B. für eine Auswertung im Chat)
+# ---------------------------------------------------------------------------
+def de(v, nd=1):
+    return f"{v:.{nd}f}".replace(".", ",")
+
+
+def secs_txt(v):
+    return f"{de(v, 1)} s" if v < 10 else f"{v:.0f} s"
+
+
+def ms_txt(v):
+    return "–" if v is None else secs_txt(v / 1000) if v >= 1000 else f"{v:.0f} ms"
+
+
+def report(con, collector, conf):
+    now = time.time()
+    st = build_status(con, collector, conf)
+    fe = felt(con, "7d", float(conf["felt_ms"]))
+    fs = fsync_stats(con, "24h")
+    ts = lambda t: time.strftime("%d.%m. %H:%M:%S", time.localtime(t))   # noqa: E731
+    first = con.execute("SELECT MIN(ts) FROM disk WHERE res = 5").fetchone()[0] or \
+        con.execute("SELECT MIN(ts) FROM disk").fetchone()[0] or now
+    L = [f"write-latency-diag Bericht - {st['host']} - {time.strftime('%Y-%m-%d %H:%M')} - Dienst {VERSION}, "
+         f"bpftrace {st['bpftrace']}",
+         f"Aufzeichnung seit {ts(first)} ({de((now - first) / 3600)} h), Dienst läuft seit {ts(st['started'])}",
+         "", "BEFUND"]
+    names = {"crit": "KRITISCH", "warn": "PRÜFEN", "info": "HINWEIS", "ok": "OK"}
+    L += [f"  [{names[f['level']]}] {f['text']}" for f in st["findings"]]
+
+    L += ["", f"SPÜRBARE HÄNGER (ab {secs_txt(fe['felt_ms'] / 1000)} Wartezeit oder 2 s Dauer)",
+          "  Zeitraum   Anzahl  zusammen  längster | App ≥1s  zusammen  längste Wartezeit"]
+    for k, w in fe["windows"].items():
+        L.append(f"  {k:<9} {w['n']:>6}  {secs_txt(w['secs']):>8}  {secs_txt(w['longest']):>8} | {w['app_n']:>7}  "
+                 f"{secs_txt(w['app_secs']):>8}  {secs_txt(w['app_max'])}" + (f" ({w['app_who']})" if w["app_who"] else ""))
+    L += ["", "SPÜRBARE HÄNGER EINZELN (neueste zuerst, max. 25)"]
+    if not fe["list"]:
+        L.append("  keine")
+    for e in fe["list"][:25]:
+        wt = ", ".join(f"{n} {ms_txt(v)}" for n, v in e["waiters"][:4]) or "-"
+        wr = ", ".join(f"{n} {de(v, 2)}" for n, v in e["writers"][:3] if v >= 0.01) or "-"
+        L.append(f"  {ts(e['start'])}  {e['dev']:<6} {secs_txt(e['dur']):>6}  Gerät max {ms_txt(max(e['max_w'], e['max_f'])):>6}"
+                 f"  wartete: {wt}  |  schrieb (MB/s): {wr}" + ("  [während SMART-Abfrage]" if e["smart"] else ""))
+
+    L += ["", "HÄNGER PRO STUNDE (letzte 24 h): alle ab Schwelle / spürbar / spürbare Sekunden"]
+    rows = con.execute(f"SELECT CAST(start / 3600 AS INTEGER) * 3600 h, COUNT(*), SUM({FELT_EV}), "
+                       f"SUM(CASE WHEN {FELT_EV} THEN end - start ELSE 0 END) FROM events WHERE start > ? "
+                       f"GROUP BY h ORDER BY h", (float(conf["felt_ms"]), float(conf["felt_ms"]), now - 86400)).fetchall()
+    L += [f"  {time.strftime('%d.%m. %H:00', time.localtime(h))}  {n:>4} / {f or 0:>3} / {secs_txt(s or 0)}"
+          for h, n, f, s in rows] or ["  keine"]
+
+    L += ["", "LAUFWERKE"]
+    for s_ in st["smart"]:
+        d = s_["dev"]
+        parts = [f"  {d:<5} {s_['model'] or '?'}  SN {s_['serial']}  {'HDD' if s_['rot'] else 'SSD'}{' USB' if s_['usb'] else ''}"]
+        if s_["used"] is not None:
+            rem = []
+            if s_["remaining_days"] is not None:
+                rem.append(f"aktuell {fmt_days(s_['remaining_days'])}")
+            if s_["remaining_lifetime_days"] is not None:
+                rem.append(f"Ø {fmt_days(s_['remaining_lifetime_days'])}")
+            parts.append(f"Verschleiß {s_['used']} %" + (f" (Rest {', '.join(rem)})" if rem else ""))
+        if s_.get("waf_24h") is not None:
+            parts.append(f"WAF {de(s_['waf_24h'])} in {s_.get('window_h')} h (Host {s_['host_day']} GiB/Tag"
+                         + (f", NAND {s_['nand_day']} GiB/Tag" if s_.get("nand_day") else "") + ")")
+        elif s_.get("waf_total") is not None:
+            parts.append(f"WAF gesamt {de(s_['waf_total'])}")
+        if s_["wc_drive"] or s_["sct"] or s_["wc_boot"]:
+            parts.append(f"Cache {'an' if s_['wc_drive'] == '1' else 'aus' if s_['wc_drive'] == '0' else '?'}"
+                         f"/Start {s_['wc_boot'] or '?'}/SCT {s_['sct'] or '-'}/Kernel {s_['wc_kernel'] or '?'}")
+        parts.append(f"Temp {s_['temp']}  POH {s_['poh']}  Realloc {s_['realloc']}  CRC {s_['crc']}")
+        L.append("  ".join(parts))
+        l5 = st["last5min"].get(d)
+        if l5:
+            L.append(f"        letzte 5 min: Flush Ø {de(l5['f_await'] or 0, 2)} ms bei {de(l5['f_rate'] or 0)}/s, "
+                     f"Write Ø {de(l5['w_await'] or 0, 2)} ms, max. Wartezeit {ms_txt(l5['max'])}, "
+                     f"Auslastung {de(l5['util'] or 0, 0)} %")
+    for d, i in st["devices"].items():
+        if not any(x["dev"] == d for x in st["smart"]):
+            L.append(f"  {d:<5} {i['model'] or '?'}  {'HDD' if i['rot'] else 'SSD'}  (noch keine SMART-Daten)")
+
+    L += ["", "FSYNC-AUFRUFER (letzte 24 h)"]
+    L += [f"  {x['name']:<36} {de(x['per_s'], 2):>6}/s  Ø {ms_txt(x['avg_ms']):>7}  max {ms_txt(x['max_ms'])}"
+          for x in fs["fsync"][:15]] or ["  keine Daten"]
+    L += ["", "SCHREIBER NETTO (letzte 24 h, Ø MB/s): " + (", ".join(f"{n} {de(v, 3)}" for n, v in fs["writers"]) or "-")]
+    p1 = con.execute("SELECT AVG(psi_io_full), AVG(psi_io_some), AVG(psi_cpu), AVG(cpu) FROM sys WHERE res = 60 AND ts > ?",
+                     (now - 3600,)).fetchone()
+    p24 = con.execute("SELECT AVG(psi_io_full), AVG(psi_io_some), AVG(psi_cpu), AVG(cpu) FROM sys WHERE res = 60 AND ts > ?",
+                      (now - 86400,)).fetchone()
+    for lbl, p in (("1 h", p1), ("24 h", p24)):
+        if p[0] is not None:
+            L.append(f"DRUCK {lbl}: IO komplett {de(p[0])} %, IO teilweise {de(p[1])} %, CPU-Wartezeit {de(p[2])} %, "
+                     f"CPU {de(p[3], 0)} %")
+    tr = st["trim"]
+    if tr:
+        L.append("TRIM: " + ("Timer aus" if tr.get("enabled") is False else
+                             f"Zeitplan {tr.get('schedule') or '?'}; " + "; ".join(
+                                 f"{m['mount']}: letzter Lauf {ts(m['last']) if m.get('last') else '?'}"
+                                 + (f", {de(m['deleted_gib_day'])} GiB/Tag gelöscht, bis {de(m['untrimmed_pct'])} % ungetrimmt"
+                                    if "deleted_gib_day" in m else "") for m in tr.get("mounts", []))))
+    runs = con.execute("SELECT COUNT(*), AVG(end - start) FROM smart_runs WHERE start > ?", (now - 86400,)).fetchone()
+    if runs[0]:
+        L.append(f"SMART-Abfragen (24 h): {runs[0]}, Ø {de(runs[1] or 0)} s")
+    return "\n".join(L) + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -980,6 +1097,9 @@ class Handler(BaseHTTPRequestHandler):
                     data = felt(con, q.get("range", "7d"), float(srv.conf["felt_ms"]))
                 elif u.path == "/api/smart":
                     data = smart_history(con)
+                elif u.path == "/api/report":
+                    self.send(200, report(con, srv.collector, srv.conf), "text/plain; charset=utf-8")
+                    return
                 else:
                     self.send(404, "nicht gefunden", "text/plain; charset=utf-8")
                     return
@@ -1092,6 +1212,8 @@ h1{font-size:18px;margin:0}h2{font-size:15px;margin:22px 0 8px}main{max-width:12
 .legend{font-size:12px;margin-top:4px}.legend span{margin-right:12px;white-space:nowrap}
 table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:5px 8px;border-bottom:1px solid var(--line);vertical-align:top}
 th{color:var(--mut);font-weight:600}td.num{text-align:right;font-variant-numeric:tabular-nums}.scroll{overflow-x:auto}
+.btn{border:1px solid var(--line);background:var(--card);color:var(--fg);padding:5px 12px;border-radius:6px;cursor:pointer}
+.tag{font-size:11px;padding:1px 6px;border-radius:9px;border:1px solid var(--line);color:var(--mut);white-space:nowrap}
 select{background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:3px 6px}
 </style></head><body>
 <header><h1>Schreiblatenz <span id="host" class="mut"></span></h1><span id="meta" class="mut small"></span></header>
@@ -1100,7 +1222,8 @@ select{background:var(--card);color:var(--fg);border:1px solid var(--line);borde
 <h2>Spürbare Hänger <span class="mut small" id="feltdef"></span></h2>
 <div class="grid" id="felttiles"></div><div id="feltlast" class="small" style="margin:8px 0"></div>
 <div class="card"><h3>Spürbare Sekunden pro Stunde</h3><div class="chart" style="height:160px"><canvas id="feltchart"></canvas><div class="tip"></div></div>
-<div class="legend"><span><span class="dot" style="background:#c2272d"></span>Summe der Hänger (s)</span><span><span class="dot" style="background:#2f6fbf"></span>längste Wartezeit einer Anwendung (s)</span></div></div>
+<div class="legend"><span><span class="dot" style="background:#c2272d"></span>Summe der Hänger (s)</span><span><span class="dot" style="background:#2f6fbf"></span>längste Wartezeit einer Anwendung (s)</span></div>
+<h3 style="margin-top:14px">Einzeln <span class="mut small" id="feltcount"></span></h3><div class="scroll" style="max-height:420px;overflow-y:auto"><table id="felttab"></table></div></div>
 <h2>Laufwerke</h2><div id="cards" class="grid"></div>
 <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-top:22px">
 <h2 style="margin:0">Verlauf</h2><div class="ranges" id="ranges"></div></div>
@@ -1111,6 +1234,10 @@ select{background:var(--card);color:var(--fg);border:1px solid var(--line);borde
 <h2>fsync-Aufrufer und Schreiber <span class="mut small" id="fsspan"></span></h2>
 <div class="grid mid"><div class="card scroll"><table id="fstab"></table></div><div class="card scroll"><table id="wrtab"></table></div></div>
 <h2>Schreibverstärkung pro Tag</h2><div class="card"><div class="chart" style="height:180px"><canvas id="wafchart"></canvas><div class="tip"></div></div><div class="legend" id="waflegend"></div></div>
+<h2>Rohdaten zum Kopieren</h2>
+<div class="card"><div style="display:flex;gap:8px;align-items:center;margin-bottom:8px"><button id="rawcopy" class="btn">Kopieren</button><button id="rawload" class="btn">Neu laden</button><span id="rawmsg" class="mut small"></span>
+<span class="mut small" style="margin-left:auto">auch abrufbar unter <code>/api/report</code></span></div>
+<textarea id="raw" readonly spellcheck="false" style="width:100%;height:360px;font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:8px;white-space:pre;overflow:auto"></textarea></div>
 </main>
 <script>
 const COLORS=['#2f6fbf','#d1497b','#1a9a8a','#c88a12','#7b5cc4','#5d8f2e','#c4552f'];
@@ -1121,7 +1248,8 @@ const $=s=>document.querySelector(s);
 function el(tag,attrs,...kids){const e=document.createElement(tag);for(const[k,v]of Object.entries(attrs||{})){if(k==='class')e.className=v;else if(k==='style')e.style.cssText=v;else e.setAttribute(k,v)}for(const c of kids){if(c==null)continue;e.append(c.nodeType?c:document.createTextNode(String(c)))}return e}
 const fmtT=t=>new Date(t*1000).toLocaleString('de-DE',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'});
 const fmtD=d=>d>=730?'~'+(d/365).toFixed(1)+' Jahre':d>=60?'~'+Math.round(d/30.4)+' Monate':'~'+Math.round(d)+' Tage';
-const ms=v=>v==null?'–':v>=1000?(v/1000).toFixed(1)+' s':v.toFixed(v<10?1:0)+' ms';
+const ms=v=>v==null?'–':v>=1000?(v/1000).toFixed(1).replace('.',',')+' s':v.toFixed(v<10?1:0).replace('.',',')+' ms';
+const mbs=l=>l.filter(w=>w[1]>=0.01).map(w=>w[0]+' '+w[1].toFixed(2).replace('.',',')).join(', ')||'–';
 async function J(u){const r=await fetch(u);return r.json()}
 
 function chart(canvas,series,opt){
@@ -1212,15 +1340,26 @@ async function loadFelt(){
     (l.waiters.length?', es warteten: '+l.waiters.slice(0,3).map(w=>w[0]+' '+sec(w[1]/1000)).join(', '):'')):el('span',{class:'mut'},'Noch kein spürbarer Hänger aufgezeichnet.'));
   const h=f.hours;chart($('#feltchart'),[{name:'Hänger',color:'#c2272d',bars:3600,t:h.map(x=>x.t),v:h.map(x=>x.secs)},{name:'längste Wartezeit',color:'#2f6fbf',t:h.filter(x=>x.app_max).map(x=>x.t),v:h.filter(x=>x.app_max).map(x=>x.app_max)}],
     {dots:true,ymin:1,x0:f.since,x1:f.now,gap:3600,fmt:v=>sec(+v),empty:'keine spürbaren Hänger'});
+  $('#feltcount').textContent='('+f.list.length+(f.list.length>=200?'+':'')+' im Zeitraum, neueste zuerst)';
+  const t=$('#felttab');t.replaceChildren(el('tr',{},...['Zeit','Gerät','Dauer','max. Wartezeit','Wer wartete (fsync)','Wer schrieb (MB/s)',''].map(h=>el('th',{},h))));
+  if(!f.list.length)t.append(el('tr',{},el('td',{colspan:7,class:'mut'},'Keine spürbaren Hänger in diesem Zeitraum.')));
+  for(const x of f.list)t.append(el('tr',{},el('td',{},fmtT(x.start)),el('td',{},x.dev),el('td',{class:'num'},sec(x.dur)),
+    el('td',{class:'num'},ms(Math.max(x.max_w,x.max_f))),el('td',{},x.waiters.map(w=>w[0]+' '+ms(w[1])).join(', ')||'–'),
+    el('td',{},mbs(x.writers)),el('td',{},x.smart?el('span',{class:'tag',title:'Zeitgleich mit einer SMART-Abfrage des Dienstes'},'SMART'):'')));
 }
+async function loadRaw(){const r=await fetch('api/report');$('#raw').value=await r.text();$('#rawmsg').textContent='Stand '+new Date().toLocaleTimeString('de-DE')}
+async function copyRaw(){const ta=$('#raw');let ok=false;
+  try{if(window.isSecureContext&&navigator.clipboard){await navigator.clipboard.writeText(ta.value);ok=true}}catch(e){}
+  if(!ok){ta.focus();ta.select();try{ok=document.execCommand('copy')}catch(e){}ta.setSelectionRange(0,0)}
+  $('#rawmsg').textContent=ok?'kopiert':'Kopieren nicht möglich - bitte markieren und manuell kopieren'}
 async function loadEvents(){
   const rng=['1h','6h','24h'].includes(RANGE)?'24h':RANGE,e=await J('api/events?range='+rng+'&min_ms='+$('#evmin').value);
   const ph=e.per_hour;chart($('#evchart'),[{name:'Hänger pro Stunde',t:ph.map(x=>x.t),v:ph.map(x=>x.n)}],{dots:true,ymin:1,x0:e.since,x1:e.now,gap:3600,empty:'keine Hänger'});
-  const t=$('#evtab');t.replaceChildren(el('tr',{},...['Zeit','Gerät','Dauer','max. Wartezeit','Wer schrieb (MB/s)','Wer wartete (fsync)'].map(h=>el('th',{},h))));
-  if(!e.events.length)t.append(el('tr',{},el('td',{colspan:6,class:'mut'},'Keine Hänger in diesem Zeitraum.')));
+  const t=$('#evtab');t.replaceChildren(el('tr',{},...['Zeit','Gerät','Dauer','max. Wartezeit','Wer schrieb (MB/s)','Wer wartete (fsync)',''].map(h=>el('th',{},h))));
+  if(!e.events.length)t.append(el('tr',{},el('td',{colspan:7,class:'mut'},'Keine Hänger in diesem Zeitraum.')));
   for(const x of e.events)t.append(el('tr',{},el('td',{},fmtT(x.start)),el('td',{},x.dev),el('td',{class:'num'},x.dur.toFixed(0)+' s'),
-    el('td',{class:'num'},ms(Math.max(x.max_w,x.max_f))),el('td',{},x.writers.map(w=>w[0]+' '+w[1].toFixed(2)).join(', ')||'–'),
-    el('td',{},x.waiters.map(w=>w[0]+' '+ms(w[1])).join(', ')||'–')));
+    el('td',{class:'num'},ms(Math.max(x.max_w,x.max_f))),el('td',{},mbs(x.writers)),
+    el('td',{},x.waiters.map(w=>w[0]+' '+ms(w[1])).join(', ')||'–'),el('td',{},x.smart?el('span',{class:'tag',title:'Zeitgleich mit einer SMART-Abfrage des Dienstes'},'SMART'):'')));
 }
 
 async function loadFsync(){
@@ -1240,7 +1379,8 @@ async function loadSmart(){
 }
 
 function ranges(){const r=$('#ranges');r.replaceChildren(...['1h','6h','24h','7d','30d','90d'].map(x=>{const b=el('button',{class:x===RANGE?'on':''},x);b.onclick=()=>{RANGE=x;localStorageSet('range',x);ranges();loadCharts();loadFelt();loadEvents();loadFsync()};return b}))}
-async function all(){try{await loadStatus()}catch(e){console.error(e)}try{await loadFelt()}catch(e){console.error(e)}try{await loadCharts()}catch(e){console.error(e)}try{await loadEvents()}catch(e){console.error(e)}try{await loadFsync()}catch(e){console.error(e)}try{await loadSmart()}catch(e){console.error(e)}}
+$('#rawcopy').onclick=copyRaw;$('#rawload').onclick=loadRaw;
+async function all(){try{await loadStatus()}catch(e){console.error(e)}try{await loadRaw()}catch(e){console.error(e)}try{await loadFelt()}catch(e){console.error(e)}try{await loadCharts()}catch(e){console.error(e)}try{await loadEvents()}catch(e){console.error(e)}try{await loadFsync()}catch(e){console.error(e)}try{await loadSmart()}catch(e){console.error(e)}}
 $('#evmin').onchange=loadEvents;ranges();all();
 setInterval(()=>{loadStatus();loadCharts()},15000);setInterval(()=>{loadFelt();loadEvents();loadFsync();loadSmart()},60000);
 let rt;window.addEventListener('resize',()=>{clearTimeout(rt);rt=setTimeout(()=>{loadCharts();loadFelt();loadEvents();loadSmart()},200)});

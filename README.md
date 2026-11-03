@@ -101,14 +101,21 @@ Danach im Browser `http://<server-ip>:81/` öffnen. Die Seite zeigt:
   TRIM, IO- und CPU-Druck)
 - **Spürbare Hänger** in echten Sekunden für die letzte Stunde, 24 h und 7 Tage: wie oft, wie lange zusammen, der
   längste Hänger und wie lange eine Anwendung höchstens auf ihr fsync gewartet hat. Dazu der letzte spürbare
-  Hänger und die spürbaren Sekunden pro Stunde. Spürbar heißt: ab 1 s Wartezeit (`felt_ms` in der Konfiguration)
-  oder ab 2 s Dauer.
+  Hänger, die spürbaren Sekunden pro Stunde und jeder spürbare Hänger einzeln (Zeit, Gerät, Dauer, wer gewartet und
+  wer geschrieben hat). Spürbar heißt: ab 1 s Wartezeit (`felt_ms` in der Konfiguration) oder ab 2 s Dauer.
 - **Laufwerke**: aktuelle Latenz und Flushes, Schreibverstärkung der letzten 24 h, Verschleiß mit Restlaufzeit,
   Schreibcache
 - **Verlauf** (1 h bis 90 Tage): maximale Wartezeit je Gerät, Flushes pro Sekunde, Schreibmenge, PSI und CPU
 - **Hänger**: jede Phase, in der eine SSD hängt (Wartezeit ab 100 ms oder offene Anfragen ohne Fortschritt), mit
   Dauer, Gerät, den Prozessen, die gerade geschrieben haben, und denen, die per fsync darauf gewartet haben
 - **fsync-Aufrufer und Schreiber** über den gewählten Zeitraum, **Schreibverstärkung pro Tag**
+- **Rohdaten zum Kopieren**: ein kompakter Textbericht mit allem oben, auch jeder einzelne spürbare Hänger, gedacht
+  zum Einfügen in einen Chat oder ein Ticket. Ein Knopf kopiert ihn. Direkt abrufbar unter `/api/report`, z.B.
+  `curl http://<server-ip>:81/api/report`
+
+Der Dienst fragt alle 30 Minuten SMART-Werte ab. SMART-Befehle laufen bei SATA am Befehlspuffer vorbei, andere
+Zugriffe warten dann kurz. Hänger, die zeitgleich mit einer solchen Abfrage auftreten, sind deshalb mit „SMART“
+markiert.
 
 Die Seite ist nur lesend und hat keinen Login. Sie gehört deshalb nur ins LAN, nicht ins Internet. Der Dienst
 braucht nur Python 3 (Standardbibliothek). Mit `bpftrace`, `smartmontools` und `hdparm` liefert er alle Werte.
