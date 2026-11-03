@@ -7,6 +7,23 @@
 # Gemessen wird jeweils seit dem letzten Aufruf (Zustandsdatei), der erste Aufruf liefert nur Startwerte.
 #
 
+# Läuft der write-latency-diag Dienst (--install-service), liefert er die Werte: Web-Oberfläche und CheckMK beruhen
+# dann auf derselben Messung, und SMART wird nur einmal abgefragt. Sonst (oder ohne Daten) misst der Check selbst.
+from_service() {
+  local conf=/etc/write-latency-diag.conf port bind url out
+  [ -f "$conf" ] || return 1
+  port=$(sed -n 's/^ *port *= *\([0-9]*\).*/\1/p' "$conf" | tail -1)
+  bind=$(sed -n 's/^ *bind *= *\([^ #]*\).*/\1/p' "$conf" | tail -1)
+  case "$bind" in ""|0.0.0.0|::) bind=127.0.0.1 ;; esac
+  url="http://$bind:${port:-81}/api/checkmk?part=$1"
+  if command -v curl >/dev/null 2>&1; then out=$(curl -fsS --max-time 5 "$url" 2>/dev/null)
+  elif command -v wget >/dev/null 2>&1; then out=$(wget -qO- -T 5 "$url" 2>/dev/null)
+  else return 1; fi
+  [ -n "$out" ] || return 1
+  printf '%s\n' "$out"
+}
+from_service fast && exit 0
+
 STATE_DIR="/var/lib/write-latency-diag"
 STATE="$STATE_DIR/checkmk-fast.state"
 DEVRE='^(sd[a-z]+|nvme[0-9]+n[0-9]+|vd[a-z]+|xvd[a-z]+)$'

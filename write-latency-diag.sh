@@ -10,7 +10,7 @@
 # eine temporäre Testdatei in das angegebene Verzeichnis und löschen sie danach.
 #
 
-VERSION="1.4"
+VERSION="1.5"
 
 PASSIVE=""            # Dauer der passiven Beobachtung in Sekunden
 INTERVAL=1
@@ -273,6 +273,7 @@ command -v fio >/dev/null 2>&1 && [ -z "${NO_FIO:-}" ] && HAVE_FIO=1
 HAVE_BT=0
 # Rotierende Laufwerke (HDDs): 5-20 ms pro Anfrage und Flush sind dort normal, sie zählen nicht als SSD-Befund
 ROTDEVS=$(for p in /sys/block/*; do [ "$(cat "$p/queue/rotational" 2>/dev/null)" = 1 ] && printf '%s ' "${p##*/}"; done)
+[ -n "${WLAT_TEST_ALL_SSD:-}" ] && ROTDEVS=""   # nur für Tests in VMs, deren Platten als rotierend gelten
 [ $TRACE -eq 1 ] && [ "$(id -u)" -eq 0 ] && command -v bpftrace >/dev/null 2>&1 && HAVE_BT=1
 HZ=$(getconf CLK_TCK 2>/dev/null || echo 100)
 
@@ -763,7 +764,7 @@ function read_disks(   line, a, n, d) {
     if (!(d in Dseen)) { Dseen[d] = 1; Ndev++; Dlist[Ndev] = d }
     D_rios[d] = a[4]; D_rsec[d] = a[6]; D_rtk[d] = a[7]
     D_wios[d] = a[8]; D_wsec[d] = a[10]; D_wtk[d] = a[11]
-    D_iot[d] = a[13]; D_tiq[d] = a[14]
+    D_iot[d] = a[13]; D_tiq[d] = a[14]; D_infl[d] = a[12]
     D_fios[d] = (n >= 20) ? a[19] : 0; D_ftk[d] = (n >= 20) ? a[20] : 0
   }
   close("/proc/diskstats")
@@ -850,6 +851,21 @@ function topw(arr, dt, n,   k, best, bv, s, j, used) {
   }
   return s
 }
+# Hänger als Ereignisse, wie im Dienst: ein Intervall ist langsam, wenn Anfragen >= stall_ms dauern oder das Gerät
+# Anfragen offen hat und gar keine beendet. Aufeinanderfolgende langsame Intervalle (Lücke < 3 s) = ein Hänger.
+function track(d, t, dt, slow, w) {
+  if (slow) {
+    if (!(d in Op_s)) { Op_s[d] = t - dt; Op_m[d] = 0 }
+    Op_e[d] = t
+    if (w > Op_m[d]) Op_m[d] = w
+  } else if ((d in Op_s) && t - Op_e[d] >= 3) close_ev(d)
+}
+function close_ev(d) {
+  EvN++; Ev_d[EvN] = d; Ev_s[EvN] = Op_s[d]; Ev_e[EvN] = Op_e[d]; Ev_m[EvN] = Op_m[d]
+  delete Op_s[d]; delete Op_e[d]; delete Op_m[d]
+}
+function sortn(a, n,   i, j, x) { for (i = 2; i <= n; i++) { x = a[i]; for (j = i - 1; j >= 1 && a[j] > x; j--) a[j + 1] = a[j]; a[j + 1] = x } }
+function wall(t,   c, r) { c = "date -d @" int(start_epoch + t - t0) " '+%d.%m. %H:%M:%S'"; r = ""; c | getline r; close(c); return r }
 function interval(dt,   c, t, b, busy, iow, maxc, maxcn, dtot, pc, pis, pif, p, dd, top, i, d,
                   dw, dws, dwt, dr, drs, drt, df, dft, diot, dtiq, wmbs, rmbs, wa, fa, util, devt, aqu, reqkb,
                   flag, maxdevt, totw, tclock, buf, iflag, wtop, k, V) {
@@ -933,6 +949,8 @@ function interval(dt,   c, t, b, busy, iow, maxc, maxcn, dtot, pc, pis, pif, p, 
     reqkb = (dw > 0) ? dws * 512 / 1024 / dw : 0
     if (devt > maxdevt) maxdevt = devt
     totw += dw
+    if (!index(" " rotdevs " ", " " d " "))
+      track(d, now, dt, (dw > 0 && wa >= stall_ms) || (df > 0 && fa >= stall_ms) || (util >= 90 && D_infl[d] > 0 && dr + dw + df == 0), (wa > fa ? wa : fa))
 
     T_wios[d] += dw; T_wsec[d] += dws; T_wtk[d] += dwt; T_fios[d] += df; T_ftk[d] += dft
     T_rsec[d] += drs
@@ -978,7 +996,8 @@ function add(side, pts, msg) {
   if (side == "SSD") Sd += pts; else if (side == "CPU") Sc += pts; else { Sd += pts; Sc += pts }
   Fn++; F[Fn] = sprintf("  [%s] %s", side, msg)
 }
-function summary(   i, d, k, n, x, aw, af, minaw, bf, first, last, tn, tops, wgb, busy, sat, verdict, cnt, avgp, dl, tpa, nst) {
+function summary(   i, d, k, n, x, aw, af, minaw, bf, first, last, tn, tops, wgb, busy, sat, verdict, cnt, avgp, dl, tpa, nst,
+                    fn, fsum, flong, FE, pl, pn, pgap, pdur, j, G, U, S, m, c) {
   printf "\n--- Auswertung: %s (%d Messpunkte à %ss, %s) ---\n", label, N, interval_s, (S_dt < 3600 ? sprintf("%.0f s", S_dt) : sprintf("%.1f h", S_dt / 3600))
   if (N < 2) { print "  Zu wenige Messpunkte."; return }
   busy = S_busy / N; sat = 100 * Nsat / N
@@ -1055,6 +1074,42 @@ function summary(   i, d, k, n, x, aw, af, minaw, bf, first, last, tn, tops, wgb
       printf "%s MB/s\n", APP["app_bw_mbs"]
   }
 
+  # ---- Hänger-Ereignisse und Muster je SSD ----
+  for (d in Op_s) close_ev(d)
+  fn = 0; fsum = 0; flong = 0
+  for (i = 1; i <= EvN; i++) {
+    x = Ev_e[i] - Ev_s[i]
+    if (Ev_m[i] >= felt_ms || x >= 2) { fn++; FE[fn] = i; fsum += x; if (x > flong) flong = x }
+  }
+  if (EvN > 0) {
+    printf "\nHänger (SSD, Wartezeit ab %d ms): %d, davon spürbar (ab %.0f s Wartezeit oder 2 s Dauer): %d, zusammen %.0f s, längster %.0f s%s\n",
+      stall_ms, EvN, felt_ms / 1000, fn, fsum, flong, (interval_s > 1 ? sprintf(" (Dauer auf %ss genau)", interval_s) : "")
+    if (fn > 0) printf "  %-17s %-8s %7s  %s\n", "Zeit", "Gerät", "Dauer", "max. Wartezeit"
+    for (k = fn; k >= 1 && k > fn - 25; k--) {
+      i = FE[k]
+      printf "  %-17s %-8s %6.0fs  %s\n", wall(Ev_s[i]), Ev_d[i], Ev_e[i] - Ev_s[i], (Ev_m[i] >= 1000 ? sprintf("%.1f s", Ev_m[i] / 1000) : sprintf("%.0f ms", Ev_m[i]))
+    }
+    if (fn > 25) printf "  (%d ältere spürbare Hänger nicht aufgeführt)\n", fn - 25
+    # Muster: pro SSD typische Dauer und typischer Abstand der spürbaren Hänger
+    pl = ""; pn = 0; pgap = 0; pdur = 0
+    for (j = 1; j <= Ndev; j++) {
+      d = Dlist[j]; n = 0; delete G; delete U
+      for (k = 1; k <= fn; k++) { i = FE[k]; if (Ev_d[i] == d) { n++; U[n] = Ev_e[i] - Ev_s[i]; S[n] = Ev_s[i] } }
+      if (n == 0) continue
+      for (k = 2; k <= n; k++) G[k - 1] = (S[k] - S[k - 1]) / 60
+      sortn(U, n); sortn(G, n - 1)
+      x = sprintf("  Muster %-6s %3d× spürbar, Dauer Median %.0f s", d, n, U[int((n + 1) / 2)])
+      if (n >= 2) x = x sprintf(", Abstand Median %.1f min (min %.1f, max %.1f)", G[int(n / 2)], G[1], G[n - 1])
+      print x
+      # Regelmäßig: mindestens 4 Hänger und die meisten Abstände nahe am Median
+      if (n >= 4) {
+        m = G[int(n / 2)]; c = 0
+        for (k = 1; k < n; k++) if (G[k] >= 0.6 * m && G[k] <= 1.6 * m) c++
+        if (c >= 0.6 * (n - 1)) { pn++; pl = pl (pl == "" ? "" : ", ") d; pgap += m; pdur += U[int((n + 1) / 2)] }
+      }
+    }
+  }
+
   # ---- Bewertung ----
   Sd = 0; Sc = 0; Fn = 0; bf = -1
   if (mode == "sync" && Nact >= 3) {
@@ -1109,6 +1164,8 @@ function summary(   i, d, k, n, x, aw, af, minaw, bf, first, last, tn, tops, wgb
       add("SSD", 0, "Im mdadm-RAID wartet jedes fsync auf alle Mitglieder: ein Stall auf irgendeiner SSD bremst das ganze Array. Mit mehr SSDs im Verbund steigt die Wahrscheinlichkeit, dass gerade eine davon hängt.")
   }
   if (N_pi && S_pif / N_pi >= 10 && Nstall > 0) add("SSD", 1, sprintf("PSI io full Ø %.0f%%: Prozesse sind regelmäßig komplett durch IO blockiert.", S_pif / N_pi))
+  if (fn > 0) add("SSD", 2, sprintf("%d spürbare Hänger (ab %.0f s Wartezeit oder 2 s Dauer), zusammen %.0f s, längster %.0f s - in dieser Zeit wartet alles, was schreibt.", fn, felt_ms / 1000, fsum, flong))
+  if (pn > 0) add("SSD", 1, sprintf("Regelmäßiger Takt: %s %s etwa alle %.0f min für ~%.0f s an. Schreibt kein Programm in diesem Takt viel (siehe Schreiber), ist das Hintergrundarbeit in der SSD-Firmware - mit Einstellungen nicht abstellbar, nur durch andere SSDs (z.B. mit Power-Loss-Protection).", pl, (pn > 1 ? "halten jeweils" : "hält"), pgap / pn, pdur / pn))
 
   if (mode != "passive" && TOP1 ~ /^(fio|dd)$/) sat = 0   # Testwerkzeug selbst lastet den Kern aus
   if (sat >= 30) add("CPU", 2, sprintf("Mindestens ein CPU-Kern war in %.0f%% der Intervalle voll ausgelastet%s.", sat, busy < 70 ? " (Single-Thread-Engpass)" : ""))
@@ -1142,6 +1199,7 @@ function summary(   i, d, k, n, x, aw, af, minaw, bf, first, last, tn, tops, wgb
 }
 BEGIN {
   if (hz <= 0) hz = 100
+  stall_ms = 100; felt_ms = 1000
   interval_s = interval_arg + 0
   t0 = uptime_s()
   sample(); remember(); tprev = t0
@@ -1284,7 +1342,7 @@ start_sampler() { # label mode duration appfile
   rm -f "$CUR_STOP"
   ( trap '' INT; exec awk -v devre="$DEVRE" -v hz="$HZ" -v interval_arg="$INTERVAL" -v duration="$3" \
       -v stopfile="$CUR_STOP" -v csv="$CSV" -v phase="$PHASE_N" -v label="$1" -v mode="$2" \
-      -v appfile="$4" -v sumfile="$OUT/phase$PHASE_N.sum" -v mdmembers="$MDMEMBERS" -v rotdevs="$ROTDEVS" -v quiet="$QUIET" -f "$OUT/sampler.awk" ) &
+      -v appfile="$4" -v sumfile="$OUT/phase$PHASE_N.sum" -v mdmembers="$MDMEMBERS" -v rotdevs="$ROTDEVS" -v quiet="$QUIET" -v start_epoch="$(date +%s)" -f "$OUT/sampler.awk" ) &
   SAMPLER=$!
   SUMFILES+=("$OUT/phase$PHASE_N.sum")
 }
@@ -1435,6 +1493,12 @@ if [ ${#WARN[@]} -gt 0 ]; then
 fi
 
 echo
+if command -v systemctl >/dev/null 2>&1 && systemctl is-active -q write-latency-diag.service 2>/dev/null; then
+  sport=$(sed -n 's/^ *port *= *\([0-9]*\).*/\1/p' "$SVC_CONF" 2>/dev/null | tail -1); sport=${sport:-81}
+  echo
+  echo "  Der Dienst zeichnet dauerhaft auf: http://$(hostname -I 2>/dev/null | awk '{print $1}'):$sport/"
+  echo "  Bericht über den ganzen Zeitraum: curl -s http://127.0.0.1:$sport/api/report"
+fi
 echo "  Report: $OUT/report.txt   Messwerte: $CSV"
 exec >&- 2>&-
 wait "$TEE_PID" 2>/dev/null

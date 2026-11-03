@@ -24,7 +24,7 @@ from collections import defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.1"
+VERSION = "1.2"
 CONF_FILE = os.environ.get("WLAT_CONF", "/etc/write-latency-diag.conf")
 DEFAULTS = {
     "bind": "0.0.0.0",
@@ -713,7 +713,7 @@ def trim_status():
 # ---------------------------------------------------------------------------
 def fmt_days(x):
     if x >= 730:
-        return f"~{x / 365:.1f} Jahre"
+        return f"~{x / 365:.1f} Jahre".replace(".", ",")
     if x >= 60:
         return f"~{x / 30.4:.0f} Monate"
     return f"~{x:.0f} Tage"
@@ -1031,7 +1031,7 @@ def report(con, collector, conf):
                 rem.append(f"Ø {fmt_days(s_['remaining_lifetime_days'])}")
             parts.append(f"Verschleiß {s_['used']} %" + (f" (Rest {', '.join(rem)})" if rem else ""))
         if s_.get("waf_24h") is not None:
-            parts.append(f"WAF {de(s_['waf_24h'])} in {s_.get('window_h')} h (Host {s_['host_day']} GiB/Tag"
+            parts.append(f"WAF {de(s_['waf_24h'])} in {s_.get('window_h')} h (Host {de(s_['host_day'] or 0)} GiB/Tag"
                          + (f", NAND {s_['nand_day']} GiB/Tag" if s_.get("nand_day") else "") + ")")
         elif s_.get("waf_total") is not None:
             parts.append(f"WAF gesamt {de(s_['waf_total'])}")
@@ -1078,6 +1078,132 @@ def report(con, collector, conf):
 
 
 # ---------------------------------------------------------------------------
+# CheckMK: fertige Local-Check-Zeilen. Die Checks in checkmk/ geben diese Ausgabe weiter, wenn der Dienst läuft,
+# damit Web-Oberfläche und CheckMK auf derselben Messung beruhen. Leere Antwort = noch keine Daten
+# (die Checks messen dann selbst). Service-Namen und Schwellwerte wie in den Checks.
+# ---------------------------------------------------------------------------
+def checkmk_lines(con, collector, conf, part):
+    now = time.time()
+    out = []
+    if part == "fast":
+        rows = con.execute(
+            "SELECT dev, SUM(f_await * f_rate) / NULLIF(SUM(f_rate), 0), SUM(w_await * w_iops) / NULLIF(SUM(w_iops), 0), "
+            "AVG(f_rate), AVG(w_mbs), AVG(util), MAX(MAX(w_await_max, f_await_max)), SUM(f_rate) * 5, SUM(w_iops) * 5, "
+            "MAX(ts) - MIN(ts) + 5 FROM disk WHERE res = 5 AND ts > ? GROUP BY dev", (now - 60,)).fetchall()
+        if not rows:
+            return ""
+        for dev, fa, wa, fr, wmbs, util, mx, nf, nw, span in rows:
+            info = collector.devs.get(dev)
+            if not info or info["rot"] or info["usb"]:
+                continue
+            fa, wa = fa or 0.0, wa or 0.0
+            st = 0
+            if nf >= 10:
+                st = 2 if fa >= 50 else 1 if fa >= 10 else 0
+            if nw >= 10:
+                st = max(st, 2 if wa >= 100 else 1 if wa >= 20 else 0)
+            out.append(f'{st} "SSD {dev} Latenz" flush_ms={fa:.2f};10;50|write_await_ms={wa:.2f};20;100|'
+                       f'flush_per_s={fr:.1f}|write_mbs={wmbs:.2f}|util={util:.1f};;;0;100|max_wait_ms={mx:.1f} '
+                       f'Flush {fa:.2f} ms ({fr:.1f}/s), Write-await {wa:.2f} ms, {wmbs:.2f} MB/s, Auslastung {util:.0f} %, '
+                       f'max. Wartezeit {ms_txt(mx)} (Mittel über {span:.0f} s, vom write-latency-diag Dienst)')
+        ps = con.execute("SELECT AVG(psi_io_full), AVG(psi_io_some), AVG(psi_cpu) FROM sys WHERE res = 5 AND ts > ?",
+                         (now - 60,)).fetchone()
+        if ps[0] is not None:
+            st = 2 if ps[0] >= 25 else 1 if ps[0] >= 10 else 0
+            out.append(f'{st} "IO-Druck" psi_io_full={ps[0]:.2f};10;25|psi_io_some={ps[1]:.2f} Prozesse komplett durch IO '
+                       f'blockiert: {de(ps[0])} %, teilweise: {de(ps[1])} % (letzte 60 s)')
+            st = 2 if ps[2] >= 40 else 1 if ps[2] >= 20 else 0
+            out.append(f'{st} "CPU-Druck" psi_cpu_some={ps[2]:.2f};20;40 Prozesse warten auf CPU-Zeit: {de(ps[2])} % (letzte 60 s)')
+        wr, n = defaultdict(float), 0
+        for (w,) in con.execute("SELECT writers FROM sys WHERE res = 5 AND ts > ?", (now - 60,)):
+            n += 1
+            for k, v in json.loads(w or "[]"):
+                wr[k] += v
+        top3 = sorted(((k, v / max(n, 1)) for k, v in wr.items()), key=lambda kv: -kv[1])
+        txt = ", ".join(f"{k} {v:.2f} MB/s" for k, v in top3[:3] if v >= 0.01) or "kaum Schreibzugriffe"
+        out.append(f'0 "Top-Schreiber" write_total_mbs={sum(v for _, v in top3):.2f} {txt}')
+        w = felt(con, "1h", float(conf["felt_ms"]))
+        h = w["windows"]["1h"]
+        st = 2 if h["longest"] >= 5 or h["app_max"] >= 5 else 1 if h["n"] or h["app_n"] else 0
+        txt = (f"letzte Stunde: {h['n']}× spürbar (ab {secs_txt(w['felt_ms'] / 1000)} Wartezeit oder 2 s Dauer), "
+               f"zusammen {secs_txt(h['secs'])}, längster {secs_txt(h['longest'])}")
+        if h["app_max"]:
+            txt += f"; Anwendung wartete max. {secs_txt(h['app_max'])}" + (f" ({h['app_who']})" if h["app_who"] else "")
+        if w.get("last"):
+            la = w["last"]
+            txt += f"; zuletzt {time.strftime('%d.%m. %H:%M', time.localtime(la['start']))} {la['dev']} {secs_txt(la['dur'])}"
+        out.append(f'{st} "SSD Hänger" felt_stalls_1h={h["n"]}|felt_secs_1h={h["secs"]}|longest_stall_s={h["longest"]}|'
+                   f'longest_wait_s={h["app_max"]} {txt}')
+    elif part == "smart":
+        smart = [x for x in smart_view(con) if not x["rot"] and not x["usb"]]
+        if not smart:
+            return ""
+        for x in smart:
+            d = x["dev"]
+            if d.startswith("sd") and (x["wc_drive"] or x["sct"] or x["wc_boot"]):
+                st = 0
+                txt = f"Laufwerk {'an' if x['wc_drive'] == '1' else 'aus' if x['wc_drive'] == '0' else '?'}"
+                if x["wc_boot"]:
+                    txt += f", beim Start {'an' if x['wc_boot'] == 'enabled' else 'aus'}"
+                if x["sct"]:
+                    txt += f", SCT: {x['sct']}"
+                if x["wc_drive"] == "1" and x["wc_kernel"] == "write through":
+                    st = 2
+                    txt += f" - Kernel hält den Cache für aus und schickt keine Flushes: echo 1 > /sys/block/{d}/device/rescan"
+                elif x["wc_drive"] == "0" or (x["sct"] and "force disabled" in x["sct"].lower()):
+                    st = 1
+                    txt += " - Cache aus" + (f". Dauerhaft einschalten: smartctl -s wcache-sct,on,p /dev/{d}" if x["sct"] else "")
+                elif x["wc_boot"] == "disabled" and not (x["sct"] and "force enabled" in x["sct"].lower()):
+                    txt += " - beim Start aus" + (f"; dauerhaft: smartctl -s wcache-sct,on,p /dev/{d}" if x["sct"] else "")
+                out.append(f'{st} "SSD {d} Schreibcache" write_cache={1 if x["wc_drive"] == "1" else 0};;;0;1 {txt}')
+            if x.get("waf_24h") is not None:
+                waf = x["waf_24h"]
+                st = 2 if waf >= 10 else 1 if waf >= 5 else 0
+                perf = f"waf={waf:.2f};5;10|host_gib_day={x['host_day'] or 0}"
+                txt = f"WAF {de(waf)} in den letzten {x.get('window_h')} h, Host {de(x['host_day'] or 0)} GiB/Tag"
+                if x.get("nand_day"):
+                    perf += f"|nand_gib_day={x['nand_day']}"
+                    txt += f", NAND {x['nand_day']} GiB/Tag"
+                out.append(f'{st} "SSD {d} Schreibverstärkung" {perf} {txt} (gesamte Laufzeit: WAF {de(x["waf_total"])})')
+            elif x.get("waf_total") is not None:
+                out.append(f'0 "SSD {d} Schreibverstärkung" - Noch kein Vergleichspunkt (ab 1 h Verlauf), '
+                           f'gesamte Laufzeit: WAF {de(x["waf_total"])}')
+            if x["used"] is not None:
+                rem = x["remaining_days"] if x["remaining_days"] is not None else x["remaining_lifetime_days"]
+                st = 2 if rem is not None and rem < 365 else 1 if rem is not None and rem < 730 else 0
+                perf = f"wear_used={x['used']};;;0;100" + (f"|remaining_days={rem}" if rem is not None else "")
+                txt = f"Verschleiß {x['used']} %"
+                if x["remaining_days"] is not None:
+                    txt += f", Restlaufzeit bei aktuellem Tempo {fmt_days(x['remaining_days'])}"
+                if x["remaining_lifetime_days"] is not None:
+                    txt += f", bei bisherigem Durchschnitt {fmt_days(x['remaining_lifetime_days'])}"
+                out.append(f'{st} "SSD {d} Verschleiß" {perf} {txt}')
+        tr = json.loads((con.execute("SELECT v FROM kv WHERE k = 'trim'").fetchone() or ["{}"])[0])
+        if tr.get("enabled") is False:
+            out.append('1 "SSD TRIM" - fstrim.timer ist nicht aktiv: systemctl enable --now fstrim.timer')
+        for m in tr.get("mounts", []):
+            p = tr.get("period", 7)
+            st, txt = 0, ""
+            if m.get("last"):
+                age = (now - m["last"]) / 86400
+                txt = f"letzter Lauf vor {de(age)} Tagen (Zeitplan {tr.get('schedule') or '?'})"
+                if age > p + 1:
+                    st, txt = 1, txt + " - überfällig"
+            else:
+                st, txt = 1, "noch kein fstrim-Lauf im Journal"
+            perf = f"trim_age_days={((now - m['last']) / 86400) if m.get('last') else 0:.1f};{p + 1}"
+            if "deleted_gib_day" in m:
+                perf += f"|deleted_gib_day={m['deleted_gib_day']}|untrimmed_pct={m['untrimmed_pct']};2"
+                txt += (f", Ø {de(m['deleted_gib_day'])} GiB/Tag gelöscht, bis zum nächsten Lauf bis zu "
+                        f"{de(m['untrimmed_pct'])} % ungetrimmt")
+                if p > 1 and m["untrimmed_pct"] >= 2:
+                    st = max(st, 1)
+                    txt += " - täglich trimmen: systemctl edit fstrim.timer, [Timer] OnCalendar= und OnCalendar=daily"
+            out.append(f'{st} "SSD TRIM {m["mount"]}" {perf} {txt}')
+    return "\n".join(out) + ("\n" if out else "")
+
+
+# ---------------------------------------------------------------------------
 # Web-Oberfläche
 # ---------------------------------------------------------------------------
 class Handler(BaseHTTPRequestHandler):
@@ -1117,6 +1243,10 @@ class Handler(BaseHTTPRequestHandler):
                     data = felt(con, q.get("range", "7d"), float(srv.conf["felt_ms"]))
                 elif u.path == "/api/smart":
                     data = smart_history(con)
+                elif u.path == "/api/checkmk":
+                    self.send(200, checkmk_lines(con, srv.collector, srv.conf, q.get("part", "fast")),
+                              "text/plain; charset=utf-8")
+                    return
                 elif u.path == "/api/report":
                     self.send(200, report(con, srv.collector, srv.conf), "text/plain; charset=utf-8")
                     return

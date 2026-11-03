@@ -165,7 +165,13 @@ sudo chmod +x /usr/lib/check_mk_agent/local/write_latency /usr/lib/check_mk_agen
 ```
 
 Danach in CheckMK die Services des Hosts neu erkennen lassen. Einfacher: Das Skript einmal als root starten. Es
-installiert die Checks bei vorhandenem Agent selbst und hält sie bei jedem weiteren Start aktuell. Beide Checks lassen sich zum Testen auch direkt
+installiert die Checks bei vorhandenem Agent selbst und hält sie bei jedem weiteren Start aktuell.
+
+**Mit dem Dienst** (siehe oben) messen die Checks nicht selbst. Sie geben die Werte des Dienstes weiter
+(`/api/checkmk`), damit CheckMK und Web-Oberfläche auf derselben Messung beruhen und SMART nur einmal abgefragt wird.
+Dazu kommt der Service `SSD Hänger` (spürbare Hänger der letzten Stunde: Anzahl, Sekunden, längster Hänger, längste
+Wartezeit einer Anwendung; WARN ab einem spürbaren Hänger, CRIT ab 5 s). Ist der Dienst gestoppt oder hat er noch
+keine Daten, messen die Checks wieder selbst. Die Schwellwerte gelten dann aus dem Dienst, nicht aus den Dateien. Beide Checks lassen sich zum Testen auch direkt
 aufrufen. Die Werte beziehen sich immer auf den Zeitraum seit dem letzten Aufruf (Zustand unter
 `/var/lib/write-latency-diag/`). Der erste Aufruf liefert deshalb nur Startwerte, die Schreibverstärkung der letzten
 24 h steht nach einem Tag fest. Die Schwellwerte stehen oben in den Dateien:
@@ -183,6 +189,11 @@ aufrufen. Die Werte beziehen sich immer auf den Zeitraum seit dem letzten Aufruf
 
 Kurze Hänger innerhalb einer Minute sieht der Latenz-Service nur, wenn sie den Minuten-Schnitt deutlich anheben.
 Für die genaue Analyse mit fsync-Aufrufern bleibt das Skript.
+
+Das Skript erkennt Hänger genauso wie der Dienst: als Ereignisse mit Uhrzeit, SSD, Dauer und Wartezeit, dazu je SSD
+die typische Dauer und den typischen Abstand. Hält eine SSD in festem Takt an (z.B. alle 10 Minuten für 7 Sekunden),
+nennt der Befund das ausdrücklich. Läuft der Dienst, verweist das Skript am Ende auf seine Web-Oberfläche und den
+Bericht über den ganzen Zeitraum.
 
 ## Wie wird entschieden?
 
