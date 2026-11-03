@@ -190,6 +190,8 @@ keep_1m_days = 90
 keep_events_days = 365
 # Ab dieser Wartezeit zählt eine Sekunde als Hänger
 stall_ms = 100
+# Spürbar für Benutzer: ab dieser Wartezeit (oder Hänger ab 2 s Dauer)
+felt_ms = 1000
 # fsync-Aufrufer per bpftrace aufzeichnen (1/0)
 bpftrace = 1
 # Täglich auf neue Version prüfen (1/0)

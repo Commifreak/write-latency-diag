@@ -32,6 +32,7 @@ DEFAULTS = {
     "db": "/var/lib/write-latency-diag/metrics.db",
     "devices": r"^(sd[a-z]+|nvme[0-9]+n[0-9]+|vd[a-z]+|xvd[a-z]+)$",
     "stall_ms": "100",           # ab dieser Wartezeit zählt eine Sekunde als Hänger
+    "felt_ms": "1000",           # spürbar: ab dieser Wartezeit (oder Hänger ab 2 s Dauer)
     "keep_5s_days": "7",         # 5-Sekunden-Werte
     "keep_1m_days": "90",        # Minutenwerte, fsync-Statistik
     "keep_events_days": "365",
@@ -852,13 +853,51 @@ def series(con, rng):
     return {"range": rng, "bucket": bucket, "since": since, "now": now, "disk": disk, "sys": sysd}
 
 
+FELT_EV = "(MAX(max_w, max_f) >= ? OR end - start >= 2)"
+
+
+def felt(con, rng, felt_ms):
+    """Hänger in echten Sekunden, so wie Benutzer sie merken: Geräte-Hänger ab felt_ms Wartezeit oder 2 s Dauer,
+    und Anwendungen, die einzeln ab felt_ms auf ein fsync gewartet haben."""
+    now = time.time()
+    out = {"felt_ms": felt_ms, "windows": {}}
+    for name, secs in (("1h", 3600), ("24h", 86400), ("7d", 604800)):
+        since = now - secs
+        n, total, longest = con.execute(f"SELECT COUNT(*), SUM(end - start), MAX(end - start) FROM events "
+                                        f"WHERE start > ? AND {FELT_EV}", (since, felt_ms)).fetchone()
+        an, atotal, amax = con.execute("SELECT COUNT(*), SUM(ms), MAX(ms) FROM slow_fsync WHERE ts > ? AND ms >= ?",
+                                       (since, felt_ms)).fetchone()
+        who = con.execute("SELECT proc, thread FROM slow_fsync WHERE ts > ? ORDER BY ms DESC LIMIT 1",
+                          (since,)).fetchone() if amax else None
+        out["windows"][name] = {"n": n or 0, "secs": round(total or 0, 1), "longest": round(longest or 0, 1),
+                                "app_n": an or 0, "app_secs": round((atotal or 0) / 1000, 1),
+                                "app_max": round((amax or 0) / 1000, 1),
+                                "app_who": (who[0] if who[0] == who[1] else f"{who[0]}/{who[1]}") if who else None}
+    last = con.execute(f"SELECT dev, start, end, MAX(max_w, max_f), waiters FROM events WHERE {FELT_EV} "
+                       f"ORDER BY start DESC LIMIT 1", (felt_ms,)).fetchone()
+    if last:
+        out["last"] = {"dev": last[0], "start": last[1], "dur": round(last[2] - last[1], 1), "max_ms": last[3],
+                       "waiters": json.loads(last[4] or "[]")}
+    since = now - RANGES.get(rng, 604800)
+    hours = defaultdict(lambda: {"secs": 0.0, "app_max": 0.0})
+    for t, secs in con.execute(f"SELECT CAST(start / 3600 AS INTEGER) * 3600, SUM(end - start) FROM events "
+                               f"WHERE start > ? AND {FELT_EV} GROUP BY 1", (since, felt_ms)):
+        hours[t]["secs"] = round(secs, 1)
+    for t, mx in con.execute("SELECT CAST(ts / 3600 AS INTEGER) * 3600, MAX(ms) FROM slow_fsync WHERE ts > ? "
+                             "GROUP BY 1", (since,)):
+        hours[t]["app_max"] = round(mx / 1000, 2)
+    out["hours"] = [{"t": t, **v} for t, v in sorted(hours.items())]
+    out["since"], out["now"] = since, now
+    return out
+
+
 def events(con, rng, min_ms):
     since = time.time() - RANGES.get(rng, 604800)
     rows = con.execute("SELECT id, dev, start, end, max_w, max_f, writers, waiters FROM events WHERE start > ? AND "
                        "MAX(max_w, max_f) >= ? ORDER BY start DESC LIMIT 500", (since, min_ms)).fetchall()
     per_hour = con.execute("SELECT CAST(start / 3600 AS INTEGER) * 3600, COUNT(*), SUM(end - start) FROM events "
                            "WHERE start > ? AND MAX(max_w, max_f) >= ? GROUP BY 1 ORDER BY 1", (since, min_ms)).fetchall()
-    return {"events": [{"id": r[0], "dev": r[1], "start": r[2], "dur": round(r[3] - r[2] + 1, 1), "max_w": r[4],
+    return {"events": [{"id": r[0], "dev": r[1], "start": r[2], "dur": round(r[3] - r[2], 1), "max_w": r[4],
                         "max_f": r[5], "writers": json.loads(r[6] or "[]"), "waiters": json.loads(r[7] or "[]")}
                        for r in rows],
             "per_hour": [{"t": r[0], "n": r[1], "secs": round(r[2] or 0, 1)} for r in per_hour],
@@ -937,6 +976,8 @@ class Handler(BaseHTTPRequestHandler):
                     data = events(con, q.get("range", "7d"), float(q.get("min_ms", "0")))
                 elif u.path == "/api/fsync":
                     data = fsync_stats(con, q.get("range", "24h"))
+                elif u.path == "/api/felt":
+                    data = felt(con, q.get("range", "7d"), float(srv.conf["felt_ms"]))
                 elif u.path == "/api/smart":
                     data = smart_history(con)
                 else:
@@ -1047,6 +1088,7 @@ h1{font-size:18px;margin:0}h2{font-size:15px;margin:22px 0 8px}main{max-width:12
 .ranges button.on{background:var(--fg);color:var(--bg)}
 .chart{position:relative;height:220px}.chart canvas{width:100%;height:100%;display:block}
 .tip{position:absolute;pointer-events:none;background:var(--card);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font-size:12px;display:none;white-space:nowrap;z-index:2;box-shadow:0 2px 8px rgba(0,0,0,.15)}
+.big{font-size:28px;font-weight:650;line-height:1.1;font-variant-numeric:tabular-nums}.big small{font-size:14px;font-weight:500;color:var(--mut)}
 .legend{font-size:12px;margin-top:4px}.legend span{margin-right:12px;white-space:nowrap}
 table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:5px 8px;border-bottom:1px solid var(--line);vertical-align:top}
 th{color:var(--mut);font-weight:600}td.num{text-align:right;font-variant-numeric:tabular-nums}.scroll{overflow-x:auto}
@@ -1055,6 +1097,10 @@ select{background:var(--card);color:var(--fg);border:1px solid var(--line);borde
 <header><h1>Schreiblatenz <span id="host" class="mut"></span></h1><span id="meta" class="mut small"></span></header>
 <main>
 <h2>Befund</h2><div id="findings"></div>
+<h2>Spürbare Hänger <span class="mut small" id="feltdef"></span></h2>
+<div class="grid" id="felttiles"></div><div id="feltlast" class="small" style="margin:8px 0"></div>
+<div class="card"><h3>Spürbare Sekunden pro Stunde</h3><div class="chart" style="height:160px"><canvas id="feltchart"></canvas><div class="tip"></div></div>
+<div class="legend"><span><span class="dot" style="background:#c2272d"></span>Summe der Hänger (s)</span><span><span class="dot" style="background:#2f6fbf"></span>längste Wartezeit einer Anwendung (s)</span></div></div>
 <h2>Laufwerke</h2><div id="cards" class="grid"></div>
 <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-top:22px">
 <h2 style="margin:0">Verlauf</h2><div class="ranges" id="ranges"></div></div>
@@ -1092,9 +1138,11 @@ function chart(canvas,series,opt){
   c.strokeStyle=grid;c.fillStyle=fg;c.font='11px system-ui';c.lineWidth=1;
   const ticks=log?[1,10,100,1000,10000,100000].filter(v=>v<=ymax*1.1):[0,.25,.5,.75,1].map(f=>f*ymax*1.08);
   for(const v of ticks){const y=Math.round(Y(v))+.5;c.beginPath();c.moveTo(L,y);c.lineTo(W-R,y);c.stroke();c.fillText(opt.fmt?opt.fmt(v):(+v.toPrecision(3)).toString(),4,y+4)}
-  const span=x1-x0,nt=Math.max(2,Math.floor(pw/110));for(let i=0;i<=nt;i++){const t=x0+span*i/nt,d=new Date(t*1000);
-    const s=span>172800?d.toLocaleDateString('de-DE',{day:'2-digit',month:'2-digit'}):d.toLocaleTimeString('de-DE',{hour:'2-digit',minute:'2-digit'});c.fillText(s,Math.min(X(t)-14,W-R-30),H-6)}
-  series.forEach((s,k)=>{c.strokeStyle=s.color||COLORS[k%COLORS.length];c.lineWidth=1.4;c.beginPath();let pen=false,gap=opt.gap||Infinity;
+  const span=x1-x0,nt=Math.max(2,Math.floor(pw/110));let lastR=-1e9;for(let i=0;i<=nt;i++){const t=x0+span*i/nt,d=new Date(t*1000);
+    const s=span>1296000?d.toLocaleDateString('de-DE',{day:'2-digit',month:'2-digit'}):span>172800?d.toLocaleDateString('de-DE',{day:'2-digit',month:'2-digit'})+' '+d.toLocaleTimeString('de-DE',{hour:'2-digit'}):d.toLocaleTimeString('de-DE',{hour:'2-digit',minute:'2-digit'});const lw=c.measureText(s).width,lx=Math.max(L-10,Math.min(X(t)-lw/2,W-R-lw));if(lx<lastR+8)continue;c.fillText(s,lx,H-6);lastR=lx+lw}
+  series.forEach((s,k)=>{c.strokeStyle=s.color||COLORS[k%COLORS.length];c.lineWidth=1.4;
+    if(s.bars){c.fillStyle=c.strokeStyle;const bw=Math.max(2,(s.bars/(x1-x0))*pw-1);for(let i=0;i<s.t.length;i++){if(!s.v[i])continue;const y=Y(s.v[i]);c.fillRect(X(s.t[i]),y,bw,T+ph-y)}return}
+    c.beginPath();let pen=false,gap=opt.gap||Infinity;
     for(let i=0;i<s.t.length;i++){const x=X(s.t[i]),y=Y(s.v[i]);if(!pen||s.t[i]-s.t[i-1]>gap){c.moveTo(x,y);pen=true}else c.lineTo(x,y)}c.stroke();
     if(opt.dots){c.fillStyle=c.strokeStyle;for(let i=0;i<s.t.length;i++){c.beginPath();c.arc(X(s.t[i]),Y(s.v[i]),2.5,0,7);c.fill()}}});
   if(opt.thresholds)for(const th of opt.thresholds){if(th.v>ymax*1.1)continue;c.strokeStyle=th.color;c.setLineDash([4,4]);c.beginPath();c.moveTo(L,Y(th.v)+.5);c.lineTo(W-R,Y(th.v)+.5);c.stroke();c.setLineDash([])}
@@ -1148,6 +1196,23 @@ async function loadCharts(){
   chart($('#c4'),ss,{...o,ymin:5});$('#c4l').replaceChildren(...legend(ss.map(x=>x.name)));
 }
 
+const sec=v=>v>=100?Math.round(v)+' s':v>=10?v.toFixed(0)+' s':v.toFixed(1).replace('.',',')+' s';
+async function loadFelt(){
+  const rng=['1h','6h','24h'].includes(RANGE)?'7d':RANGE,f=await J('api/felt?range='+rng);
+  $('#feltdef').textContent='(ab '+sec(f.felt_ms/1000)+' Wartezeit oder 2 s Dauer)';
+  const lbl={'1h':'Letzte Stunde','24h':'Letzte 24 Stunden','7d':'Letzte 7 Tage'};
+  $('#felttiles').replaceChildren(...Object.entries(f.windows).map(([k,w])=>{
+    const lv=w.n===0&&w.app_n===0?'ok':(w.longest>=5||w.app_max>=5)?'crit':'warn';
+    return el('div',{class:'card'},el('h3',{},el('span',{},el('span',{class:'dot b-'+lv}),lbl[k])),
+      el('div',{class:'big'},w.n+'× ',el('small',{},'zusammen '+sec(w.secs))),
+      el('div',{class:'kv',style:'margin-top:6px'},el('span',{},'längster Hänger'),el('span',{},w.n?sec(w.longest):'–'),
+        el('span',{},'Anwendung wartete'),el('span',{},w.app_n?w.app_n+'× ≥ '+sec(f.felt_ms/1000)+', zusammen '+sec(w.app_secs):'nie ≥ '+sec(f.felt_ms/1000)),
+        el('span',{},'längste Wartezeit'),el('span',{},w.app_max?sec(w.app_max)+(w.app_who?' ('+w.app_who+')':''):'–')))}));
+  const l=f.last;$('#feltlast').replaceChildren(l?el('span',{},el('b',{},'Zuletzt: '),fmtT(l.start)+' – '+sec(l.dur)+' auf '+l.dev+
+    (l.waiters.length?', es warteten: '+l.waiters.slice(0,3).map(w=>w[0]+' '+sec(w[1]/1000)).join(', '):'')):el('span',{class:'mut'},'Noch kein spürbarer Hänger aufgezeichnet.'));
+  const h=f.hours;chart($('#feltchart'),[{name:'Hänger',color:'#c2272d',bars:3600,t:h.map(x=>x.t),v:h.map(x=>x.secs)},{name:'längste Wartezeit',color:'#2f6fbf',t:h.filter(x=>x.app_max).map(x=>x.t),v:h.filter(x=>x.app_max).map(x=>x.app_max)}],
+    {dots:true,ymin:1,x0:f.since,x1:f.now,gap:3600,fmt:v=>sec(+v),empty:'keine spürbaren Hänger'});
+}
 async function loadEvents(){
   const rng=['1h','6h','24h'].includes(RANGE)?'24h':RANGE,e=await J('api/events?range='+rng+'&min_ms='+$('#evmin').value);
   const ph=e.per_hour;chart($('#evchart'),[{name:'Hänger pro Stunde',t:ph.map(x=>x.t),v:ph.map(x=>x.n)}],{dots:true,ymin:1,x0:e.since,x1:e.now,gap:3600,empty:'keine Hänger'});
@@ -1174,11 +1239,11 @@ async function loadSmart(){
   $('#waflegend').replaceChildren(...legend(names));
 }
 
-function ranges(){const r=$('#ranges');r.replaceChildren(...['1h','6h','24h','7d','30d','90d'].map(x=>{const b=el('button',{class:x===RANGE?'on':''},x);b.onclick=()=>{RANGE=x;localStorageSet('range',x);ranges();loadCharts();loadEvents();loadFsync()};return b}))}
-async function all(){try{await loadStatus()}catch(e){console.error(e)}try{await loadCharts()}catch(e){console.error(e)}try{await loadEvents()}catch(e){console.error(e)}try{await loadFsync()}catch(e){console.error(e)}try{await loadSmart()}catch(e){console.error(e)}}
+function ranges(){const r=$('#ranges');r.replaceChildren(...['1h','6h','24h','7d','30d','90d'].map(x=>{const b=el('button',{class:x===RANGE?'on':''},x);b.onclick=()=>{RANGE=x;localStorageSet('range',x);ranges();loadCharts();loadFelt();loadEvents();loadFsync()};return b}))}
+async function all(){try{await loadStatus()}catch(e){console.error(e)}try{await loadFelt()}catch(e){console.error(e)}try{await loadCharts()}catch(e){console.error(e)}try{await loadEvents()}catch(e){console.error(e)}try{await loadFsync()}catch(e){console.error(e)}try{await loadSmart()}catch(e){console.error(e)}}
 $('#evmin').onchange=loadEvents;ranges();all();
-setInterval(()=>{loadStatus();loadCharts()},15000);setInterval(()=>{loadEvents();loadFsync();loadSmart()},60000);
-let rt;window.addEventListener('resize',()=>{clearTimeout(rt);rt=setTimeout(()=>{loadCharts();loadEvents();loadSmart()},200)});
+setInterval(()=>{loadStatus();loadCharts()},15000);setInterval(()=>{loadFelt();loadEvents();loadFsync();loadSmart()},60000);
+let rt;window.addEventListener('resize',()=>{clearTimeout(rt);rt=setTimeout(()=>{loadCharts();loadFelt();loadEvents();loadSmart()},200)});
 </script></body></html>
 """
 

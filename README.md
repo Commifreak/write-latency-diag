@@ -99,6 +99,10 @@ Danach im Browser `http://<server-ip>:81/` öffnen. Die Seite zeigt:
 
 - **Befund**: dieselben Regeln wie Skript und CheckMK (Schreibcache, Schreibverstärkung, Restlaufzeit, Hänger,
   TRIM, IO- und CPU-Druck)
+- **Spürbare Hänger** in echten Sekunden für die letzte Stunde, 24 h und 7 Tage: wie oft, wie lange zusammen, der
+  längste Hänger und wie lange eine Anwendung höchstens auf ihr fsync gewartet hat. Dazu der letzte spürbare
+  Hänger und die spürbaren Sekunden pro Stunde. Spürbar heißt: ab 1 s Wartezeit (`felt_ms` in der Konfiguration)
+  oder ab 2 s Dauer.
 - **Laufwerke**: aktuelle Latenz und Flushes, Schreibverstärkung der letzten 24 h, Verschleiß mit Restlaufzeit,
   Schreibcache
 - **Verlauf** (1 h bis 90 Tage): maximale Wartezeit je Gerät, Flushes pro Sekunde, Schreibmenge, PSI und CPU
