@@ -774,7 +774,7 @@ def build_status(con, collector, conf):
         if s["waf_24h"] is not None:
             lvl = "crit" if s["waf_24h"] >= 10 else "warn" if s["waf_24h"] >= 5 else None
             if lvl:
-                add(lvl, f"{d}: Schreibverstärkung {s['waf_24h']} in den letzten {s.get('window_h')} h - viele kleine "
+                add(lvl, f"{d}: Schreibverstärkung {str(s['waf_24h']).replace('.', ',')} in den letzten {s.get('window_h')} h - viele kleine "
                          f"Sync-Schreibzugriffe/Flushes auf einer SSD ohne Power-Loss-Protection.")
         rem = s["remaining_days"] if s["remaining_days"] is not None else s["remaining_lifetime_days"]
         if rem is not None and rem < 730:
@@ -805,8 +805,8 @@ def build_status(con, collector, conf):
         add("warn", "fstrim.timer ist nicht aktiv: systemctl enable --now fstrim.timer")
     for m in trim.get("mounts", []):
         if trim.get("period", 7) > 1 and m.get("untrimmed_pct", 0) >= 2:
-            add("warn", f"TRIM {m['mount']}: bis zum nächsten Lauf bis zu {m['untrimmed_pct']} % der Kapazität "
-                        f"ungetrimmt ({m['deleted_gib_day']} GiB/Tag gelöscht) - täglich trimmen: systemctl edit "
+            add("warn", f"TRIM {m['mount']}: bis zum nächsten Lauf bis zu {str(m['untrimmed_pct']).replace('.', ',')} % der "
+                        f"Kapazität ungetrimmt ({str(m['deleted_gib_day']).replace('.', ',')} GiB/Tag gelöscht) - täglich trimmen: systemctl edit "
                         f"fstrim.timer, [Timer] OnCalendar= und OnCalendar=daily")
         if m.get("last") and now - m["last"] > (trim.get("period", 7) + 1) * 86400:
             add("warn", f"TRIM {m['mount']}: letzter Lauf vor {(now - m['last']) / 86400:.0f} Tagen.")
@@ -1002,10 +1002,27 @@ def report(con, collector, conf):
     L += [f"  {time.strftime('%d.%m. %H:00', time.localtime(h))}  {n:>4} / {f or 0:>3} / {secs_txt(s or 0)}"
           for h, n, f, s in rows] or ["  keine"]
 
+    L += ["", "MUSTER PRO GERÄT (spürbare Hänger, letzte 24 h): Anzahl, typische Dauer, typischer Abstand"]
+    per = defaultdict(list)
+    for dev, start, end in con.execute(f"SELECT dev, start, end FROM events WHERE start > ? AND {FELT_EV} ORDER BY start",
+                                       (now - 86400, float(conf["felt_ms"]))):
+        per[dev].append((start, end - start))
+    for dev in sorted(per):
+        ev = per[dev]
+        durs = sorted(d for _, d in ev)
+        gaps = sorted((b[0] - a[0]) / 60 for a, b in zip(ev, ev[1:]))
+        line = f"  {dev:<6} {len(ev):>3}×  Dauer Median {secs_txt(durs[len(durs) // 2])}"
+        if gaps:
+            line += (f"  Abstand Median {de(gaps[len(gaps) // 2])} min (min {de(gaps[0])}, max {de(gaps[-1])})")
+        L.append(line)
+    if not per:
+        L.append("  keine")
+
     L += ["", "LAUFWERKE"]
     for s_ in st["smart"]:
         d = s_["dev"]
-        parts = [f"  {d:<5} {s_['model'] or '?'}  SN {s_['serial']}  {'HDD' if s_['rot'] else 'SSD'}{' USB' if s_['usb'] else ''}"]
+        parts = [f"  {d:<5} {s_['model'] or '?'}" + (f"  SN {s_['serial']}" if s_["serial"] != d else "")
+                 + f"  {'HDD' if s_['rot'] else 'SSD'}{' USB' if s_['usb'] else ''}"]
         if s_["used"] is not None:
             rem = []
             if s_["remaining_days"] is not None:
@@ -1021,10 +1038,13 @@ def report(con, collector, conf):
         if s_["wc_drive"] or s_["sct"] or s_["wc_boot"]:
             parts.append(f"Cache {'an' if s_['wc_drive'] == '1' else 'aus' if s_['wc_drive'] == '0' else '?'}"
                          f"/Start {s_['wc_boot'] or '?'}/SCT {s_['sct'] or '-'}/Kernel {s_['wc_kernel'] or '?'}")
-        parts.append(f"Temp {s_['temp']}  POH {s_['poh']}  Realloc {s_['realloc']}  CRC {s_['crc']}")
+        extra = [f"{k} {v}" for k, v in (("Temp", s_["temp"]), ("POH", s_["poh"]), ("Realloc", s_["realloc"]),
+                                         ("CRC", s_["crc"])) if v is not None]
+        if extra:
+            parts.append("  ".join(extra))
         L.append("  ".join(parts))
         l5 = st["last5min"].get(d)
-        if l5:
+        if l5 and (l5["f_rate"] or l5["w_await"] or l5["max"]):
             L.append(f"        letzte 5 min: Flush Ø {de(l5['f_await'] or 0, 2)} ms bei {de(l5['f_rate'] or 0)}/s, "
                      f"Write Ø {de(l5['w_await'] or 0, 2)} ms, max. Wartezeit {ms_txt(l5['max'])}, "
                      f"Auslastung {de(l5['util'] or 0, 0)} %")
