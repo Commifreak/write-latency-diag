@@ -86,7 +86,8 @@ Ablauf:
 1. **SMART vorher und kurzer Selbsttest**: Gesamtzustand, Attribute am Grenzwert, Zähler, die bei einer gesunden
    SSD 0 sind (reallokierte, wartende und nicht korrigierbare Sektoren, Programmier- und Löschfehler,
    Reserveblöcke), Fehlerprotokoll, frühere Selbsttests, Verschleiß, Betriebsstunden, Geschriebenes und
-   unerwartete Stromausfälle.
+   unerwartete Stromausfälle. Bei Samsung-SSDs mit NAND-Zähler (Attribut 251, z.B. SM883/PM883) außerdem die
+   Schreibverstärkung über die Lebensdauer und am Ende die während der Prüfung.
 2. **TRIM über die ganze Fläche** (`blkdiscard`): Gebrauchte SSDs starten ohne alte Belegung.
 3. **Flush-Latenz**: 60 s lang 4k-Schreiben mit O_SYNC direkt auf das Laufwerk, jeder Zugriff mit Flush. Mit
    wirksamer Power-Loss-Protection (PLP) bestätigt die SSD sofort: Median unter 0,5 ms. Ohne PLP dauert es

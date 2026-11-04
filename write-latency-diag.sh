@@ -10,7 +10,7 @@
 # eine temporäre Testdatei in das angegebene Verzeichnis und löschen sie danach.
 #
 
-VERSION="1.6"
+VERSION="1.7"
 
 PASSIVE=""            # Dauer der passiven Beobachtung in Sekunden
 INTERVAL=1
@@ -417,6 +417,13 @@ dc_smart_eval() { # SMART-Datei vorher
   DC_USED=$used; DC_POH=$poh; DC_W0=$wr
   dc_info "Betriebsstunden: ${poh:-?}$([ -n "$poh" ] && echo " (~$(dc_de "$(awk -v h="$poh" 'BEGIN{print h/24/365}')") Jahre)")  Einschaltvorgänge: ${pc:-?}${por:+  unerwartete Stromausfälle: $por}"
   [ -n "$wr" ] && dc_info "Geschrieben: $(dc_de "$(awk -v b="$wr" 'BEGIN{print b/1e12}')") TB$( [ -n "$poh" ] && [ "$poh" -gt 24 ] && echo " (Ø $(awk -v b="$wr" -v h="$poh" 'BEGIN{printf "%.0f", b/1e9/(h/24)}') GB/Tag)")"
+  # Samsung (z.B. SM883/PM883): 251 NAND-Schreibmenge und 241 Host-Schreibmenge, beide in LBAs
+  local nw hw
+  nw=$(dc_attr "$f" 251); hw=$(dc_attr "$f" 241)
+  if grep -qE '^(Device Model|Model Number): *(SAMSUNG|MZ)' "$f" && [ "${nw:-0}" -gt 0 ] && [ "${hw:-0}" -gt 0 ]; then
+    DC_WAF=$(awk -v n="$nw" -v h="$hw" 'BEGIN { printf "%.2f", n / h }')
+    dc_info "Schreibverstärkung über die Lebensdauer (NAND/Host): $(dc_de "$DC_WAF" %.2f)"
+  fi
   if [ -z "$used" ]; then dc_res hint "Verschleiß nicht lesbar."
   elif [ "$used" -ge 90 ]; then dc_res crit "Verschleiß $used % - die Nennlebensdauer ist fast erreicht."
   elif [ "$used" -ge 50 ]; then dc_res warn "Verschleiß $used % - mehr als die Hälfte der Nennlebensdauer ist verbraucht."
@@ -707,6 +714,17 @@ disk_check() {
     if [ "$ratio" -lt 80 ] || [ "$ratio" -gt 125 ]; then dc_res hint "Der Schreibzähler der SSD passt nicht zur geschriebenen Menge - die SMART-Werte (Verschleiß, Geschriebenes) sind dann mit Vorsicht zu lesen."
     else dc_res ok "Schreibzähler der SSD stimmt mit der geschriebenen Menge überein."; fi
   fi
+  if [ -n "$DC_WAF" ]; then
+    local n1 n2 h1 h2
+    n1=$(dc_attr "$sm" 251); n2=$(dc_attr "$sm2" 251); h1=$(dc_attr "$sm" 241); h2=$(dc_attr "$sm2" 241)
+    if [ -n "$n2" ] && [ -n "$h2" ] && [ $(( h2 - h1 )) -gt 2000000 ]; then
+      DC_WAFT=$(awk -v n=$(( n2 - n1 )) -v h=$(( h2 - h1 )) 'BEGIN { printf "%.2f", n / h }')
+      dc_info "Schreibverstärkung während der Prüfung (NAND/Host): $(dc_de "$DC_WAFT" %.2f)"
+      if awk -v x="$DC_WAFT" 'BEGIN { exit !(x >= 3) }'; then
+        dc_res hint "Hohe Schreibverstärkung während der Prüfung ($(dc_de "$DC_WAFT" %.1f)) - bei einer SSD mit PLP sind Werte um 1 üblich."
+      fi
+    fi
+  fi
   if [ $DC_ABORT -eq 0 ]; then
     blkdiscard $force "$dev" 2>/dev/null && dc_info "Fläche wieder getrimmt - die SSD ist leer und bereit zum Einbau."
   fi
@@ -723,7 +741,7 @@ disk_check() {
     case ${x%%|*} in crit) echo "   - [KRITISCH] ${x#*|}" ;; warn) echo "   - [!] ${x#*|}" ;; hint) echo "   - [?] ${x#*|}" ;; esac
   done
   local line
-  line="$(date '+%F %H:%M')  $d  ${model:-?}  SN ${serial:-?}  FW ${fw:-?}  Verschleiß ${DC_USED:-?} %  ${DC_POH:-?} h  $( [ -n "$DC_W0" ] && echo "$(dc_de "$(awk -v b="$DC_W0" 'BEGIN{print b/1e12}')") TB geschrieben  ")Flush $([ -n "$DC_FP50" ] && dc_de "$DC_FP50" %.2f || echo ?) ms  4k-Schreiben QD32 $([ -n "$DC_WIOPS" ] && dc_de "$DC_WIOPS" %.0f || echo ?) IOPS  Schreiben ${DC_WMED:-?} MB/s (min ${DC_WMIN:-?})  Hänger ${DC_EV:-?}/spürbar ${DC_EVF:-?}  => $verdict"
+  line="$(date '+%F %H:%M')  $d  ${model:-?}  SN ${serial:-?}  FW ${fw:-?}  Verschleiß ${DC_USED:-?} %  ${DC_POH:-?} h  $( [ -n "$DC_W0" ] && echo "$(dc_de "$(awk -v b="$DC_W0" 'BEGIN{print b/1e12}')") TB geschrieben  ")$([ -n "$DC_WAF" ] && echo "WAF $(dc_de "$DC_WAF" %.2f)${DC_WAFT:+ (Prüfung $(dc_de "$DC_WAFT" %.2f))}  ")Flush $([ -n "$DC_FP50" ] && dc_de "$DC_FP50" %.2f || echo ?) ms  4k-Schreiben QD32 $([ -n "$DC_WIOPS" ] && dc_de "$DC_WIOPS" %.0f || echo ?) IOPS  Schreiben ${DC_WMED:-?} MB/s (min ${DC_WMIN:-?})  Hänger ${DC_EV:-?}/spürbar ${DC_EVF:-?}  => $verdict"
   echo
   echo "  Kurzfassung: $line"
   echo "$line" >> "$OUTBASE/ssdcheck-kurzfassung.txt"
