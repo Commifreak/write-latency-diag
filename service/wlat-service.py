@@ -24,7 +24,7 @@ from collections import defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.2"
+VERSION = "1.3"
 CONF_FILE = os.environ.get("WLAT_CONF", "/etc/write-latency-diag.conf")
 DEFAULTS = {
     "bind": "0.0.0.0",
@@ -625,6 +625,10 @@ def smart_sample(store, conf):
         num = den = host = nand = None
         if WDSD.search(model) and attr(sm, 233) and attr(sm, 241):
             num, den = attr(sm, 233), attr(sm, 241)
+            host, nand = den, 1
+        elif re.search(r"SAMSUNG|^MZ", model) and attr(sm, 251) and attr(sm, 241):
+            # Samsung (SM883/PM883 u.ä.): NAND- und Host-Schreibmenge in LBAs, umgerechnet in GiB
+            num, den = round(attr(sm, 251) * 512 / 2 ** 30, 2), round(attr(sm, 241) * 512 / 2 ** 30, 2)
             host, nand = den, 1
         elif "FTL_Program_Page_Count" in sm and attr(sm, 247):
             num, den = attr(sm, 247) + (attr(sm, 248) or 0), attr(sm, 247)

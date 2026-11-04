@@ -73,10 +73,13 @@ for p in /sys/block/*; do
     echo "$st \"SSD $d Schreibcache\" write_cache=$([ "$hw" = 1 ] && echo 1 || echo 0);;;0;1 $txt"
   fi
 
-  # --- Schreibverstärkung: SanDisk/WD 233/241 (GiB), Crucial/Micron (247+248)/247 (Pages) ---
-  num=""; den=""; hgib=""; gib=0
+  # --- Schreibverstärkung: SanDisk/WD 233/241 (GiB), Samsung 251/241 (LBAs), Crucial/Micron (247+248)/247 (Pages) ---
+  num=""; den=""; hgib=""; gib=0; wdsd=0
   if grep -qE 'SanDisk|^SD |SDSSD|WDS[0-9]|WD (Blue|Red|Green)' <<<"$model"; then
     read -r num den < <(awk '$1 == 233 {n = $10} $1 == 241 {h = $10} END { if (n > 0 && h > 0) print n, h }' <<<"$sm")
+    hgib=$den; gib=1; wdsd=1
+  elif grep -qE 'SAMSUNG|^MZ' <<<"$model" && grep -qE '^ *251 ' <<<"$sm"; then
+    read -r num den < <(awk '$1 == 251 {n = $10} $1 == 241 {h = $10} END { if (n > 0 && h > 0) printf "%.2f %.2f\n", n * 512 / 2^30, h * 512 / 2^30 }' <<<"$sm")
     hgib=$den; gib=1
   elif grep -q 'FTL_Program_Page_Count' <<<"$sm"; then
     read -r num den hgib < <(awk '$1 == 247 {h = $10} $1 == 248 {f = $10} $1 == 246 {l = $10}
@@ -110,7 +113,7 @@ for p in /sys/block/*; do
 
   # --- Verschleiß und Restlaufzeit ---
   used=$(smartctl -l devstat "$dev" 2>/dev/null | awk '/Percentage Used Endurance Indicator/ {print $4 + 0; exit}')
-  [ -n "$used" ] || used=$(awk -v wdsd="$gib" '
+  [ -n "$used" ] || used=$(awk -v wdsd="$wdsd" '
     /^Percentage Used:/ { v = $3; gsub("%", "", v); print v + 0; exit }
     wdsd && $1 == 230 && NF >= 10 { print $10 + 0; exit }
     ($1 == 169 || $1 == 202 || $1 == 177 || $1 == 231) && NF >= 10 { print 100 - $4; exit }' <<<"$sm")

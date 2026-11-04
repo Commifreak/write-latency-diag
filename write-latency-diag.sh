@@ -10,7 +10,7 @@
 # eine temporäre Testdatei in das angegebene Verzeichnis und löschen sie danach.
 #
 
-VERSION="1.7"
+VERSION="1.8"
 
 PASSIVE=""            # Dauer der passiven Beobachtung in Sekunden
 INTERVAL=1
@@ -1095,7 +1095,8 @@ static_check() {
       [ "${realloc:-0}" -gt 0 ] && warn "$d: $realloc reallokierte Sektoren."
       # Schreibverstärkung: WAF = num/den, host = Host-Schreibmenge in GiB.
       # SanDisk/WD: 233 NAND-GiB / 241 Host-GiB. Crucial/Micron: (247 Host- + 248 FTL-Pages) / 247, Host über 246 (LBAs).
-      local nand hostw poh erase num="" den="" hgib="" serial
+      # Samsung (SM883/PM883 u.ä.): 251 NAND-LBAs / 241 Host-LBAs, hier in GiB umgerechnet.
+      local nand hostw poh erase num="" den="" hgib="" serial nandgib=$wdsd
       poh=$(awk '$1 == 9 && NF >= 10 {print $10 + 0; exit} /^Power On Hours:/ {gsub(",", "", $4); print $4 + 0; exit}' <<<"$sm")
       serial=$(sed -n 's/^Serial Number: *//p' <<<"$sm" | head -1)
       if [ $wdsd -eq 1 ]; then
@@ -1109,6 +1110,13 @@ static_check() {
             if (e != "") printf "   Ø Löschzyklen %s", e
             print "" }'
         fi
+      elif grep -qE 'SAMSUNG|^MZ' <<<"$model" && awk '$1 == 251 && $10 > 0 { a = 1 } $1 == 241 && $10 > 0 { b = 1 } END { exit !(a && b) }' <<<"$sm"; then
+        read -r num den < <(awk '$1 == 251 {n = $10} $1 == 241 {h = $10} END { printf "%.2f %.2f\n", n * 512 / 2^30, h * 512 / 2^30 }' <<<"$sm")
+        hgib=$den; nandgib=1
+        awk -v n="$num" -v h="$den" -v poh="${poh:-0}" 'BEGIN {
+            printf "      Schreibverstärkung (WAF = NAND/Host): %.2f", n / h
+            if (poh > 24) printf "   Host %.0f GiB/Tag, NAND %.0f GiB/Tag", h * 24 / poh, n * 24 / poh
+            print "" }'
       elif grep -q 'FTL_Program_Page_Count' <<<"$sm"; then
         read -r num den hgib < <(awk '$1==247 {h=$10} $1==248 {f=$10} $1==246 {l=$10}
           END { if (h > 0) printf "%.0f %.0f %.1f\n", h + f, h, l * 512 / 2^30 }' <<<"$sm")
@@ -1120,7 +1128,7 @@ static_check() {
       if [ -n "$den" ]; then
         awk -v n="$num" -v h="$den" 'BEGIN { exit !(n >= 5 * h) }' &&
           warn "$d: interne Schreibverstärkung $(awk -v n="$num" -v h="$den" 'BEGIN{printf "%.0f", n/h}')x - die SSD schreibt intern ein Vielfaches dessen, was das System schreibt. Typisch für viele kleine fsync-Schreibzugriffe (Datenbanken, NVR, Logs) auf Consumer-SSDs ohne Power-Loss-Protection: Die SSD ist dauerhaft mit Garbage Collection beschäftigt (Latenzspitzen) und verschleißt schnell."
-        waf_history "$d" "$serial" "$num" "$den" "$hgib" "$wdsd"
+        waf_history "$d" "$serial" "$num" "$den" "$hgib" "$nandgib"
       fi
       [ "$rot" = 0 ] && wear_forecast "$d" "$(wear_used "$dev" "$sm" "$wdsd")" "$poh" "$num" "$([ -n "$den" ] && echo "$WH_RATE")"
     fi
