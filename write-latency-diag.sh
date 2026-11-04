@@ -10,7 +10,12 @@
 # eine temporäre Testdatei in das angegebene Verzeichnis und löschen sie danach.
 #
 
-VERSION="1.8"
+VERSION="1.9"
+
+# Zahlen immer mit Punkt verarbeiten: Mit deutscher Locale gibt awk sonst "3,000" aus, bash-printf lehnt "3.5" ab
+# und Vergleiche werden zu Textvergleichen. Texte bleiben in der Sprache des Systems.
+if [ -n "${LC_ALL:-}" ]; then export LANG="$LC_ALL"; unset LC_ALL; fi
+export LC_NUMERIC=C
 
 PASSIVE=""            # Dauer der passiven Beobachtung in Sekunden
 INTERVAL=1
@@ -516,7 +521,7 @@ JOB
   if [ "$nf" -gt 0 ] || [ "${DC_SFELT:-0}" -gt 0 ]; then
     dc_res crit "Spürbare Hänger unter Dauerlast: $nf (längste Wartezeit $(dc_de "$DC_SMAX" %.0f) ms) - genau das Verhalten, das ersetzt werden soll."
   elif [ "$n" -gt 0 ] || [ "${DC_SSLOW:-0}" -gt 0 ]; then
-    dc_res hint "Kurze Hänger unter Dauerlast: $n (nicht spürbar, längste Wartezeit $(dc_de "$DC_SMAX" %.0f) ms)."
+    dc_res hint "Kurze Verzögerungen unter Dauerlast, nicht spürbar: $n Hänger am Gerät, $DC_SSLOW Schreibzugriffe ab $DC_STALL ms, längste Wartezeit $(dc_de "$DC_SMAX" %.0f) ms."
   else
     dc_res ok "Keine Hänger in $((rt / 60)) min Dauerlast, längste Wartezeit $(dc_de "$DC_SMAX" %.0f) ms."
   fi

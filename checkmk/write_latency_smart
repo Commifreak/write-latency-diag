@@ -10,6 +10,11 @@
 
 # Läuft der write-latency-diag Dienst (--install-service), liefert er die Werte: Web-Oberfläche und CheckMK beruhen
 # dann auf derselben Messung, und SMART wird nur einmal abgefragt. Sonst (oder ohne Daten) misst der Check selbst.
+# Zahlen immer mit Punkt verarbeiten: Mit deutscher Locale gibt awk sonst "3,000" aus, bash-printf lehnt "3.5" ab
+# und Vergleiche werden zu Textvergleichen. Texte bleiben in der Sprache des Systems.
+if [ -n "${LC_ALL:-}" ]; then export LANG="$LC_ALL"; unset LC_ALL; fi
+export LC_NUMERIC=C
+
 from_service() {
   local conf=/etc/write-latency-diag.conf port bind url out
   [ -f "$conf" ] || return 1
