@@ -19,12 +19,12 @@ CPU/Software. Zielsystem ist vor allem Ubuntu mit mdadm, Unraid wird im Skript z
 |---|---|---|
 | Dienst | `service/wlat-service.py` | Die eine Quelle für dauerhafte Messung: Sammler, SQLite, Web-Oberfläche (Port 81), Textbericht `/api/report`, CheckMK-Zeilen `/api/checkmk` |
 | CheckMK-Checks | `checkmk/write_latency`, `checkmk/write_latency_smart` | Geben die Ausgabe des Dienstes weiter, wenn er läuft und Daten hat. Sonst messen sie selbst |
-| Skript | `write-latency-diag.sh` | Aktive Tests (fio, Dauerlast), Einmal-Analyse, Installation des Dienstes (`--install-service`), Auto-Update von Skript, Dienst und Checks |
+| Skript | `write-latency-diag.sh` | Aktive Tests (fio, Dauerlast), Einmal-Analyse, Prüfung neuer SSDs vor dem Einbau (`--check-disk`, löscht das Laufwerk), Installation des Dienstes (`--install-service`), Auto-Update von Skript, Dienst und Checks |
 
 - Die Logik für Hänger, Schreibverstärkung (WAF), Verschleiß/Restlaufzeit, Schreibcache und TRIM gibt es in mehreren
   Teilen. Sie muss gleich bleiben: gleiche Schwellwerte, gleiche Regeln, gleiche Service-Namen in CheckMK. Wer eine
   Regel ändert, ändert sie überall (Skript-awk, Dienst, `checkmk_lines()` und die eigene Messung der Checks).
-- Hänger: Ein Zeitabschnitt ist langsam, wenn Anfragen >= 100 ms dauern (`stall_ms`) oder das Gerät Anfragen offen
+- Hänger (auch in der Dauerlast von `--check-disk`): Ein Zeitabschnitt ist langsam, wenn Anfragen >= 100 ms dauern (`stall_ms`) oder das Gerät Anfragen offen
   hat und gar keine beendet. Aufeinanderfolgende langsame Abschnitte (Lücke < 3 s) bilden ein Ereignis. Spürbar ist
   ein Ereignis ab 1 s Wartezeit (`felt_ms`) oder 2 s Dauer. HDDs (rotierend) zählen nicht als SSD-Befund.
 - Schreiber pro Prozess werden netto gezählt (`write_bytes - cancelled_write_bytes`). Beim Ende eines Prozesses
@@ -62,6 +62,10 @@ Die Entwicklungsumgebung ist eine VM ohne echte SATA-SSDs, ohne systemd und ohne
   per `PATH` voranstellen, Testdaten direkt in die SQLite-Datenbank schreiben.
 - Web-Oberfläche: Screenshots mit Playwright (`NODE_PATH=/opt/node-tools/node_modules node <skript>.js`), jeweils
   hell, dunkel und 390 px breit. Auf Browser-Fehler und horizontales Scrollen prüfen.
+- `--check-disk`: an einem Loop-Device testen (`losetup` auf eine Datei im Scratchpad) mit einem Ersatz-`smartctl`,
+  das eine SATA-SSD nachbildet (`-i -A -c -t -X -l selftest -l devstat`). `WLAT_CONFIRM_DEV=<gerätename>` ersetzt
+  die Eingabe zur Bestätigung. Abbruch mit `TERM` testen: Hintergrundprozesse einer nicht interaktiven Shell
+  ignorieren `INT`.
 - Testprozesse gezielt beenden (`pkill -f '^python3 service/wlat-service.py'`), nicht mit einem Muster, das auch auf
   die eigene Shell passt.
 

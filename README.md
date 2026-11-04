@@ -70,6 +70,52 @@ Das ist typisch für QLC-SSDs und DRAM-lose SSDs.
 
 Report und Messwerte (`samples.csv`, eine Zeile pro Sekunde und Gerät) liegen unter `/tmp/wlat-<Zeitstempel>/`.
 
+## Neue oder gebrauchte SSD vor dem Einbau prüfen
+
+```bash
+sudo /tmp/wlat.sh --check-disk /dev/sdX -o /root
+```
+
+**Achtung: Die Prüfung löscht das ganze Laufwerk.** Sie läuft nur auf einem ganzen Laufwerk, das nicht
+eingehängt, nicht Teil eines RAID/LVM und nicht als Swap aktiv ist. Vor dem Start zeigt das Skript Modell,
+Seriennummer und Inhalt und verlangt, dass man den Gerätenamen eintippt. Braucht `fio`, `smartctl` und
+`blkdiscard` (`apt install fio smartmontools`). Am besten in `tmux` oder `screen` starten.
+
+Ablauf:
+
+1. **SMART vorher und kurzer Selbsttest**: Gesamtzustand, Attribute am Grenzwert, Zähler, die bei einer gesunden
+   SSD 0 sind (reallokierte, wartende und nicht korrigierbare Sektoren, Programmier- und Löschfehler,
+   Reserveblöcke), Fehlerprotokoll, frühere Selbsttests, Verschleiß, Betriebsstunden, Geschriebenes und
+   unerwartete Stromausfälle.
+2. **TRIM über die ganze Fläche** (`blkdiscard`): Gebrauchte SSDs starten ohne alte Belegung.
+3. **Flush-Latenz**: 60 s lang 4k-Schreiben mit O_SYNC direkt auf das Laufwerk, jeder Zugriff mit Flush. Mit
+   wirksamer Power-Loss-Protection (PLP) bestätigt die SSD sofort: Median unter 0,5 ms. Ohne PLP dauert es
+   Millisekunden.
+4. **Vollschreiben mit Prüfsummen**: Die ganze Fläche wird beschrieben und zurückgelesen (`fio --verify=crc32c`).
+   Das findet defekte Bereiche und zeigt die Dauer-Schreibrate, auch je 10 % der Fläche (Einbruch durch einen
+   vollen SLC-Cache).
+5. **Leistung im vollen Zustand**: 4k zufällig lesen und schreiben mit Queue-Tiefe 32 sowie Lesen mit
+   Queue-Tiefe 1, je 30 s.
+6. **Dauerlast wie im Betrieb** (`-r SEK`, Standard 3600): 16 Sync-Schreibzugriffe pro Sekunde (wie
+   Datenbanken), dazu ein Strom mit 1 MB/s (wie eine Kamera-Aufnahme) und 50 Lesezugriffe pro Sekunde, auf der
+   voll beschriebenen, ungetrimmten SSD. Hänger erkennt das Skript nach denselben Regeln wie der Dienst. Dazu misst
+   es die Wartezeit jedes einzelnen Sync-Schreibzugriffs. Eine SSD mit regelmäßigen Firmware-Pausen fällt hier auf,
+   auch mit dem Muster aus Dauer und Abstand.
+7. **Langer Selbsttest** der SSD.
+8. **SMART nachher**: Steigt einer der Fehlerzähler während der Prüfung, ist sie nicht bestanden. Außerdem
+   vergleicht das Skript den Schreibzähler der SSD mit der Menge, die der Kernel geschrieben hat. Passt er nicht,
+   sind Verschleiß und Geschriebenes mit Vorsicht zu lesen. Zum Schluss wird die Fläche wieder getrimmt.
+
+Das Ergebnis ist `BESTANDEN`, `BESTANDEN MIT AUFFÄLLIGKEITEN` oder `NICHT BESTANDEN` (Exit-Code 2), mit allen
+Befunden. Eine Zeile mit den wichtigsten Werten landet zusätzlich in `ssdcheck-kurzfassung.txt` im Verzeichnis von
+`-o`. So lassen sich mehrere SSDs nebeneinander vergleichen. Report, SMART-Ausgaben und Messwerte liegen unter
+`ssdcheck-<Gerät>-<Zeitstempel>/`. `Ctrl+C` bricht ab und zeigt, was bis dahin geprüft ist.
+
+Bei einer SSD mit 480 GB dauert die Prüfung etwa 2,5 Stunden. Mehrere SSDs lassen sich gleichzeitig in
+getrennten Aufrufen prüfen. Über einen USB-Adapter funktioniert die Prüfung meist auch (SMART über `-d sat`),
+der Adapter verlängert aber jede Anfrage, und manche geben Flush und TRIM nicht richtig weiter. Die Flush-Latenz
+ist dann nur grob zu bewerten. Für NVMe-SSDs fehlen die Selbsttests.
+
 ## Wer erzeugt die Last?
 
 - **Schreiber pro Prozess**: In jedem Intervall zeigt die Zeile `schreibt:`, welche Prozesse wie viel schreiben
