@@ -24,7 +24,7 @@ from collections import defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.3"
+VERSION = "1.4"
 CONF_FILE = os.environ.get("WLAT_CONF", "/etc/write-latency-diag.conf")
 DEFAULTS = {
     "bind": "0.0.0.0",
@@ -724,8 +724,10 @@ def fmt_days(x):
 
 
 def smart_view(con):
+    # Nur Laufwerke aus der letzten SMART-Abfrage: Ausgebaute SSDs (andere Seriennummer) verschwinden aus Anzeige,
+    # Befunden und CheckMK. Ihr Verlauf bleibt in der Datenbank (Schreibverstärkung pro Tag).
     rows = con.execute("SELECT * FROM smart WHERE ts = (SELECT MAX(ts) FROM smart s2 WHERE s2.serial = smart.serial) "
-                       "ORDER BY dev").fetchall()
+                       "AND ts >= (SELECT MAX(ts) FROM smart) - 60 ORDER BY dev").fetchall()
     cols = [c[0] for c in con.execute("SELECT * FROM smart LIMIT 0").description]
     out = []
     for r in rows:
