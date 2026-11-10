@@ -10,7 +10,7 @@
 # eine temporäre Testdatei in das angegebene Verzeichnis und löschen sie danach.
 #
 
-VERSION="1.9"
+VERSION="1.10"
 
 # Zahlen immer mit Punkt verarbeiten: Mit deutscher Locale gibt awk sonst "3,000" aus, bash-printf lehnt "3.5" ab
 # und Vergleiche werden zu Textvergleichen. Texte bleiben in der Sprache des Systems.
@@ -1783,7 +1783,7 @@ trace_start() {
   BT_PID=$!
   local i
   for i in $(seq 50); do
-    grep -q '^Attaching' "$BT_OUT" 2>/dev/null && return
+    grep -qE '^Attach(ing|ed)' "$BT_OUT" 2>/dev/null && return
     kill -0 "$BT_PID" 2>/dev/null || break
     sleep 0.2
   done
@@ -1797,7 +1797,7 @@ trace_stop() {
   kill "$BT_PID" 2>/dev/null
   wait "$BT_PID" 2>/dev/null
   BT_PID=""
-  if ! grep -q '^Attaching' "$BT_OUT" 2>/dev/null; then
+  if ! grep -qE '^Attach(ing|ed)' "$BT_OUT" 2>/dev/null; then
     printf '\nbpftrace-Tracing nicht möglich: %s\n' "$(grep -v RLIMIT_MEMLOCK "$BT_OUT.err" | grep -m1 -i error)"
     return
   fi

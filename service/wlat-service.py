@@ -24,7 +24,7 @@ from collections import defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.4"
+VERSION = "1.5"
 CONF_FILE = os.environ.get("WLAT_CONF", "/etc/write-latency-diag.conf")
 DEFAULTS = {
     "bind": "0.0.0.0",
@@ -514,9 +514,13 @@ class FsyncTracer(threading.Thread):
             t_tick = time.time()
             for line in self.proc.stdout:
                 line = line.rstrip("\n")
-                if line.startswith("Attaching"):
+                # bpftrace bis 0.20: "Attaching N probes...", neuere Versionen: "Attached N probes"
+                if line.startswith("Attach"):
                     INFO["bpftrace"] = "läuft"
-                elif line.startswith("SLOW|"):
+                    continue
+                if line.startswith("SLOW|") or line == "TICK":
+                    INFO["bpftrace"] = "läuft"
+                if line.startswith("SLOW|"):
                     p = line.split("|", 3)
                     if len(p) == 4:
                         ms, now = int(p[1]) / 1000, time.time()
