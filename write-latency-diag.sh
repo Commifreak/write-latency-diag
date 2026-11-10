@@ -10,7 +10,7 @@
 # eine temporäre Testdatei in das angegebene Verzeichnis und löschen sie danach.
 #
 
-VERSION="1.11"
+VERSION="1.12"
 
 # Zahlen immer mit Punkt verarbeiten: Mit deutscher Locale gibt awk sonst "3,000" aus, bash-printf lehnt "3.5" ab
 # und Vergleiche werden zu Textvergleichen. Texte bleiben in der Sprache des Systems.
@@ -816,6 +816,8 @@ warn()    { printf '  [!]  %s\n' "$*"; WARN+=("$*"); }
 hint()    { printf '  [?]  %s\n' "$*"; WARN+=("(prüfen) $*"); }
 
 declare -A ROLE
+SYSBLOCK=${WLAT_TEST_SYSBLOCK:-/sys/block}   # nur für Tests der RAID-/Boot-Prüfungen in VMs ohne md
+declare -A DEVPOH        # Betriebsstunden je Laufwerk (SMART), für die Prüfung der RAID10-Spiegelgruppen
 MDMEMBERS=""          # physische Laufwerke in mdadm-Arrays (für die Auswertung)
 
 # Die SMART-Zähler gelten für die ganze Lebensdauer. Jeder Lauf speichert sie, damit der
@@ -941,6 +943,155 @@ trim_advice() { # OnCalendar-Wert des fstrim.timer
 # ---------------------------------------------------------------------------
 # Systemcheck
 # ---------------------------------------------------------------------------
+# RAID10 near-Layout: Spiegelgruppen anzeigen und prüfen, ob die beiden ältesten SSDs in derselben Gruppe liegen
+md_groups() { # /sys/block/mdX level
+  local md=$1 lvl=$2 s sl part
+  # RAID10 near-Layout: aufeinanderfolgende Slots bilden Spiegelgruppen, die immer dieselben Daten bekommen
+  if [ "$lvl" = raid10 ]; then
+    local layout nc ndev groups
+    layout=$(cat "$md/md/layout" 2>/dev/null); ndev=$(cat "$md/md/raid_disks" 2>/dev/null)
+    nc=$(( ${layout:-0} & 255 ))
+    if [ "$nc" -ge 2 ] && [ $(( (${layout:-0} >> 8) & 255 )) -eq 1 ] && [ "${ndev:-0}" -gt 0 ] && [ $((ndev % nc)) -eq 0 ]; then
+      local glist oldpair
+      glist=$(for s in "$md"/md/dev-*; do
+          sl=$(cat "$s/slot" 2>/dev/null); part=${s##*/dev-}
+          [[ $sl =~ ^[0-9]+$ ]] || continue
+          [ -e "/sys/block/$part" ] || part=$(basename "$(readlink -f "/sys/class/block/$part/..")")
+          echo "$((sl / nc)) $part"
+        done | sort -n)
+      groups=$(awk '{ g[$1] = g[$1] (g[$1] == "" ? "" : "+") $2 } END { for (i = 0; i in g; i++) printf "%s%s", (i ? ", " : ""), g[i] }' <<<"$glist")
+      [ -n "$groups" ] && info "${md##*/}: Spiegelgruppen (bekommen jeweils dieselben Schreibzugriffe): $groups"
+      # Liegen die beiden mit Abstand ältesten SSDs in derselben Gruppe, fallen sie womöglich kurz nacheinander aus
+      oldpair=$(while read -r g dv; do [ -n "$dv" ] && echo "$g $dv ${DEVPOH[$dv]:-x}"; done <<<"$glist" | awk '
+        $3 == "x" { miss = 1 } { g[NR] = $1; p[NR] = $2; h[NR] = $3 + 0 }
+        END {
+          if (miss || NR < 4) exit
+          a = 0; for (i = 1; i <= NR; i++) if (!a || h[i] > h[a]) a = i
+          b = 0; for (i = 1; i <= NR; i++) if (i != a && (!b || h[i] > h[b])) b = i
+          if (g[a] != g[b]) exit
+          mo = 0; for (i = 1; i <= NR; i++) if (i != a && i != b && h[i] > mo) mo = h[i]
+          if (h[b] > 2 * mo && h[b] > 8760) printf "%s und %s (%d und %d Betriebsstunden)", p[a], p[b], h[a], h[b] }')
+      [ -n "$oldpair" ] && hint "${md##*/}: Die beiden mit Abstand ältesten SSDs $oldpair bilden eine Spiegelgruppe. Fallen beide aus, bevor eine ersetzt ist, sind die Daten weg - beim nächsten Tausch oder Neuaufbau auf verschiedene Gruppen verteilen."
+    fi
+  fi
+}
+
+# Bitmap, mdadm.conf und Reserve am Ende der RAID-Mitglieder
+md_extra_checks() { # /sys/block/mdX level
+  local md=$1 lvl=$2 s f
+  if [[ $lvl =~ ^raid(1|10|4|5|6)$ ]]; then
+    # Ohne Write-Intent-Bitmap muss nach jedem Absturz das ganze Array neu synchronisiert werden
+    if [ "$(cat "$md/md/bitmap/location" 2>/dev/null || echo none)" = none ] && [ "$(cat "$md/size" 2>/dev/null || echo 0)" -gt 200000000 ]; then
+      hint "${md##*/}: keine Write-Intent-Bitmap - nach einem Absturz oder Stromausfall muss das ganze RAID neu synchronisiert werden (Stunden, bremst währenddessen). Nachrüsten im laufenden Betrieb: mdadm --grow --bitmap=internal /dev/${md##*/}"
+    fi
+    # Fehlt das Array in mdadm.conf, setzt es das initramfs womöglich unter anderem Namen (md127) zusammen
+    local mdconf="" uuid
+    for f in /etc/mdadm/mdadm.conf /etc/mdadm.conf; do [ -f "$f" ] && { mdconf=$f; break; }; done
+    if [ -n "$mdconf" ] && command -v mdadm >/dev/null 2>&1; then
+      uuid=$(mdadm --detail --export "/dev/${md##*/}" 2>/dev/null | sed -n 's/^MD_UUID=//p')
+      if [ -n "$uuid" ] && ! grep -qi "UUID=$uuid" "$mdconf"; then
+        hint "${md##*/} steht nicht in $mdconf - beim Start wird es womöglich unter anderem Namen oder gar nicht zusammengesetzt. Eintragen: mdadm --detail --scan | grep $uuid >> $mdconf && update-initramfs -u"
+      fi
+    fi
+    # Reserve am Ende: Eine Ersatz-SSD gleicher Nenngröße hat nicht immer gleich viele Sektoren
+    local tight="" part disk free
+    for s in "$md"/slaves/*; do
+      [ -e "$s" ] || continue
+      part=${s##*/}
+      if [ -e "/sys/class/block/$part/partition" ]; then
+        disk=$(basename "$(readlink -f "/sys/class/block/$part/..")")
+        free=$(( $(cat "/sys/block/$disk/size") - $(cat "/sys/class/block/$part/start") - $(cat "/sys/class/block/$part/size") ))
+      else
+        free=0
+      fi
+      [ "$free" -lt 1048576 ] && tight="$tight $part"
+    done
+    [ -n "$tight" ] && info "Tipp: Die RAID-Mitglieder von ${md##*/} reichen bis ans Ende der Laufwerke (${tight# }). Eine Ersatz-SSD muss dann mindestens genauso viele Sektoren haben - gleiche Nenngröße reicht nicht immer. Beim nächsten Neuaufbau am Ende etwa 1 GiB frei lassen."
+  fi
+}
+
+# ext4-Einstellungen (Verhalten bei Fehlern, Reserve, Ausrichtung am RAID) und Boot-Ausfallsicherheit bei RAID als /
+fs_boot_check() {
+  [ "$(id -u)" -eq 0 ] || return
+  section "Dateisystem und Boot"
+  local src mnt fstype opts real tl eb bc rbc bs st sw md lvl chunk nd layout data es ew any=0
+  while read -r src mnt fstype opts; do
+    [ "$fstype" = ext4 ] || continue
+    case "$src" in /dev/loop*|/dev/zram*) continue ;; esac
+    tl=$(tune2fs -l "$src" 2>/dev/null) || continue
+    any=1
+    eb=$(sed -n 's/^Errors behavior: *//p' <<<"$tl")
+    bc=$(sed -n 's/^Block count: *//p' <<<"$tl"); rbc=$(sed -n 's/^Reserved block count: *//p' <<<"$tl")
+    bs=$(sed -n 's/^Block size: *//p' <<<"$tl")
+    st=$(sed -n 's/^RAID stride: *//p' <<<"$tl"); sw=$(sed -n 's/^RAID stripe width: *//p' <<<"$tl")
+    info "ext4 $mnt ($src): bei Fehlern ${eb:-?}, Reserve für root $(awk -v r="${rbc:-0}" -v b="${bc:-1}" -v s="${bs:-4096}" 'BEGIN { x = sprintf("%.1f", 100 * r / b); sub(/\./, ",", x); printf "%s %% (%.0f GiB)", x, r * s / 2^30 }'), RAID stride ${st:-0} / stripe-width ${sw:-0}"
+    if [ "$eb" = Continue ] && ! grep -qE '(^|,)errors=(remount-ro|panic)' <<<"$opts"; then
+      hint "ext4 $mnt: Bei Fehlern im Dateisystem schreibt ext4 weiter ('Continue') - ein Schaden kann sich unbemerkt ausbreiten. Sicherer: tune2fs -e remount-ro $src (bei einem Fehler wird dann nur noch gelesen)."
+    fi
+    if awk -v r="${rbc:-0}" -v b="${bc:-1}" -v s="${bs:-4096}" 'BEGIN { exit !(100 * r / b >= 2 && r * s / 2^30 >= 10) }'; then
+      info "Tipp: ext4 $mnt hält $(awk -v r="$rbc" -v s="$bs" 'BEGIN { printf "%.0f", r * s / 2^30 }') GiB für root zurück. Laufen die Dienste ohnehin als root (z.B. Docker), schützt das kaum etwas: tune2fs -m 1 $src"
+    fi
+    # Ausrichtung am Software-RAID: stride = Chunk / Blockgröße, stripe-width = stride x Datenlaufwerke
+    real=$(readlink -f "$src"); md=${real##*/}
+    if [[ $md == md* ]] && [ -f "$SYSBLOCK/$md/md/level" ]; then
+      lvl=$(cat "$SYSBLOCK/$md/md/level"); chunk=$(cat "$SYSBLOCK/$md/md/chunk_size" 2>/dev/null); nd=$(cat "$SYSBLOCK/$md/md/raid_disks" 2>/dev/null)
+      layout=$(cat "$SYSBLOCK/$md/md/layout" 2>/dev/null); data=""
+      case "$lvl" in
+        raid0) data=$nd ;;
+        raid5) data=$((nd - 1)) ;;
+        raid6) data=$((nd - 2)) ;;
+        raid10) [ $(( (${layout:-0} >> 8) & 255 )) -eq 1 ] && [ $(( ${layout:-0} & 255 )) -gt 0 ] && data=$(( nd / (${layout:-0} & 255) )) ;;
+      esac
+      if [ -n "$data" ] && [ "${chunk:-0}" -gt 0 ] && [ "${bs:-0}" -gt 0 ]; then
+        es=$((chunk / bs)); ew=$((es * data))
+        if [ "${st:-0}" != "$es" ] || [ "${sw:-0}" != "$ew" ]; then
+          hint "ext4 $mnt: RAID-Ausrichtung passt nicht zu $md (Chunk $((chunk / 1024)) KiB): stride ${st:-0} statt $es, stripe-width ${sw:-0} statt $ew$( [ "$lvl" = raid10 ] && echo " - bei RAID10 wirkt sich das kaum aus"). Anpassen: tune2fs -E stride=$es,stripe_width=$ew $src"
+        fi
+      fi
+    fi
+  done < <(awk '$1 ~ "^/dev/" { print $1, $2, $3, $4 }' /proc/mounts | sort -u -k1,1)
+  [ $any -eq 0 ] && info "Kein ext4-Dateisystem eingehängt."
+  boot_check "$(findmnt -no SOURCE / 2>/dev/null)" /etc/fstab /var/cache/debconf/config.dat
+}
+
+# Liegt / auf einem Software-RAID, soll der Server auch ohne die SSD mit der eingehängten EFI-Partition starten
+boot_check() { # quelle-von-/ fstab debconf-datei
+  local real md disks="" d esps="" n=0 ne=0 opts inst missing="" l p pp
+  real=$(readlink -f "$1" 2>/dev/null); md=${real##*/}
+  [[ $md == md* ]] && [ -d "$SYSBLOCK/$md/slaves" ] || return
+  for p in "$SYSBLOCK/$md"/slaves/*; do
+    [ -e "$p" ] || continue
+    d=${p##*/}; [ -e "/sys/class/block/$d/partition" ] && d=$(basename "$(readlink -f "/sys/class/block/$d/..")")
+    disks="$disks $d"; n=$((n + 1))
+    # EFI-Partition am GPT-Typ erkennen (blkid liest ihn direkt, ohne udev)
+    l=""
+    for pp in "/sys/block/$d/$d"*; do
+      [ -e "$pp/partition" ] || continue
+      [ "$(blkid -p -o value -s PART_ENTRY_TYPE "/dev/${pp##*/}" 2>/dev/null | tr 'A-F' 'a-f')" = c12a7328-f81f-11d2-ba4b-00a0c93ec93b ] && l="$l /dev/${pp##*/}"
+    done
+    [ -n "$l" ] && { ne=$((ne + 1)); esps="$esps$l"; }
+  done
+  [ "$n" -gt 1 ] || return
+  if findmnt -n /boot/efi >/dev/null 2>&1; then
+    info "/ liegt auf $md (${disks# }), EFI-Partitionen auf $ne von $n Laufwerken"
+    [ "$ne" -lt "$n" ] && hint "Nur $ne von $n Laufwerken des RAID haben eine EFI-Partition. Fällt ein Laufwerk mit EFI-Partition aus, startet der Server womöglich nicht. Beim nächsten Neuaufbau auf jedem Laufwerk eine anlegen (Ubuntu-Installer: 'Add As Another Boot Device')."
+    opts=$(awk '$1 !~ /^#/ && $2 == "/boot/efi" { print $4 }' "$2" 2>/dev/null)
+    if [ -n "$opts" ] && ! grep -qE '(^|,)nofail(,|$)' <<<"$opts"; then
+      hint "/boot/efi hat in $2 kein 'nofail'. Fällt genau dieses Laufwerk aus, startet der Server im Notfallmodus statt normal vom RAID. In $2 bei /boot/efi '$opts' durch '$opts,nofail' ersetzen."
+    fi
+    # Ubuntu/Debian: GRUB-Updates schreiben nur auf die EFI-Partitionen in grub-efi/install_devices
+    if [ -r "$3" ] && grep -q '^Name: grub-efi/install_devices$' "$3"; then
+      inst=$(sed -n '/^Name: grub-efi\/install_devices$/,/^$/s/^Value: //p' "$3" | tr -d ',' | while read -ra a; do for l in "${a[@]}"; do readlink -f "$l"; done; done)
+      for p in $esps; do grep -qx "$p" <<<"$inst" || missing="$missing ${p#/dev/}"; done
+      if [ -n "$missing" ]; then
+        hint "GRUB hält bei Updates nicht alle EFI-Partitionen aktuell (fehlen:$missing). Ein Laufwerk mit veralteter EFI-Partition bootet nach einem GRUB-Update womöglich nicht mehr. Ergänzen: dpkg-reconfigure grub-efi-amd64 und alle EFI-Partitionen auswählen."
+      else
+        ok "GRUB hält alle $ne EFI-Partitionen aktuell."
+      fi
+    fi
+  fi
+}
+
 static_check() {
   local ver=""
   if [ -f /etc/unraid-version ]; then
@@ -981,6 +1132,16 @@ static_check() {
   if [ "${db:-0}" -gt 0 ]; then dirty_mb=$((db / 1048576)); else dirty_mb=$((memkb * dr / 100 / 1024)); fi
   info "RAM: $((memkb / 1048576)) GB, vm.dirty_ratio=$dr, dirty_background_ratio=$(cat /proc/sys/vm/dirty_background_ratio) (=> bis ~${dirty_mb} MB ungeschriebene Daten)"
   [ "$dirty_mb" -gt 4096 ] && hint "Großer Dirty-Puffer (~${dirty_mb} MB): bei Dauerschreiblast entstehen lange Schreibstaus, wenn der Puffer voll ist."
+  # Swap: Ausgelagerte Programmteile muss der Kernel beim nächsten Zugriff von der Platte lesen (Seitenfehler)
+  local swt swf avail swu swp
+  read -r swt swf avail < <(awk '/^SwapTotal/ {t = $2} /^SwapFree/ {f = $2} /^MemAvailable/ {a = $2} END {print t + 0, f + 0, a + 0}' /proc/meminfo)
+  swu=$(( (swt - swf) / 1024 )); swp=$(cat /proc/sys/vm/swappiness 2>/dev/null)
+  if [ "$swt" -gt 0 ]; then
+    info "Swap: $swu MB von $((swt / 1024)) MB belegt, vm.swappiness=${swp:-?}, verfügbarer RAM $((avail / 1048576)) GB"
+    if [ "$swu" -ge 256 ] && [ $((avail / 1024)) -ge $((swu * 4)) ]; then
+      hint "$swu MB liegen im Swap, obwohl $((avail / 1048576)) GB RAM frei sind. Ausgelagerte Programmteile muss der Kernel beim nächsten Zugriff von der Platte lesen (Seitenfehler) - fällt das in einen Hänger der SSD, wartet das Programm. Zurückholen: swapoff -a && swapon -a$( [ "${swp:-60}" -gt 10 ] && echo ". Seltener auslagern: echo vm.swappiness=10 > /etc/sysctl.d/90-swappiness.conf && sysctl --system")"
+    fi
+  fi
 
   # Unraid roles
   if [ -f /var/local/emhttp/disks.ini ]; then
@@ -1103,6 +1264,7 @@ static_check() {
       # Samsung (SM883/PM883 u.ä.): 251 NAND-LBAs / 241 Host-LBAs, hier in GiB umgerechnet.
       local nand hostw poh erase num="" den="" hgib="" serial nandgib=$wdsd
       poh=$(awk '$1 == 9 && NF >= 10 {print $10 + 0; exit} /^Power On Hours:/ {gsub(",", "", $4); print $4 + 0; exit}' <<<"$sm")
+      [ -n "$poh" ] && DEVPOH[$d]=$poh
       serial=$(sed -n 's/^Serial Number: *//p' <<<"$sm" | head -1)
       if [ $wdsd -eq 1 ]; then
         nand=$(awk '$1==233 {print $10+0}' <<<"$sm"); hostw=$(awk '$1==241 {print $10+0}' <<<"$sm")
@@ -1187,21 +1349,8 @@ static_check() {
       done
       MDMEMBERS="$MDMEMBERS$members"
       info "${md##*/}: $lvl, Bitmap: $(cat "$md/md/bitmap/location" 2>/dev/null || echo none)${lvl:+, }$( [ -f "$md/md/stripe_cache_size" ] && echo "stripe_cache_size=$(cat "$md/md/stripe_cache_size")")"
-      # RAID10 near-Layout: aufeinanderfolgende Slots bilden Spiegelgruppen, die immer dieselben Daten bekommen
-      if [ "$lvl" = raid10 ]; then
-        local layout nc ndev groups
-        layout=$(cat "$md/md/layout" 2>/dev/null); ndev=$(cat "$md/md/raid_disks" 2>/dev/null)
-        nc=$(( ${layout:-0} & 255 ))
-        if [ "$nc" -ge 2 ] && [ $(( (${layout:-0} >> 8) & 255 )) -eq 1 ] && [ "${ndev:-0}" -gt 0 ] && [ $((ndev % nc)) -eq 0 ]; then
-          groups=$(for s in "$md"/md/dev-*; do
-              sl=$(cat "$s/slot" 2>/dev/null); part=${s##*/dev-}
-              [[ $sl =~ ^[0-9]+$ ]] || continue
-              [ -e "/sys/block/$part" ] || part=$(basename "$(readlink -f "/sys/class/block/$part/..")")
-              echo "$((sl / nc)) $part"
-            done | sort -n | awk '{ g[$1] = g[$1] (g[$1] == "" ? "" : "+") $2 } END { for (i = 0; i in g; i++) printf "%s%s", (i ? ", " : ""), g[i] }')
-          [ -n "$groups" ] && info "${md##*/}: Spiegelgruppen (bekommen jeweils dieselben Schreibzugriffe): $groups"
-        fi
-      fi
+      md_groups "$md" "$lvl"
+      md_extra_checks "$md" "$lvl"
       case "$lvl" in
         raid1|raid10|raid5|raid6)
           info "${md##*/}: jedes fsync/Flush geht an alle Mitglieder (${members# }) - die jeweils langsamste SSD bestimmt die Latenz." ;;&
@@ -1230,6 +1379,7 @@ static_check() {
     info "Tipp: 'zpool iostat -vl 1' zeigt parallel, ob Zeit in Warteschlangen (syncq/asyncq) oder auf der Disk (disk_wait) entsteht."
   fi
 
+  fs_boot_check
   section "Kernel-Log (ATA/IO-Fehler)"
   local errs
   errs=$(dmesg 2>/dev/null | grep -Ei 'ata[0-9.]+:.*(error|exception|failed|hard resetting|link down|SError|timeout)|I/O error|blk_update_request|critical medium')

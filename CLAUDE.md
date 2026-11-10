@@ -66,6 +66,10 @@ Die Entwicklungsumgebung ist eine VM ohne echte SATA-SSDs, ohne systemd und ohne
   das eine SATA-SSD nachbildet (`-i -A -c -t -X -l selftest -l devstat`). `WLAT_CONFIRM_DEV=<gerätename>` ersetzt
   die Eingabe zur Bestätigung. Abbruch mit `TERM` testen: Hintergrundprozesse einer nicht interaktiven Shell
   ignorieren `INT`.
+- RAID- und Boot-Prüfungen (`md_groups`, `md_extra_checks`, `fs_boot_check`, `boot_check`): Der VM-Kernel hat kein md.
+  Test mit Loop-Laufwerken (`losetup -f`, `partx -a`, GPT mit EFI-Partition), einem nachgebauten md-Verzeichnis
+  (`WLAT_TEST_SYSBLOCK=<dir>` mit `md0/md/level`, `layout`, `raid_disks`, `chunk_size`, `slaves/`, `md/dev-*/slot`),
+  einem Gerätenamen `/dev/md0` per `mknod` auf ein Loop-Laufwerk (Einhängen mit `mount -c`) und den Funktionen per `eval`.
 - Testprozesse gezielt beenden (`pkill -f '^python3 service/wlat-service.py'`), nicht mit einem Muster, das auch auf
   die eigene Shell passt.
 
