@@ -10,7 +10,7 @@
 # eine temporäre Testdatei in das angegebene Verzeichnis und löschen sie danach.
 #
 
-VERSION="1.10"
+VERSION="1.11"
 
 # Zahlen immer mit Punkt verarbeiten: Mit deutscher Locale gibt awk sonst "3,000" aus, bash-printf lehnt "3.5" ab
 # und Vergleiche werden zu Textvergleichen. Texte bleiben in der Sprache des Systems.
@@ -1783,7 +1783,7 @@ trace_start() {
   BT_PID=$!
   local i
   for i in $(seq 50); do
-    grep -qE '^Attach(ing|ed)' "$BT_OUT" 2>/dev/null && return
+    grep -qE '^Attach(ing|ed)' "$BT_OUT" "$BT_OUT.err" 2>/dev/null && return
     kill -0 "$BT_PID" 2>/dev/null || break
     sleep 0.2
   done
@@ -1797,8 +1797,9 @@ trace_stop() {
   kill "$BT_PID" 2>/dev/null
   wait "$BT_PID" 2>/dev/null
   BT_PID=""
-  if ! grep -qE '^Attach(ing|ed)' "$BT_OUT" 2>/dev/null; then
-    printf '\nbpftrace-Tracing nicht möglich: %s\n' "$(grep -v RLIMIT_MEMLOCK "$BT_OUT.err" | grep -m1 -i error)"
+  # bpftrace bis 0.20 meldet "Attaching N probes..." auf stdout, neuere Versionen "Attached N probes" auf stderr
+  if ! grep -qE '^Attach(ing|ed)' "$BT_OUT" "$BT_OUT.err" 2>/dev/null; then
+    printf '\nbpftrace-Tracing nicht möglich: %s\n' "$( { grep -v RLIMIT_MEMLOCK "$BT_OUT.err" | grep -m1 -i error; } || tail -1 "$BT_OUT.err")"
     return
   fi
   # Läuft ein Prozess noch, waren es nur beendete Threads; die stecken schon in den Top-Schreibern.

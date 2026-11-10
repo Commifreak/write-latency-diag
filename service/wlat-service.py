@@ -24,7 +24,7 @@ from collections import defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.5"
+VERSION = "1.6"
 CONF_FILE = os.environ.get("WLAT_CONF", "/etc/write-latency-diag.conf")
 DEFAULTS = {
     "bind": "0.0.0.0",
@@ -505,15 +505,20 @@ class FsyncTracer(threading.Thread):
                 INFO["bpftrace"] = "nicht installiert (apt install bpftrace)"
                 return
             try:
+                # Fehlerausgabe mitlesen: Neuere bpftrace-Versionen melden "Attached N probes" dort, und eine volle,
+                # ungelesene Pipe würde bpftrace blockieren
                 self.proc = subprocess.Popen(["bpftrace", "-B", "none", "-e", BPF], stdout=subprocess.PIPE,
-                                             stderr=subprocess.PIPE, text=True)
+                                             stderr=subprocess.STDOUT, text=True)
             except OSError as e:
                 INFO["bpftrace"] = f"Start fehlgeschlagen: {e}"
                 return
             maps = defaultdict(dict)
             t_tick = time.time()
+            err = "beendet"
             for line in self.proc.stdout:
                 line = line.rstrip("\n")
+                if "ERROR" in line and "RLIMIT" not in line:
+                    err = line
                 # bpftrace bis 0.20: "Attaching N probes...", neuere Versionen: "Attached N probes"
                 if line.startswith("Attach"):
                     INFO["bpftrace"] = "läuft"
@@ -545,12 +550,10 @@ class FsyncTracer(threading.Thread):
                         maps[m.group(1)][m.group(2)] = int(m.group(3))
                 if STOP.is_set():
                     break
-            err = self.proc.stderr.read() if self.proc.stderr else ""
             self.proc.wait()
             if STOP.is_set():
                 return
-            msg = next((l for l in err.splitlines() if "ERROR" in l and "RLIMIT" not in l), "beendet")
-            INFO["bpftrace"] = f"Fehler: {msg[:200]} - neuer Versuch in 5 min"
+            INFO["bpftrace"] = f"Fehler: {err[:200]} - neuer Versuch in 5 min"
             STOP.wait(300)
 
     def stop(self):
