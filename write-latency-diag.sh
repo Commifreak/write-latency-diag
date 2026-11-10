@@ -10,7 +10,7 @@
 # eine temporäre Testdatei in das angegebene Verzeichnis und löschen sie danach.
 #
 
-VERSION="1.12"
+VERSION="1.13"
 
 # Zahlen immer mit Punkt verarbeiten: Mit deutscher Locale gibt awk sonst "3,000" aus, bash-printf lehnt "3.5" ab
 # und Vergleiche werden zu Textvergleichen. Texte bleiben in der Sprache des Systems.
@@ -1025,7 +1025,9 @@ fs_boot_check() {
     bs=$(sed -n 's/^Block size: *//p' <<<"$tl")
     st=$(sed -n 's/^RAID stride: *//p' <<<"$tl"); sw=$(sed -n 's/^RAID stripe width: *//p' <<<"$tl")
     info "ext4 $mnt ($src): bei Fehlern ${eb:-?}, Reserve für root $(awk -v r="${rbc:-0}" -v b="${bc:-1}" -v s="${bs:-4096}" 'BEGIN { x = sprintf("%.1f", 100 * r / b); sub(/\./, ",", x); printf "%s %% (%.0f GiB)", x, r * s / 2^30 }'), RAID stride ${st:-0} / stripe-width ${sw:-0}"
-    if [ "$eb" = Continue ] && ! grep -qE '(^|,)errors=(remount-ro|panic)' <<<"$opts"; then
+    if [ "$eb" != Continue ] && grep -qE '(^|,)errors=continue(,|$)' <<<"$opts"; then
+      hint "ext4 $mnt: Im Dateisystem steht '$eb', eingehängt ist es aber noch mit errors=continue (gilt erst nach dem nächsten Einhängen). Sofort übernehmen: mount -o remount,errors=remount-ro $mnt"
+    elif [ "$eb" = Continue ] && ! grep -qE '(^|,)errors=(remount-ro|panic)' <<<"$opts"; then
       hint "ext4 $mnt: Bei Fehlern im Dateisystem schreibt ext4 weiter ('Continue') - ein Schaden kann sich unbemerkt ausbreiten. Sicherer: tune2fs -e remount-ro $src (bei einem Fehler wird dann nur noch gelesen)."
     fi
     if awk -v r="${rbc:-0}" -v b="${bc:-1}" -v s="${bs:-4096}" 'BEGIN { exit !(100 * r / b >= 2 && r * s / 2^30 >= 10) }'; then
@@ -1348,7 +1350,9 @@ static_check() {
         members="$members $mem"
       done
       MDMEMBERS="$MDMEMBERS$members"
-      info "${md##*/}: $lvl, Bitmap: $(cat "$md/md/bitmap/location" 2>/dev/null || echo none)${lvl:+, }$( [ -f "$md/md/stripe_cache_size" ] && echo "stripe_cache_size=$(cat "$md/md/stripe_cache_size")")"
+      local bml; bml=$(cat "$md/md/bitmap/location" 2>/dev/null || echo none)
+      case "$bml" in [+-][0-9]*) bml="intern" ;; none) bml="keine" ;; esac
+      info "${md##*/}: $lvl, Bitmap: $bml$( [ -f "$md/md/stripe_cache_size" ] && echo ", stripe_cache_size=$(cat "$md/md/stripe_cache_size")")"
       md_groups "$md" "$lvl"
       md_extra_checks "$md" "$lvl"
       case "$lvl" in
