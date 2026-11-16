@@ -34,14 +34,20 @@ CPU/Software. Zielsystem ist vor allem Ubuntu mit mdadm, Unraid wird im Skript z
 
 ## Regeln für den Code
 
-- Dienst: nur Python-Standardbibliothek (läuft auf Ubuntu 24.04 mit Python 3.12). Keine Pakete, nichts aus dem
-  Internet zur Laufzeit. Die Web-Oberfläche ist nur lesend und hat keinen Login. Sie darf nie Befehle oder Tests
+- Dienst: nur Python-Standardbibliothek (läuft auf Ubuntu 24.04 mit Python 3.12 und auf 26.04). Keine Pakete, nichts
+  aus dem Internet zur Laufzeit. Die Web-Oberfläche ist nur lesend und hat keinen Login. Sie darf nie Befehle oder Tests
   auslösen. Prozessnamen im Browser immer als Text einsetzen (`textContent`), nie als HTML.
 - Der Dienst soll selbst kaum Schreiblast erzeugen: SQLite mit WAL und `synchronous=NORMAL`, gebündelt einmal pro
   Minute schreiben.
 - Skript: bash und awk, kompatibel mit mawk (Ubuntu-Standard). Kein `strftime`, keine gawk-Erweiterungen. Dateien
   unter `/proc/<pid>/` nicht per `getline` lesen: mawk bricht bei Lesefehlern (EACCES) ab. Stattdessen
   `grep -s -H` über alle Dateien.
+- Zahlen in Skript und Checks mit `LC_NUMERIC=C` verarbeiten (steht oben in beiden): Mit deutscher Locale gibt awk
+  sonst Kommas aus und Vergleiche werden zu Textvergleichen. Für Benutzer Kommas gezielt einsetzen (`dc_de`, `de()`).
+- bpftrace: bis 0.20 kommt „Attaching N probes...“ auf stdout, ab neueren Versionen (z.B. 0.25 unter Ubuntu 26.04)
+  „Attached N probes“ auf stderr. Beides akzeptieren, stderr immer mitlesen. Das Format der Map-Ausgabe ist gleich.
+- SMART-Schreibverstärkung: SanDisk/WD 233/241 (GiB), Samsung 251/241 (LBAs, in GiB umgerechnet), Crucial/Micron
+  247/248. Der Dienst zeigt nur Laufwerke aus der letzten SMART-Abfrage, der Verlauf bleibt pro Seriennummer.
 - Downloads beim Auto-Update vor dem Ersetzen prüfen (vollständig, `bash -n` bzw. `compile()`). Eine
   Git-Arbeitskopie wird nie überschrieben.
 - Neue Optionen, Services oder Befunde im README beschreiben.
