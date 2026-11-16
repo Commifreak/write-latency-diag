@@ -1,91 +1,95 @@
 # write-latency-diag
 
-Werkzeuge, die Schreiblatenz auf Linux-Servern messen und eingrenzen: SSD (Gerät, Flush, Firmware) oder
-CPU/Software. Zielsystem ist vor allem Ubuntu mit mdadm, Unraid wird im Skript zusätzlich erkannt.
+Tools that measure write latency on Linux servers and narrow down its cause: SSD (device, flush, firmware) or
+CPU/software. The main target is Ubuntu with mdadm, the script also detects Unraid.
 
-## Arbeitsweise
+## Way of working
 
-- Direkt auf `main` committen und pushen, keine Pull Requests.
-- Alles, was Benutzer sehen (Ausgaben, Befunde, Web-Oberfläche, README), ist auf Deutsch, mit Dezimalkomma in
-  Fließtext und Tabellen. Commit-Nachrichten auf Englisch.
-- Bei jeder Änderung `VERSION` hochzählen: im Skript (`write-latency-diag.sh`) bzw. im Dienst
-  (`service/wlat-service.py`). Das Auto-Update vergleicht den Dateiinhalt, die Version erscheint im Report.
-- Das Repo ist öffentlich und wird per Auto-Update von `raw.githubusercontent.com` (Zweig `main`) geladen.
-  Keine Daten eines konkreten Servers einchecken (IPs, Seriennummern, Benutzernamen, Reports).
+- Commit and push directly to `main`, no pull requests.
+- Everything users see (output, findings, web UI, README) is in English, with a decimal point. Commit messages in
+  English.
+- Bump `VERSION` with every change: in the script (`write-latency-diag.sh`) or in the service
+  (`service/wlat-service.py`). The auto-update compares the file content, the version appears in the report.
+- The repo is public and is loaded by the auto-update from `raw.githubusercontent.com` (branch `main`).
+  Never commit data of a specific server (IPs, serial numbers, user names, reports).
 
-## Aufbau
+## Structure
 
-| Teil | Datei | Aufgabe |
+| Part | File | Purpose |
 |---|---|---|
-| Dienst | `service/wlat-service.py` | Die eine Quelle für dauerhafte Messung: Sammler, SQLite, Web-Oberfläche (Port 81), Textbericht `/api/report`, CheckMK-Zeilen `/api/checkmk` |
-| CheckMK-Checks | `checkmk/write_latency`, `checkmk/write_latency_smart` | Geben die Ausgabe des Dienstes weiter, wenn er läuft und Daten hat. Sonst messen sie selbst |
-| Skript | `write-latency-diag.sh` | Aktive Tests (fio, Dauerlast), Einmal-Analyse, Prüfung neuer SSDs vor dem Einbau (`--check-disk`, löscht das Laufwerk), Installation des Dienstes (`--install-service`), Auto-Update von Skript, Dienst und Checks |
+| Service | `service/wlat-service.py` | The single source for continuous measurement: collector, SQLite, web UI (port 81), text report `/api/report`, CheckMK lines `/api/checkmk` |
+| CheckMK checks | `checkmk/write_latency`, `checkmk/write_latency_smart` | Pass on the service's output when it is running and has data. Otherwise they measure themselves |
+| Script | `write-latency-diag.sh` | Active tests (fio, sustained load), one-off analysis, check of new SSDs before installation (`--check-disk`, erases the drive), installation of the service (`--install-service`), auto-update of script, service and checks |
 
-- Die Logik für Hänger, Schreibverstärkung (WAF), Verschleiß/Restlaufzeit, Schreibcache und TRIM gibt es in mehreren
-  Teilen. Sie muss gleich bleiben: gleiche Schwellwerte, gleiche Regeln, gleiche Service-Namen in CheckMK. Wer eine
-  Regel ändert, ändert sie überall (Skript-awk, Dienst, `checkmk_lines()` und die eigene Messung der Checks).
-- Hänger (auch in der Dauerlast von `--check-disk`): Ein Zeitabschnitt ist langsam, wenn Anfragen >= 100 ms dauern (`stall_ms`) oder das Gerät Anfragen offen
-  hat und gar keine beendet. Aufeinanderfolgende langsame Abschnitte (Lücke < 3 s) bilden ein Ereignis. Spürbar ist
-  ein Ereignis ab 1 s Wartezeit (`felt_ms`) oder 2 s Dauer. HDDs (rotierend) zählen nicht als SSD-Befund.
-- Schreiber pro Prozess werden netto gezählt (`write_bytes - cancelled_write_bytes`). Beim Ende eines Prozesses
-  rechnet der Kernel seine Menge dem Elternprozess zu. Was beim Kind schon gezählt wurde, wird dort abgezogen.
-- SMART-Abfragen laufen bei SATA am NCQ-Puffer vorbei. Der Dienst merkt sich ihre Zeiträume und markiert Hänger, die
-  in eine Abfrage fallen.
+- The logic for stalls, write amplification (WAF), wear/remaining lifetime, write cache and TRIM exists in several
+  parts. It must stay identical: same thresholds, same rules, same service names in CheckMK. Whoever changes a rule
+  changes it everywhere (script awk, service, `checkmk_lines()` and the checks' own measurement).
+- Stalls (also in the sustained load of `--check-disk`): a time slice is slow if requests take >= 100 ms
+  (`stall_ms`) or the device has requests in flight and completes none. Consecutive slow slices (gap < 3 s) form one
+  event. An event is noticeable from 1 s wait time (`felt_ms`) or 2 s duration. HDDs (rotational) do not count as
+  an SSD finding.
+- Writers per process are counted net (`write_bytes - cancelled_write_bytes`). When a process exits, the kernel
+  adds its amount to the parent process. What was already counted for the child is subtracted there.
+- On SATA, SMART queries bypass the NCQ queue. The service remembers their time spans and marks stalls that fall
+  into a query.
+- CheckMK service names (since script 1.14 / service 1.7, previously German): `SSD sdX Latency`, `IO pressure`,
+  `CPU pressure`, `Top writers`, `SSD stalls`, `SSD sdX Write cache`, `SSD sdX Write amplification`,
+  `SSD sdX Wear`, `SSD TRIM <mount>`, `SSD SMART`.
 
-## Regeln für den Code
+## Code rules
 
-- Dienst: nur Python-Standardbibliothek (läuft auf Ubuntu 24.04 mit Python 3.12 und auf 26.04). Keine Pakete, nichts
-  aus dem Internet zur Laufzeit. Die Web-Oberfläche ist nur lesend und hat keinen Login. Sie darf nie Befehle oder Tests
-  auslösen. Prozessnamen im Browser immer als Text einsetzen (`textContent`), nie als HTML.
-- Der Dienst soll selbst kaum Schreiblast erzeugen: SQLite mit WAL und `synchronous=NORMAL`, gebündelt einmal pro
-  Minute schreiben.
-- Skript: bash und awk, kompatibel mit mawk (Ubuntu-Standard). Kein `strftime`, keine gawk-Erweiterungen. Dateien
-  unter `/proc/<pid>/` nicht per `getline` lesen: mawk bricht bei Lesefehlern (EACCES) ab. Stattdessen
-  `grep -s -H` über alle Dateien.
-- Zahlen in Skript und Checks mit `LC_NUMERIC=C` verarbeiten (steht oben in beiden): Mit deutscher Locale gibt awk
-  sonst Kommas aus und Vergleiche werden zu Textvergleichen. Für Benutzer Kommas gezielt einsetzen (`dc_de`, `de()`).
-- bpftrace: bis 0.20 kommt „Attaching N probes...“ auf stdout, ab neueren Versionen (z.B. 0.25 unter Ubuntu 26.04)
-  „Attached N probes“ auf stderr. Beides akzeptieren, stderr immer mitlesen. Das Format der Map-Ausgabe ist gleich.
-- SMART-Schreibverstärkung: SanDisk/WD 233/241 (GiB), Samsung 251/241 (LBAs, in GiB umgerechnet), Crucial/Micron
-  247/248. Der Dienst zeigt nur Laufwerke aus der letzten SMART-Abfrage, der Verlauf bleibt pro Seriennummer.
-- Downloads beim Auto-Update vor dem Ersetzen prüfen (vollständig, `bash -n` bzw. `compile()`). Eine
-  Git-Arbeitskopie wird nie überschrieben.
-- Neue Optionen, Services oder Befunde im README beschreiben.
+- Service: Python standard library only (runs on Ubuntu 24.04 with Python 3.12 and on 26.04). No packages, nothing
+  from the internet at runtime. The web UI is read-only and has no login. It must never trigger commands or tests.
+  Always insert process names in the browser as text (`textContent`), never as HTML.
+- The service itself should cause hardly any write load: SQLite with WAL and `synchronous=NORMAL`, write in one
+  batch per minute.
+- Script: bash and awk, compatible with mawk (Ubuntu default). No `strftime`, no gawk extensions. Do not read files
+  under `/proc/<pid>/` via `getline`: mawk aborts on read errors (EACCES). Use `grep -s -H` over all files instead.
+- Handle numbers in script and checks with `LC_NUMERIC=C` (set at the top of both): with a German or other
+  locale awk would otherwise print commas and comparisons turn into string comparisons. Format numbers for users
+  with `dc_num` (script) or `num()` (service).
+- bpftrace: up to 0.20 "Attaching N probes..." goes to stdout, newer versions (e.g. 0.25 on Ubuntu 26.04) print
+  "Attached N probes" to stderr. Accept both and always read stderr too. The map output format is the same.
+- SMART write amplification: SanDisk/WD 233/241 (GiB), Samsung 251/241 (LBAs, converted to GiB), Crucial/Micron
+  247/248. The service only shows drives from the latest SMART query, the history stays per serial number.
+- Check downloads in the auto-update before replacing (complete, `bash -n` or `compile()`). A Git working copy is
+  never overwritten.
+- Describe new options, services or findings in the README.
 
-## Testen
+## Testing
 
-Die Entwicklungsumgebung ist eine VM ohne echte SATA-SSDs, ohne systemd und ohne CheckMK-Agent.
+The development environment is a VM without real SATA SSDs, without systemd and without a CheckMK agent.
 
-- Statische Prüfung: `bash -n write-latency-diag.sh checkmk/*`, `python3 -m pyflakes service/wlat-service.py`.
-- bpftrace braucht tracefs: `mount -t tracefs nodev /sys/kernel/tracing`.
-- `WLAT_TEST_ALL_SSD=1` behandelt die (rotierenden) VM-Platten als SSD, im Skript und im Dienst.
-- Dienst mit Testkonfiguration starten: `WLAT_CONF=<datei>` mit z.B. `bind = 127.0.0.1`, `port = 18081`,
-  `db = <scratchpad>/metrics.db`, `auto_update = 0`. Hänger lassen sich mit einem großen Schreibblock und
-  anschließendem `fsync` erzeugen.
-- Auto-Update gegen einen lokalen Testserver: `WLAT_UPDATE_URL=http://127.0.0.1:<port>` und
-  `python3 -m http.server`. `WLAT_NO_UPDATE=1` schaltet das Update ab.
-- SMART, hdparm, journalctl und systemctl gibt es in der VM nicht oder nicht echt: für Tests kleine Ersatzskripte
-  per `PATH` voranstellen, Testdaten direkt in die SQLite-Datenbank schreiben.
-- Web-Oberfläche: Screenshots mit Playwright (`NODE_PATH=/opt/node-tools/node_modules node <skript>.js`), jeweils
-  hell, dunkel und 390 px breit. Auf Browser-Fehler und horizontales Scrollen prüfen.
-- `--check-disk`: an einem Loop-Device testen (`losetup` auf eine Datei im Scratchpad) mit einem Ersatz-`smartctl`,
-  das eine SATA-SSD nachbildet (`-i -A -c -t -X -l selftest -l devstat`). `WLAT_CONFIRM_DEV=<gerätename>` ersetzt
-  die Eingabe zur Bestätigung. Abbruch mit `TERM` testen: Hintergrundprozesse einer nicht interaktiven Shell
-  ignorieren `INT`.
-- RAID- und Boot-Prüfungen (`md_groups`, `md_extra_checks`, `fs_boot_check`, `boot_check`): Der VM-Kernel hat kein md.
-  Test mit Loop-Laufwerken (`losetup -f`, `partx -a`, GPT mit EFI-Partition), einem nachgebauten md-Verzeichnis
-  (`WLAT_TEST_SYSBLOCK=<dir>` mit `md0/md/level`, `layout`, `raid_disks`, `chunk_size`, `slaves/`, `md/dev-*/slot`),
-  einem Gerätenamen `/dev/md0` per `mknod` auf ein Loop-Laufwerk (Einhängen mit `mount -c`) und den Funktionen per `eval`.
-- Testprozesse gezielt beenden (`pkill -f '^python3 service/wlat-service.py'`), nicht mit einem Muster, das auch auf
-  die eigene Shell passt.
+- Static checks: `bash -n write-latency-diag.sh checkmk/*`, `python3 -m pyflakes service/wlat-service.py`.
+- bpftrace needs tracefs: `mount -t tracefs nodev /sys/kernel/tracing`.
+- `WLAT_TEST_ALL_SSD=1` treats the (rotational) VM disks as SSDs, in the script and in the service.
+- Start the service with a test configuration: `WLAT_CONF=<file>` with e.g. `bind = 127.0.0.1`, `port = 18081`,
+  `db = <scratchpad>/metrics.db`, `auto_update = 0`. Stalls can be produced with a large write block followed by
+  `fsync`.
+- Auto-update against a local test server: `WLAT_UPDATE_URL=http://127.0.0.1:<port>` and
+  `python3 -m http.server`. `WLAT_NO_UPDATE=1` disables the update.
+- SMART, hdparm, journalctl and systemctl are missing or not real in the VM: for tests, put small stand-in scripts
+  first in `PATH` and write test data directly into the SQLite database.
+- Web UI: screenshots with Playwright (`NODE_PATH=/opt/node-tools/node_modules node <script>.js`), light, dark and
+  390 px wide each. Check for browser errors and horizontal scrolling.
+- `--check-disk`: test on a loop device (`losetup` on a file in the scratchpad) with a stand-in `smartctl` that
+  emulates a SATA SSD (`-i -A -c -t -X -l selftest -l devstat`). `WLAT_CONFIRM_DEV=<device name>` replaces the
+  confirmation prompt. Test aborting with `TERM`: background processes of a non-interactive shell ignore `INT`.
+- RAID and boot checks (`md_groups`, `md_extra_checks`, `fs_boot_check`, `boot_check`): the VM kernel has no md.
+  Test with loop drives (`losetup -f`, `partx -a`, GPT with an EFI partition), a fake md directory
+  (`WLAT_TEST_SYSBLOCK=<dir>` with `md0/md/level`, `layout`, `raid_disks`, `chunk_size`, `slaves/`,
+  `md/dev-*/slot`), a device name `/dev/md0` via `mknod` pointing to a loop drive (mount with `mount -c`) and the
+  functions via `eval`.
+- Stop test processes specifically (`pkill -f '^python3 service/wlat-service.py'`), not with a pattern that also
+  matches your own shell.
 
-## Zusammenfassung des Kontexts
+## Context summary
 
-Bei einer Zusammenfassung (automatisch oder `/compact`) vollständig behalten:
+When summarizing (automatically or `/compact`), keep in full:
 
-- Den Stand der Analyse am Zielserver des Benutzers: Befunde mit den wichtigsten Messwerten, gekaufte oder geplante
-  Hardware, bereits umgesetzte Änderungen und die offenen Schritte dort, jeweils mit den Befehlen, die noch
-  auszuführen sind. Diese Daten stehen absichtlich nicht im Repo und gibt es nur in der Unterhaltung.
-- Widerlegte Annahmen und warum sie falsch waren, damit sie nicht erneut vorgeschlagen werden.
-- Was der Benutzer für später angekündigt hat („behalte im Hinterkopf“).
-- Laufende Arbeit am Code: was geändert, getestet und gepusht ist und was noch fehlt.
+- The state of the analysis on the user's target server: findings with the most important measurements, purchased
+  or planned hardware, changes already made and the open steps there, each with the commands still to be run.
+  This data is intentionally not in the repo and exists only in the conversation.
+- Disproved assumptions and why they were wrong, so they are not suggested again.
+- What the user announced for later ("keep in mind").
+- Ongoing work on the code: what is changed, tested and pushed, and what is still missing.

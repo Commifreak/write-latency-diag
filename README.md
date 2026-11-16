@@ -1,11 +1,11 @@
 # write-latency-diag
 
-Ein Diagnose-Skript für Linux. Getestet ist es für Ubuntu, Unraid wird zusätzlich erkannt. Es misst
-Schreiblatenz und grenzt ein, ob die Wartezeit **auf den SSDs** (Gerät, Controller, Cache-Flush) entsteht oder
-**darüber** (CPU, RAID-Parität, Verschlüsselung, Dateisystem, Locks).
+A diagnostic script for Linux. It is tested on Ubuntu, Unraid is detected as well. It measures write latency and
+narrows down whether the wait happens **on the SSDs** (device, controller, cache flush) or **above them** (CPU, RAID
+parity, encryption, file system, locks).
 
-Es braucht nur `bash` und `awk`. `fio`, `smartctl`, `bpftrace` und `hdparm` sind optional, liefern aber deutlich
-mehr Details:
+It only needs `bash` and `awk`. `fio`, `smartctl`, `bpftrace` and `hdparm` are optional but provide much more
+detail:
 
 ```bash
 sudo apt install fio smartmontools bpftrace hdparm
@@ -18,160 +18,157 @@ wget -O /tmp/wlat.sh https://raw.githubusercontent.com/Commifreak/write-latency-
 chmod +x /tmp/wlat.sh
 ```
 
-Das Skript als root starten (`sudo`). Sonst fehlen SMART-Daten.
+Run the script as root (`sudo`). Otherwise SMART data is missing.
 
-**Automatisches Update:** Bei jedem Start lädt das Skript die aktuelle Version von GitHub (`main`), prüft sie
-(vollständig, gültige Bash-Syntax) und startet sich bei Änderungen neu. Ist der CheckMK-Agent installiert
-(`/usr/lib/check_mk_agent`), installiert bzw. aktualisiert es außerdem die beiden Local Checks (siehe unten).
-Ohne Netzverbindung läuft die vorhandene Version weiter. Liegt das Skript in einer Git-Arbeitskopie, wird es nicht
-überschrieben. Abschalten mit `-U` oder `WLAT_NO_UPDATE=1`. Da das Skript als root läuft, führt das Update Code aus
-diesem Repository mit root-Rechten aus. Wer das nicht möchte, startet immer mit `-U`.
+**Automatic update:** On every start the script downloads the current version from GitHub (`main`), checks it
+(complete, valid bash syntax) and restarts itself if it changed. If the CheckMK agent is installed
+(`/usr/lib/check_mk_agent`), it also installs or updates the two local checks (see below). Without a network
+connection the existing version keeps running. If the script lives in a Git working copy, it is not overwritten.
+Disable with `-U` or `WLAT_NO_UPDATE=1`. Since the script runs as root, the update executes code from this
+repository with root privileges. If you do not want that, always start it with `-U`.
 
-## Vorgehen
+## Procedure
 
-**1. Aktiver Test (ca. 1 Minute)**
+**1. Active test (about 1 minute)**
 
 ```bash
-sudo /tmp/wlat.sh -t /pfad/auf/dem/ssd-volume/.lattest
+sudo /tmp/wlat.sh -t /path/on/the/ssd-volume/.lattest
 ```
 
-Der Test schreibt 4k-Blöcke mit O_SYNC (Queue-Tiefe 1). So schreiben auch Datenbanken, Docker-Container und
-VMs. Die Testdatei ist 256 MB groß und wird danach gelöscht. Mit mehreren `-t` lassen sich Volumes vergleichen,
-z.B. RAID gegen Einzel-SSD oder verschlüsselt gegen unverschlüsselt.
+The test writes 4k blocks with O_SYNC (queue depth 1). This is how databases, Docker containers and VMs write as
+well. The test file is 256 MB and is deleted afterwards. With several `-t` you can compare volumes, e.g. RAID
+against a single SSD or encrypted against unencrypted.
 
-**2. Im Alltag beobachten, wenn es hakt (passiv)**
+**2. Observe in everyday use when things hang (passive)**
 
 ```bash
 sudo /tmp/wlat.sh -d 600
 ```
 
-Das Skript zeigt jede Sekunde CPU, Kern-Spitze, PSI und Top-Prozesse sowie für jede aktive SSD Durchsatz,
-await, Flush-Latenz und Auslastung. Langsame Intervalle sind mit `<< LANGSAM` markiert. `Ctrl+C` beendet die
-Messung vorzeitig, die Auswertung kommt trotzdem.
+Every second the script shows CPU, core peak, PSI and top processes, and for every active SSD throughput, await,
+flush latency and utilization. Slow intervals are marked with `<< SLOW`. `Ctrl+C` stops the measurement early,
+the analysis still follows.
 
-**3. Über einen ganzen Tag beobachten**
+**3. Observe over a whole day**
 
 ```bash
 sudo /tmp/wlat.sh -d 86400 -q -i 5
 ```
 
-Mit `-q` zeigt das Skript nur die auffälligen Intervalle, jeweils mit den Prozessen, die gerade schreiben. Die
-Auswertung am Ende fasst den ganzen Zeitraum zusammen. So landen auch nächtliche Backups, Cronjobs und
-Datenbank-Wartung in der Messung. Am besten in `tmux` oder `screen` starten.
+With `-q` the script only shows the conspicuous intervals, each with the processes writing at that moment. The
+analysis at the end summarizes the whole period. This way nightly backups, cron jobs and database maintenance end
+up in the measurement too. Best started in `tmux` or `screen`.
 
-**4. Optional: Dauerlast (SLC-Cache)**
+**4. Optional: sustained load (SLC cache)**
 
 ```bash
-sudo /tmp/wlat.sh -t /pfad/.lattest -S 30G
+sudo /tmp/wlat.sh -t /path/.lattest -S 30G
 ```
 
-Dieser Test schreibt 30 GB. Bricht die Schreibrate nach einigen GB stark ein, ist der SLC-Cache der SSD voll.
-Das ist typisch für QLC-SSDs und DRAM-lose SSDs.
+This test writes 30 GB. If the write rate drops sharply after a few GB, the SSD's SLC cache is full. This is
+typical for QLC SSDs and DRAM-less SSDs.
 
-Report und Messwerte (`samples.csv`, eine Zeile pro Sekunde und Gerät) liegen unter `/tmp/wlat-<Zeitstempel>/`.
+Report and samples (`samples.csv`, one line per second and device) are stored under `/tmp/wlat-<timestamp>/`.
 
-## Neue oder gebrauchte SSD vor dem Einbau prüfen
+## Check a new or used SSD before installing it
 
 ```bash
 sudo /tmp/wlat.sh --check-disk /dev/sdX -o /root
 ```
 
-**Achtung: Die Prüfung löscht das ganze Laufwerk.** Sie läuft nur auf einem ganzen Laufwerk, das nicht
-eingehängt, nicht Teil eines RAID/LVM und nicht als Swap aktiv ist. Vor dem Start zeigt das Skript Modell,
-Seriennummer und Inhalt und verlangt, dass man den Gerätenamen eintippt. Braucht `fio`, `smartctl` und
-`blkdiscard` (`apt install fio smartmontools`). Am besten in `tmux` oder `screen` starten.
+**Caution: the check erases the whole drive.** It only runs on a whole drive that is not mounted, not part of a
+RAID/LVM and not active as swap. Before starting, the script shows model, serial number and content and asks you
+to type the device name. Needs `fio`, `smartctl` and `blkdiscard` (`apt install fio smartmontools`). Best started in
+`tmux` or `screen`.
 
-Ablauf:
+Steps:
 
-1. **SMART vorher und kurzer Selbsttest**: Gesamtzustand, Attribute am Grenzwert, Zähler, die bei einer gesunden
-   SSD 0 sind (reallokierte, wartende und nicht korrigierbare Sektoren, Programmier- und Löschfehler,
-   Reserveblöcke), Fehlerprotokoll, frühere Selbsttests, Verschleiß, Betriebsstunden, Geschriebenes und
-   unerwartete Stromausfälle. Bei Samsung-SSDs mit NAND-Zähler (Attribut 251, z.B. SM883/PM883) außerdem die
-   Schreibverstärkung über die Lebensdauer und am Ende die während der Prüfung.
-2. **TRIM über die ganze Fläche** (`blkdiscard`): Gebrauchte SSDs starten ohne alte Belegung.
-3. **Flush-Latenz**: 60 s lang 4k-Schreiben mit O_SYNC direkt auf das Laufwerk, jeder Zugriff mit Flush. Mit
-   wirksamer Power-Loss-Protection (PLP) bestätigt die SSD sofort: Median unter 0,5 ms. Ohne PLP dauert es
-   Millisekunden.
-4. **Vollschreiben mit Prüfsummen**: Die ganze Fläche wird beschrieben und zurückgelesen (`fio --verify=crc32c`).
-   Das findet defekte Bereiche und zeigt die Dauer-Schreibrate, auch je 10 % der Fläche (Einbruch durch einen
-   vollen SLC-Cache).
-5. **Leistung im vollen Zustand**: 4k zufällig lesen und schreiben mit Queue-Tiefe 32 sowie Lesen mit
-   Queue-Tiefe 1, je 30 s.
-6. **Dauerlast wie im Betrieb** (`-r SEK`, Standard 3600): 16 Sync-Schreibzugriffe pro Sekunde (wie
-   Datenbanken), dazu ein Strom mit 1 MB/s (wie eine Kamera-Aufnahme) und 50 Lesezugriffe pro Sekunde, auf der
-   voll beschriebenen, ungetrimmten SSD. Hänger erkennt das Skript nach denselben Regeln wie der Dienst. Dazu misst
-   es die Wartezeit jedes einzelnen Sync-Schreibzugriffs. Eine SSD mit regelmäßigen Firmware-Pausen fällt hier auf,
-   auch mit dem Muster aus Dauer und Abstand.
-7. **Langer Selbsttest** der SSD.
-8. **SMART nachher**: Steigt einer der Fehlerzähler während der Prüfung, ist sie nicht bestanden. Außerdem
-   vergleicht das Skript den Schreibzähler der SSD mit der Menge, die der Kernel geschrieben hat. Passt er nicht,
-   sind Verschleiß und Geschriebenes mit Vorsicht zu lesen. Zum Schluss wird die Fläche wieder getrimmt.
+1. **SMART before and short self-test**: overall health, attributes at their threshold, counters that are 0 on a
+   healthy SSD (reallocated, pending and uncorrectable sectors, program and erase errors, reserve blocks), error
+   log, earlier self-tests, wear, power-on hours, data written and unexpected power losses. For Samsung SSDs with a
+   NAND counter (attribute 251, e.g. SM883/PM883) also the write amplification over the lifetime and, at the end,
+   during the check.
+2. **TRIM over the whole drive** (`blkdiscard`): used SSDs start without old allocations.
+3. **Flush latency**: 60 s of 4k writes with O_SYNC directly to the drive, every write with a flush. With
+   effective power loss protection (PLP) the SSD acknowledges immediately: median below 0.5 ms. Without PLP it
+   takes milliseconds.
+4. **Full write with checksums**: the whole drive is written and read back (`fio --verify=crc32c`). This finds
+   defective areas and shows the sustained write rate, also per 10 % of the drive (drop caused by a full SLC
+   cache).
+5. **Performance when full**: 4k random reads and writes at queue depth 32 and reads at queue depth 1, 30 s
+   each.
+6. **Sustained load as in production** (`-r SEC`, default 3600): 16 sync writes per second (like databases), plus
+   a 1 MB/s stream (like a camera recording) and 50 reads per second, on the completely written, untrimmed SSD.
+   The script detects stalls with the same rules as the service. It also measures the wait time of every single
+   sync write. An SSD with regular firmware pauses stands out here, including the pattern of duration and
+   interval.
+7. **Long self-test** of the SSD.
+8. **SMART after**: if one of the error counters rises during the check, it fails. The script also compares the
+   SSD's write counter with the amount the kernel has written. If it does not match, read wear and data written
+   with caution. Finally the drive is trimmed again.
 
-Das Ergebnis ist `BESTANDEN`, `BESTANDEN MIT AUFFÄLLIGKEITEN` oder `NICHT BESTANDEN` (Exit-Code 2), mit allen
-Befunden. Eine Zeile mit den wichtigsten Werten landet zusätzlich in `ssdcheck-kurzfassung.txt` im Verzeichnis von
-`-o`. So lassen sich mehrere SSDs nebeneinander vergleichen. Report, SMART-Ausgaben und Messwerte liegen unter
-`ssdcheck-<Gerät>-<Zeitstempel>/`. `Ctrl+C` bricht ab und zeigt, was bis dahin geprüft ist.
+The result is `PASSED`, `PASSED WITH FINDINGS` or `FAILED` (exit code 2), with all findings. A line with the most
+important values is also appended to `ssdcheck-summary.txt` in the `-o` directory, so several SSDs can be compared
+side by side. Report, SMART output and samples are stored under `ssdcheck-<device>-<timestamp>/`. `Ctrl+C` aborts
+and shows what has been checked so far.
 
-Bei einer SSD mit 480 GB dauert die Prüfung etwa 2,5 Stunden. Mehrere SSDs lassen sich gleichzeitig in
-getrennten Aufrufen prüfen. Über einen USB-Adapter funktioniert die Prüfung meist auch (SMART über `-d sat`),
-der Adapter verlängert aber jede Anfrage, und manche geben Flush und TRIM nicht richtig weiter. Die Flush-Latenz
-ist dann nur grob zu bewerten. Für NVMe-SSDs fehlen die Selbsttests.
+For a 480 GB SSD the check takes about 2.5 hours. Several SSDs can be checked at the same time in separate runs.
+The check usually works via a USB adapter too (SMART via `-d sat`), but the adapter adds latency to every request,
+and some do not pass flush and TRIM on correctly. The flush latency can then only be judged roughly. Self-tests are
+not available for NVMe SSDs.
 
-## Wer erzeugt die Last?
+## Who causes the load?
 
-- **Schreiber pro Prozess**: In jedem Intervall zeigt die Zeile `schreibt:`, welche Prozesse wie viel schreiben
-  (aus `/proc/<pid>/io`, nur als root vollständig). Die Auswertung nennt die größten Schreiber über die ganze Phase
-  und getrennt davon in den langsamen Intervallen. Endet ein Prozess, rechnet der Kernel seine Schreibmenge dem
-  Elternprozess zu. Darum tauchen `systemd`, `cron` oder `containerd-shim` mit der Schreibmenge ihrer beendeten
-  Kindprozesse auf.
-- **fsync-Aufrufer** (mit `bpftrace`): Wer ruft `fsync`, `fdatasync`, `sync_file_range`, `msync(MS_SYNC)`, `sync`
-  oder `syncfs` auf, wie oft, und wie lange wartet er darauf? Angezeigt wird Prozess/Thread, z.B.
-  `mysqld/ib_log_flush`. Auch Prozesse, die während der Messung enden, werden mit ihrer Schreibmenge erfasst.
-  `-T` schaltet das Tracing ab.
-- **Schreibverstärkung im Verlauf**: Die SMART-Zähler gelten für die ganze Lebensdauer der SSD. Jeder Lauf speichert
-  sie in `/var/lib/write-latency-diag/smart-history.csv`. Ab dem zweiten Lauf (frühestens nach 1 h, besser nach
-  12 h oder mehr) zeigt das Skript die Schreibverstärkung seit dem letzten Messpunkt. So sieht man, ob eine Änderung
-  gewirkt hat.
+- **Writers per process**: in every interval the line `writes:` shows which processes write how much (from
+  `/proc/<pid>/io`, complete only as root). The analysis names the biggest writers over the whole phase and,
+  separately, in the slow intervals. When a process exits, the kernel adds its writes to the parent process. That
+  is why `systemd`, `cron` or `containerd-shim` show up with the writes of their exited child processes.
+- **fsync callers** (with `bpftrace`): who calls `fsync`, `fdatasync`, `sync_file_range`, `msync(MS_SYNC)`, `sync`
+  or `syncfs`, how often, and how long do they wait for it? Shown as process/thread, e.g. `mysqld/ib_log_flush`.
+  Processes that exit during the measurement are recorded with their writes as well. `-T` disables tracing.
+- **Write amplification over time**: the SMART counters cover the whole lifetime of the SSD. Every run saves them
+  in `/var/lib/write-latency-diag/smart-history.csv`. From the second run on (at the earliest after 1 h, better
+  after 12 h or more) the script shows the write amplification since the last data point. This shows whether a
+  change has worked.
 
-## Dauerhaft aufzeichnen mit Web-Oberfläche
+## Continuous recording with a web UI
 
-Statt einzelner Messläufe kann ein Dienst dauerhaft aufzeichnen. Die Ergebnisse zeigt er auf einer eigenen
-Web-Seite (Standard: Port 81):
+Instead of single runs, a service can record continuously. It shows the results on its own web page (default:
+port 81):
 
 ```bash
 sudo /tmp/wlat.sh --install-service
 ```
 
-Danach im Browser `http://<server-ip>:81/` öffnen. Die Seite zeigt:
+Then open `http://<server-ip>:81/` in the browser. The page shows:
 
-- **Befund**: dieselben Regeln wie Skript und CheckMK (Schreibcache, Schreibverstärkung, Restlaufzeit, Hänger,
-  TRIM, IO- und CPU-Druck)
-- **Spürbare Hänger** in echten Sekunden für die letzte Stunde, 24 h und 7 Tage: wie oft, wie lange zusammen, der
-  längste Hänger und wie lange eine Anwendung höchstens auf ihr fsync gewartet hat. Dazu der letzte spürbare
-  Hänger, die spürbaren Sekunden pro Stunde und jeder spürbare Hänger einzeln (Zeit, Gerät, Dauer, wer gewartet und
-  wer geschrieben hat). Spürbar heißt: ab 1 s Wartezeit (`felt_ms` in der Konfiguration) oder ab 2 s Dauer.
-- **Laufwerke**: aktuelle Latenz und Flushes, Schreibverstärkung der letzten 24 h, Verschleiß mit Restlaufzeit,
-  Schreibcache
-- **Verlauf** (1 h bis 90 Tage): maximale Wartezeit je Gerät, Flushes pro Sekunde, Schreibmenge, PSI und CPU
-- **Hänger**: jede Phase, in der eine SSD hängt (Wartezeit ab 100 ms oder offene Anfragen ohne Fortschritt), mit
-  Dauer, Gerät, den Prozessen, die gerade geschrieben haben, und denen, die per fsync darauf gewartet haben
-- **fsync-Aufrufer und Schreiber** über den gewählten Zeitraum, **Schreibverstärkung pro Tag**
-- **Rohdaten zum Kopieren**: ein kompakter Textbericht mit allem oben, auch jeder einzelne spürbare Hänger, gedacht
-  zum Einfügen in einen Chat oder ein Ticket. Ein Knopf kopiert ihn. Direkt abrufbar unter `/api/report`, z.B.
+- **Findings**: the same rules as the script and CheckMK (write cache, write amplification, remaining lifetime,
+  stalls, TRIM, IO and CPU pressure)
+- **Noticeable stalls** in real seconds for the last hour, 24 h and 7 days: how often, how long in total, the
+  longest stall and how long an application waited for its fsync at most. Plus the last noticeable stall, the
+  noticeable seconds per hour and every noticeable stall individually (time, device, duration, who waited and who
+  wrote). Noticeable means: from 1 s wait time (`felt_ms` in the configuration) or from 2 s duration.
+- **Drives**: current latency and flushes, write amplification over the last 24 h, wear with remaining lifetime,
+  write cache
+- **History** (1 h to 90 days): maximum wait per device, flushes per second, writes, PSI and CPU
+- **Stalls**: every phase in which an SSD stalls (wait time from 100 ms or requests in flight without progress),
+  with duration, device, the processes that were writing and those that waited for it via fsync
+- **fsync callers and writers** over the selected period, **write amplification per day**
+- **Raw data to copy**: a compact text report with everything above, including every single noticeable stall,
+  meant for pasting into a chat or a ticket. A button copies it. Directly available at `/api/report`, e.g.
   `curl http://<server-ip>:81/api/report`
 
-Der Dienst fragt alle 30 Minuten SMART-Werte ab. SMART-Befehle laufen bei SATA am Befehlspuffer vorbei, andere
-Zugriffe warten dann kurz. Hänger, die zeitgleich mit einer solchen Abfrage auftreten, sind deshalb mit „SMART“
-markiert.
+The service queries SMART values every 30 minutes. On SATA, SMART commands bypass the command queue, so other
+requests wait briefly. Stalls that coincide with such a query are therefore marked with "SMART".
 
-Die Seite ist nur lesend und hat keinen Login. Sie gehört deshalb nur ins LAN, nicht ins Internet. Der Dienst
-braucht nur Python 3 (Standardbibliothek). Mit `bpftrace`, `smartmontools` und `hdparm` liefert er alle Werte.
-Die Daten liegen in `/var/lib/write-latency-diag/metrics.db` (SQLite): 5-Sekunden-Werte 7 Tage, Minutenwerte
-90 Tage, Hänger ein Jahr. Der Dienst schreibt gebündelt einmal pro Minute und erzeugt dabei selbst kaum fsyncs.
+The page is read-only and has no login. It therefore belongs in the LAN only, not on the internet. The service only
+needs Python 3 (standard library). With `bpftrace`, `smartmontools` and `hdparm` it provides all values. The data
+is stored in `/var/lib/write-latency-diag/metrics.db` (SQLite): 5-second values for 7 days, minute values for 90
+days, stalls for a year. The service writes in batches once per minute and causes hardly any fsyncs itself.
 
-Einstellungen (Port, Adresse, Aufbewahrung, Schwelle für Hänger) stehen in `/etc/write-latency-diag.conf`.
-Danach `systemctl restart write-latency-diag`. Der Dienst prüft täglich auf eine neue Version, und jeder
-Skriptlauf aktualisiert ihn ebenfalls.
+Settings (port, address, retention, stall threshold) are in `/etc/write-latency-diag.conf`. Afterwards run
+`systemctl restart write-latency-diag`. The service checks daily for a new version, and every script run updates it
+as well.
 
 ```bash
 sudo systemctl stop write-latency-diag
@@ -185,19 +182,19 @@ sudo systemctl disable --now write-latency-diag
 sudo /tmp/wlat.sh --uninstall-service
 ```
 
-Der erste Befehl hält den Dienst an, der zweite schaltet ihn dauerhaft ab, der dritte entfernt ihn. Daten und
-Konfiguration bleiben dabei erhalten.
+The first command stops the service, the second disables it permanently, the third removes it. Data and
+configuration are kept.
 
-## Dauerhaft überwachen mit CheckMK
+## Continuous monitoring with CheckMK
 
-Im Ordner `checkmk/` liegen zwei Local Checks für den CheckMK-Agent:
+The `checkmk/` folder contains two local checks for the CheckMK agent:
 
-| Datei | Läuft | Services |
+| File | Runs | Services |
 |---|---|---|
-| `write_latency` | bei jedem Agent-Aufruf | `SSD sdX Latenz` (Flush- und Write-Latenz, Flushes/s, Durchsatz, Auslastung), `IO-Druck` und `CPU-Druck` (PSI), `Top-Schreiber` (netto, nach Prozessname) |
-| `write_latency_smart` | alle 30 Minuten | `SSD sdX Schreibcache`, `SSD sdX Schreibverstärkung` (letzte 24 h), `SSD sdX Verschleiß` (mit Restlaufzeit), `SSD TRIM <Mountpunkt>` |
+| `write_latency` | on every agent call | `SSD sdX Latency` (flush and write latency, flushes/s, throughput, utilization), `IO pressure` and `CPU pressure` (PSI), `Top writers` (net, by process name) |
+| `write_latency_smart` | every 30 minutes | `SSD sdX Write cache`, `SSD sdX Write amplification` (last 24 h), `SSD sdX Wear` (with remaining lifetime), `SSD TRIM <mount point>` |
 
-Installation auf dem überwachten Server:
+Installation on the monitored server:
 
 ```bash
 sudo wget -O /usr/lib/check_mk_agent/local/write_latency https://raw.githubusercontent.com/Commifreak/write-latency-diag/main/checkmk/write_latency
@@ -211,92 +208,91 @@ sudo mkdir -p /usr/lib/check_mk_agent/local/1800 && sudo wget -O /usr/lib/check_
 sudo chmod +x /usr/lib/check_mk_agent/local/write_latency /usr/lib/check_mk_agent/local/1800/write_latency_smart
 ```
 
-Danach in CheckMK die Services des Hosts neu erkennen lassen. Einfacher: Das Skript einmal als root starten. Es
-installiert die Checks bei vorhandenem Agent selbst und hält sie bei jedem weiteren Start aktuell.
+Then run a service discovery for the host in CheckMK. Easier: start the script once as root. If the agent is
+present, it installs the checks itself and keeps them up to date on every further start.
 
-**Mit dem Dienst** (siehe oben) messen die Checks nicht selbst. Sie geben die Werte des Dienstes weiter
-(`/api/checkmk`), damit CheckMK und Web-Oberfläche auf derselben Messung beruhen und SMART nur einmal abgefragt wird.
-Dazu kommt der Service `SSD Hänger` (spürbare Hänger der letzten Stunde: Anzahl, Sekunden, längster Hänger, längste
-Wartezeit einer Anwendung; WARN ab einem spürbaren Hänger, CRIT ab 5 s). Ist der Dienst gestoppt oder hat er noch
-keine Daten, messen die Checks wieder selbst. Die Schwellwerte gelten dann aus dem Dienst, nicht aus den Dateien. Beide Checks lassen sich zum Testen auch direkt
-aufrufen. Die Werte beziehen sich immer auf den Zeitraum seit dem letzten Aufruf (Zustand unter
-`/var/lib/write-latency-diag/`). Der erste Aufruf liefert deshalb nur Startwerte, die Schreibverstärkung der letzten
-24 h steht nach einem Tag fest. Die Schwellwerte stehen oben in den Dateien:
+**With the service** (see above) the checks do not measure themselves. They pass on the values of the service
+(`/api/checkmk`), so that CheckMK and the web UI rely on the same measurement and SMART is queried only once. This
+adds the service `SSD stalls` (noticeable stalls in the last hour: count, seconds, longest stall, longest wait of an
+application; WARN from one noticeable stall, CRIT from 5 s). If the service is stopped or has no data yet, the checks
+measure themselves again. The thresholds then come from the service, not from the files. Both checks can also be
+called directly for testing. The values always refer to the period since the previous call (state under
+`/var/lib/write-latency-diag/`). The first call therefore only returns starting values, and the write amplification
+over the last 24 h is known after one day. The thresholds are at the top of the files:
 
 | Service | WARN | CRIT |
 |---|---|---|
-| Flush-Latenz Ø | 10 ms | 50 ms |
-| Write-await Ø | 20 ms | 100 ms |
-| IO-Druck (PSI io full, avg60) | 10 % | 25 % |
-| CPU-Druck (PSI cpu some, avg60) | 20 % | 40 % |
-| Schreibverstärkung (24 h) | 5 | 10 |
-| Restlaufzeit | < 2 Jahre | < 1 Jahr |
-| Schreibcache | aus | Kernel hält ihn für aus, obwohl er an ist |
-| TRIM | überfällig oder mehr als 2 % der Kapazität ungetrimmt | – |
+| Flush latency avg | 10 ms | 50 ms |
+| Write await avg | 20 ms | 100 ms |
+| IO pressure (PSI io full, avg60) | 10 % | 25 % |
+| CPU pressure (PSI cpu some, avg60) | 20 % | 40 % |
+| Write amplification (24 h) | 5 | 10 |
+| Remaining lifetime | < 2 years | < 1 year |
+| Write cache | off | kernel considers it off although it is on |
+| TRIM | overdue or more than 2 % of the capacity untrimmed | – |
 
-Kurze Hänger innerhalb einer Minute sieht der Latenz-Service nur, wenn sie den Minuten-Schnitt deutlich anheben.
-Für die genaue Analyse mit fsync-Aufrufern bleibt das Skript.
+The latency service only sees short stalls within a minute if they raise the minute average noticeably. For a
+detailed analysis with fsync callers, use the script.
 
-Das Skript erkennt Hänger genauso wie der Dienst: als Ereignisse mit Uhrzeit, SSD, Dauer und Wartezeit, dazu je SSD
-die typische Dauer und den typischen Abstand. Hält eine SSD in festem Takt an (z.B. alle 10 Minuten für 7 Sekunden),
-nennt der Befund das ausdrücklich. Läuft der Dienst, verweist das Skript am Ende auf seine Web-Oberfläche und den
-Bericht über den ganzen Zeitraum.
+The script detects stalls exactly like the service: as events with time, SSD, duration and wait time, plus the
+typical duration and the typical interval per SSD. If an SSD pauses at a fixed rhythm (e.g. every 10 minutes for 7
+seconds), the findings say so explicitly. If the service is running, the script points to its web UI and to the
+report over the whole period at the end.
 
-## Wie wird entschieden?
+## How is it decided?
 
-| Messgröße | Bedeutung |
+| Metric | Meaning |
 |---|---|
-| **Gerätezeit-Anteil** (aktiver Test) | Summe aller Anfragezeiten der SSD (Schreiben und Flush) geteilt durch die Testdauer. Bei QD1 zeigt das, welcher Anteil der Wartezeit auf dem Gerät liegt. ≥ 70 % deutet auf die SSD, ≤ 35 % auf CPU/Software. |
-| **w_await / Flush-Latenz** pro SSD | Die Latenz, die das Gerät selbst liefert. Flush ist das, worauf `fsync` wartet. Richtwerte: gute SATA-SSD < 2 ms, Enterprise-SSD mit PLP < 0,1 ms. |
-| **LANGSAM-Intervalle** | Hohe Latenz bei geringem Durchsatz, also ein echter Einbruch und kein normaler Warteschlangenstau. |
-| **Ausreißer-SSD** | Eine SSD ist deutlich langsamer als die anderen. Dann dieses Laufwerk prüfen (Firmware, Verschleiß, Kabel). |
-| **Wechselnde Stalls** | Mal hängt die eine SSD, mal die andere, während die übrigen im selben Moment schnell antworten. Das Gerät hält intern an (Garbage Collection, Firmware). Ein einzelner Defekt ist das nicht, eher ein Modell- oder Lastproblem. Im mdadm-RAID wartet jedes `fsync` auf alle Mitglieder, darum bremst jeder Stall einer einzelnen SSD das ganze Array. |
-| **Schreibverstärkung (WAF)** | Bei SanDisk/WD-SSDs berechnet aus SMART 233 (NAND-GiB) und 241 (Host-GiB), bei Samsung-SSDs mit NAND-Zähler (z.B. SM883/PM883) aus 251 und 241 (NAND- und Host-LBAs), bei Crucial/Micron aus 247/248 (Host- und FTL-Pages). Normal sind etwa 1–3. Werte ab 5 bedeuten, dass die SSD intern ein Vielfaches neu schreibt. Typisch ist das für viele kleine `fsync`-Schreibzugriffe auf Consumer-SSDs ohne PLP. Folgen sind Dauer-Garbage-Collection, Latenzspitzen und schneller Verschleiß. |
-| **TRIM-Zeitplan** | Bei ext4 meldet jeder `fstrim`-Lauf ungefähr, wie viel seit dem letzten Lauf gelöscht wurde (der erste Lauf nach einem Neustart zählt nicht). Daraus rechnet das Skript, wie viel gelöschter, aber noch nicht getrimmter Platz bis zum nächsten Lauf auflaufen kann. Ab etwa 2 % der Kapazität empfiehlt es tägliches TRIM: Für die SSD ist dieser Platz bis dahin belegt, und Consumer-SSDs haben nur ~7 % Reserve. |
-| **Verschleiß / Restlaufzeit** | Verschleiß in % (ATA Device Statistics, NVMe „Percentage Used“ oder herstellerspezifisch). Die Restlaufzeit rechnet das Skript zweimal: mit dem Durchschnitt der bisherigen Laufzeit und, ab dem zweiten Lauf, mit dem aktuellen Tempo seit dem letzten Messpunkt (aus der NAND-Schreibmenge, bei SanDisk/WD, Samsung und Crucial/Micron). Unter zwei Jahren gibt es einen Hinweis, unter einem Jahr eine Warnung. |
-| **Spiegelgruppen** (mdadm RAID10) | Welche SSDs immer dieselben Schreibzugriffe bekommen. Sie verschleißen gleich schnell und halten oft auch gleichzeitig für die Garbage Collection an. |
-| **RAID-Einrichtung** (mdadm) | Fehlt die Write-Intent-Bitmap, muss das ganze RAID nach jedem Absturz neu synchronisiert werden (Abhilfe: `mdadm --grow --bitmap=internal`). Fehlt das Array in `mdadm.conf`, setzt es das initramfs womöglich unter anderem Namen zusammen. Liegen bei RAID10 die beiden mit Abstand ältesten SSDs (Betriebsstunden) in derselben Spiegelgruppe, gibt es einen Hinweis. Als Tipp: Reichen die RAID-Partitionen bis ans Ende der Laufwerke, muss eine Ersatz-SSD mindestens genauso viele Sektoren haben. |
-| **ext4** | Verhalten bei Fehlern: Bei „Continue“ schreibt ext4 trotz beschädigter Verwaltungsdaten weiter, empfohlen ist `tune2fs -e remount-ro`. Die Reserve für root (Standard 5 %) bringt wenig, wenn die Dienste ohnehin als root laufen (Tipp: `tune2fs -m 1`). Auf Software-RAID prüft das Skript, ob `stride` und `stripe-width` zum Chunk passen. |
-| **Boot bei RAID als `/`** | Hat jedes Laufwerk des RAID eine EFI-Partition? Steht bei `/boot/efi` in der fstab `nofail`, damit der Server auch ohne dieses Laufwerk normal startet? Hält GRUB bei Updates alle EFI-Partitionen aktuell (`grub-efi/install_devices`, Abhilfe: `dpkg-reconfigure grub-efi-amd64`)? |
-| **Swap** | Liegt viel im Swap, obwohl genug RAM frei ist, muss der Kernel ausgelagerte Programmteile beim nächsten Zugriff von der Platte lesen (Seitenfehler). Fällt das in einen Hänger der SSD, wartet das Programm. Abhilfe: `swapoff -a && swapon -a`, seltener auslagern mit `vm.swappiness=10`. |
-| **Schreibcache** | Zeigt den Zustand im Laufwerk (`hdparm -W`), beim Start (erste Kernel-Meldung, bevor udev-Regeln greifen) und die SCT-Einstellung. Ist der Cache aus, geht jeder Schreibzugriff direkt in den Flash. Hält der Kernel ihn für aus, obwohl er an ist, schickt er keine Flushes, und bei Stromausfall droht Datenverlust. |
-| **Kern ≥ 95 % / PSI cpu** | Ein einzelner Thread ist der Engpass, oder Prozesse warten auf CPU-Zeit. |
-| **Top-Prozesse** | `md0_raid5`/`md0_raid6` steht für die RAID-Paritätsberechnung, `kcryptd`/`dmcrypt_write` für LUKS, `z_wr_*` für ZFS, `md0_resync` für einen laufenden RAID-Check. |
-| **iowait** | Das ist **keine** CPU-Last. Die CPU wartet auf IO. |
+| **Device time share** (active test) | Sum of all request times of the SSD (writes and flushes) divided by the test duration. At QD1 this shows which share of the wait time lies on the device. ≥ 70 % points to the SSD, ≤ 35 % to CPU/software. |
+| **w_await / flush latency** per SSD | The latency the device itself delivers. Flush is what `fsync` waits for. Guide values: good SATA SSD < 2 ms, enterprise SSD with PLP < 0.1 ms. |
+| **SLOW intervals** | High latency at low throughput, i.e. a real drop and not a normal queue backlog. |
+| **Outlier SSD** | One SSD is much slower than the others. Then check this drive (firmware, wear, cable). |
+| **Alternating stalls** | Sometimes one SSD stalls, sometimes another, while the others respond quickly at the same moment. The device pauses internally (garbage collection, firmware). This is not a single defect but rather a model or load problem. In an mdadm RAID every `fsync` waits for all members, so every stall of a single SSD slows down the whole array. |
+| **Write amplification (WAF)** | For SanDisk/WD SSDs calculated from SMART 233 (NAND GiB) and 241 (host GiB), for Samsung SSDs with a NAND counter (e.g. SM883/PM883) from 251 and 241 (NAND and host LBAs), for Crucial/Micron from 247/248 (host and FTL pages). About 1–3 is normal. Values from 5 mean that the SSD internally rewrites a multiple. This is typical for many small `fsync` writes on consumer SSDs without PLP. The consequences are constant garbage collection, latency spikes and fast wear. |
+| **TRIM schedule** | On ext4 every `fstrim` run reports roughly how much was deleted since the last run (the first run after a reboot does not count). From this the script calculates how much deleted but not yet trimmed space can accumulate until the next run. From about 2 % of the capacity it recommends daily TRIM: until then this space is used for the SSD, and consumer SSDs only have ~7 % spare area. |
+| **Wear / remaining lifetime** | Wear in % (ATA Device Statistics, NVMe "Percentage Used" or vendor-specific). The script calculates the remaining lifetime twice: with the average of the lifetime so far and, from the second run on, with the current rate since the last data point (from the NAND writes, for SanDisk/WD, Samsung and Crucial/Micron). Below two years there is a note, below one year a warning. |
+| **Mirror groups** (mdadm RAID10) | Which SSDs always receive the same writes. They wear out at the same rate and often pause for garbage collection at the same time. |
+| **RAID setup** (mdadm) | Without a write-intent bitmap, the whole RAID has to be resynchronized after every crash (remedy: `mdadm --grow --bitmap=internal`). If the array is missing from `mdadm.conf`, the initramfs may assemble it under a different name. With RAID10, there is a note if the two by far oldest SSDs (power-on hours) are in the same mirror group. As a tip: if the RAID partitions reach up to the end of the drives, a replacement SSD needs at least as many sectors. |
+| **ext4** | Behavior on errors: with "Continue" ext4 keeps writing despite damaged metadata, `tune2fs -e remount-ro` is recommended. The reserve for root (default 5 %) is of little use if the services run as root anyway (tip: `tune2fs -m 1`). On software RAID the script checks whether `stride` and `stripe-width` match the chunk. |
+| **Boot with RAID as `/`** | Does every drive of the RAID have an EFI partition? Does `/boot/efi` have `nofail` in the fstab, so the server also boots normally without this drive? Does GRUB keep all EFI partitions up to date on updates (`grub-efi/install_devices`, remedy: `dpkg-reconfigure grub-efi-amd64`)? |
+| **Swap** | If a lot is in swap although enough RAM is free, the kernel has to read swapped-out program parts back from disk on the next access (page faults). If that coincides with an SSD stall, the program waits. Remedy: `swapoff -a && swapon -a`, swap less often with `vm.swappiness=10`. |
+| **Write cache** | Shows the state in the drive (`hdparm -W`), at boot (first kernel message, before udev rules apply) and the SCT setting. If the cache is off, every write goes straight to flash. If the kernel considers it off although it is on, it sends no flushes, and data loss is possible on power failure. |
+| **Core ≥ 95 % / PSI cpu** | A single thread is the bottleneck, or processes wait for CPU time. |
+| **Top processes** | `md0_raid5`/`md0_raid6` stands for the RAID parity calculation, `kcryptd`/`dmcrypt_write` for LUKS, `z_wr_*` for ZFS, `md0_resync` for a running RAID check. |
+| **iowait** | This is **not** CPU load. The CPU waits for IO. |
 
-## Typische Ursachen und Maßnahmen
+## Typical causes and remedies
 
-- **mdadm RAID5/6**: Kleine Schreibzugriffe brauchen ein Read-Modify-Write, und die Paritätsberechnung läuft in
-  nur einem Kernel-Thread. `stripe_cache_size` erhöhen. Für Sync-lastige Workloads ist RAID10 deutlich
-  schneller.
-- **RAID-Check**: Ubuntu startet `checkarray` jeden ersten Sonntag im Monat (`/etc/cron.d/mdadm`). In dieser
-  Zeit sind Schreibzugriffe deutlich langsamer.
-- **SATA ALPM** (`med_power_with_dipm`, `min_power`): Den Link wieder auf
-  `echo max_performance > /sys/class/scsi_host/hostX/link_power_management_policy` stellen. Diese Einstellung
-  setzen oft TLP oder `powertop --auto-tune`.
-- **Hohe Flush-Latenz**: Consumer-SSDs ohne Power-Loss-Protection. Bei ZFS hilft `sync=standard`
-  (nicht `always`). Für Datenbanken sind Enterprise-SSDs mit PLP sinnvoll.
-- **Einbruch bei Dauerlast**: Die SSD ist eine QLC- oder DRAM-lose SSD, oder TRIM fehlt.
-  `systemctl enable --now fstrim.timer` aktivieren. Wird viel gelöscht (Backups, NVR-Aufnahmen), täglich statt
-  wöchentlich trimmen: `systemctl edit fstrim.timer`, dort `[Timer]`, `OnCalendar=` und `OnCalendar=daily`. Bei mdadm muss TRIM durch alle Schichten durchgereicht
-  werden (`lsblk --discard`).
-- **Hohe Schreibverstärkung**: Ursache sind viele kleine Sync-Schreibzugriffe (Datenbanken, NVR wie Frigate,
-  Logs). Abhilfe: die Sync-Last verringern (z.B. Aufnahmen auf eigene Disks, Datenbank-`fsync`-Einstellungen
-  prüfen), Over-Provisioning (10–20 % unpartitioniert lassen) oder Enterprise-SSDs mit PLP verwenden. Die bestätigen
-  einen Flush sofort aus dem geschützten Cache.
-- **Datenbanken (MySQL/MariaDB)**: Die Standardwerte sichern jeden Commit doppelt per `fsync` (Redo-Log und
-  Binlog). Ohne Replikation braucht man das Binlog nicht (`disable-log-bin`). Mit
-  `innodb_flush_log_at_trx_commit = 2` gehen bei Stromausfall höchstens ~1 s Transaktionen verloren, die Datenbank
-  bleibt konsistent. Ein größerer `innodb_buffer_pool_size` und ein kleinerer `innodb_io_capacity` (MySQL 8.4:
-  Standard 10000) lassen InnoDB Änderungen sammeln, statt jede Seite sofort zurückzuschreiben.
-- **Schreibcache aus**: Der Schalter (`hdparm -W1`) ist laut ATA-Standard nicht dauerhaft. Kommt das Laufwerk beim
-  Start ohne Cache hoch (BIOS oder Firmware), lässt er sich bei vielen Laufwerken über SCT Feature Control dauerhaft
-  im Laufwerk einschalten: `smartctl -s wcache-sct,on,p /dev/sdX`. Danach einen Kaltstart machen und mit
-  `journalctl -k -b | grep -i 'write cache'` prüfen. Zurück: `smartctl -s wcache-sct,ata,p /dev/sdX`. Ohne SCT bleibt
-  nur, den Cache bei jedem Start per udev-Regel mit `hdparm -W1` einzuschalten.
-- **CRC-Fehler / ATA-Resets im dmesg**: Kabel, Backplane oder Port prüfen.
-- **Großer Dirty-Puffer**: Viele GB RAM mit `vm.dirty_ratio=20` bauen große Writeback-Stöße auf. Ein kleinerer
-  `vm.dirty_bytes`-Wert glättet sie.
+- **mdadm RAID5/6**: small writes need a read-modify-write, and the parity calculation runs in a single kernel
+  thread. Increase `stripe_cache_size`. For sync-heavy workloads RAID10 is much faster.
+- **RAID check**: Ubuntu starts `checkarray` on the first Sunday of every month (`/etc/cron.d/mdadm`). During this
+  time writes are much slower.
+- **SATA ALPM** (`med_power_with_dipm`, `min_power`): set the link back with
+  `echo max_performance > /sys/class/scsi_host/hostX/link_power_management_policy`. This setting is often made by
+  TLP or `powertop --auto-tune`.
+- **High flush latency**: consumer SSDs without power loss protection. With ZFS `sync=standard` helps (not
+  `always`). For databases, enterprise SSDs with PLP make sense.
+- **Drop under sustained load**: the SSD is a QLC or DRAM-less SSD, or TRIM is missing. Enable
+  `systemctl enable --now fstrim.timer`. If a lot is deleted (backups, NVR recordings), trim daily instead of
+  weekly: `systemctl edit fstrim.timer`, there `[Timer]`, `OnCalendar=` and `OnCalendar=daily`. With mdadm, TRIM has
+  to be passed through all layers (`lsblk --discard`).
+- **High write amplification**: caused by many small sync writes (databases, NVRs like Frigate, logs). Remedy:
+  reduce the sync load (e.g. recordings on separate disks, check the database `fsync` settings), over-provisioning
+  (leave 10–20 % unpartitioned) or use enterprise SSDs with PLP. They acknowledge a flush immediately from the
+  protected cache.
+- **Databases (MySQL/MariaDB)**: the defaults secure every commit twice via `fsync` (redo log and binlog). Without
+  replication you do not need the binlog (`disable-log-bin`). With `innodb_flush_log_at_trx_commit = 2` at most ~1 s
+  of transactions is lost on power failure, the database stays consistent. A larger `innodb_buffer_pool_size` and a
+  smaller `innodb_io_capacity` (MySQL 8.4: default 10000) let InnoDB collect changes instead of writing back every
+  page immediately.
+- **Write cache off**: according to the ATA standard the switch (`hdparm -W1`) is not permanent. If the drive comes
+  up without cache at boot (BIOS or firmware), many drives allow enabling it permanently in the drive via SCT
+  Feature Control: `smartctl -s wcache-sct,on,p /dev/sdX`. Then do a cold boot and check with
+  `journalctl -k -b | grep -i 'write cache'`. To revert: `smartctl -s wcache-sct,ata,p /dev/sdX`. Without SCT the
+  only option is to enable the cache at every boot with a udev rule running `hdparm -W1`.
+- **CRC errors / ATA resets in dmesg**: check cable, backplane or port.
+- **Large dirty buffer**: many GB of RAM with `vm.dirty_ratio=20` build up large writeback bursts. A smaller
+  `vm.dirty_bytes` value smooths them.
 
-Für ZFS zeigt parallel `zpool iostat -vl 1`, ob Zeit in den Warteschlangen (`syncq_wait`/`asyncq_wait`) oder
-auf der Disk (`disk_wait`) verbracht wird.
+For ZFS, `zpool iostat -vl 1` shows in parallel whether time is spent in the queues (`syncq_wait`/`asyncq_wait`)
+or on the disk (`disk_wait`).

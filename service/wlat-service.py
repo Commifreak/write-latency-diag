@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 #
-# write-latency-diag Dienst
+# write-latency-diag service
 #
-# Zeichnet dauerhaft Schreiblatenz, Flushes, Hänger, Schreiber, fsync-Wartezeiten und SMART-Werte
-# auf (SQLite) und zeigt sie auf einer Web-Oberfläche an (nur lesend, ohne Login, gedacht fürs LAN).
+# Continuously records write latency, flushes, stalls, writers, fsync wait times and SMART values
+# (SQLite) and shows them on a web UI (read-only, no login, meant for the LAN).
 #
-# Nur Python-Standardbibliothek. Optional: bpftrace (fsync-Aufrufer), smartctl, hdparm.
-# Konfiguration: /etc/write-latency-diag.conf (Schlüssel = Wert), siehe DEFAULTS.
+# Python standard library only. Optional: bpftrace (fsync callers), smartctl, hdparm.
+# Configuration: /etc/write-latency-diag.conf (key = value), see DEFAULTS.
 #
 
 import glob
@@ -24,17 +24,17 @@ from collections import defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.6"
+VERSION = "1.7"
 CONF_FILE = os.environ.get("WLAT_CONF", "/etc/write-latency-diag.conf")
 DEFAULTS = {
     "bind": "0.0.0.0",
     "port": "81",
     "db": "/var/lib/write-latency-diag/metrics.db",
     "devices": r"^(sd[a-z]+|nvme[0-9]+n[0-9]+|vd[a-z]+|xvd[a-z]+)$",
-    "stall_ms": "100",           # ab dieser Wartezeit zählt eine Sekunde als Hänger
-    "felt_ms": "1000",           # spürbar: ab dieser Wartezeit (oder Hänger ab 2 s Dauer)
-    "keep_5s_days": "7",         # 5-Sekunden-Werte
-    "keep_1m_days": "90",        # Minutenwerte, fsync-Statistik
+    "stall_ms": "100",           # from this wait time on a second counts as a stall
+    "felt_ms": "1000",           # noticeable: from this wait time on (or stalls lasting 2 s or more)
+    "keep_5s_days": "7",         # 5-second values
+    "keep_1m_days": "90",        # minute values, fsync statistics
     "keep_events_days": "365",
     "smart_interval": "1800",
     "bpftrace": "1",
@@ -43,8 +43,8 @@ DEFAULTS = {
 }
 
 STOP = threading.Event()
-RESTART = threading.Event()   # nach einem Update: beenden, systemd startet neu
-INFO = {"started": time.time(), "bpftrace": "aus", "update": ""}
+RESTART = threading.Event()   # after an update: exit, systemd restarts the service
+INFO = {"started": time.time(), "bpftrace": "off", "update": ""}
 
 
 def log(msg):
@@ -81,7 +81,7 @@ def run(cmd, timeout=30):
 
 
 # ---------------------------------------------------------------------------
-# Datenbank
+# Database
 # ---------------------------------------------------------------------------
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS disk (res INTEGER, ts INTEGER, dev TEXT, w_iops REAL, w_mbs REAL, w_await REAL,
@@ -106,14 +106,14 @@ CREATE TABLE IF NOT EXISTS smart_runs (start REAL, end REAL);
 
 def db_connect(path):
     con = sqlite3.connect(path, timeout=30, check_same_thread=False)
-    # WAL + synchronous=NORMAL: Der Dienst soll selbst kaum fsyncs erzeugen (nur bei Checkpoints)
+    # WAL + synchronous=NORMAL: the service itself should cause hardly any fsyncs (only at checkpoints)
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA synchronous=NORMAL")
     return con
 
 
 class Store:
-    """Schreibt gesammelte Werte gebündelt einmal pro Minute in die Datenbank."""
+    """Writes collected values to the database in one batch per minute."""
 
     def __init__(self, path):
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -121,8 +121,8 @@ class Store:
         self.con = db_connect(path)
         self.con.executescript(SCHEMA)
         self.con.commit()
-        self.lock = threading.Lock()     # schützt pending
-        self.dblock = threading.Lock()   # eine Verbindung, mehrere Threads: Schreiben nacheinander
+        self.lock = threading.Lock()     # protects pending
+        self.dblock = threading.Lock()   # one connection, several threads: write one after another
         self.pending = []   # (sql, params)
 
     def add(self, sql, params):
@@ -140,7 +140,7 @@ class Store:
                     for sql, params in items:
                         self.con.execute(sql, params)
             except sqlite3.Error as e:
-                log(f"Datenbankfehler: {e}")
+                log(f"Database error: {e}")
 
     def kv_set(self, k, v):
         self.add("INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)", (k, json.dumps(v)))
@@ -163,11 +163,11 @@ class Store:
                 self.con.execute("DELETE FROM events WHERE start < ?", (now - de,))
             self.con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         except sqlite3.Error as e:
-            log(f"Aufräumen fehlgeschlagen: {e}")
+            log(f"Cleanup failed: {e}")
 
 
 # ---------------------------------------------------------------------------
-# Laufwerke und System
+# Drives and system
 # ---------------------------------------------------------------------------
 def devices(regex):
     out = {}
@@ -196,7 +196,7 @@ def diskstats(names):
             continue
         v = [int(x) for x in p[3:]]
         fl, ft = (v[15], v[16]) if len(v) >= 17 else (0, 0)
-        # Anfragen/Sektoren/ms für Lesen und Schreiben, laufende Anfragen, io_ticks, Flushes
+        # Requests/sectors/ms for reads and writes, requests in flight, io_ticks, flushes
         res[p[2]] = (v[0], v[2], v[3], v[4], v[6], v[7], v[8], v[9], fl, ft)
     return res
 
@@ -208,7 +208,7 @@ def cpustat():
             break
         p = line.split()
         vals = [int(x) for x in p[1:9]]
-        cpus[p[0]] = (sum(vals), vals[3], vals[4])   # gesamt, idle, iowait
+        cpus[p[0]] = (sum(vals), vals[3], vals[4])   # total, idle, iowait
     return cpus
 
 
@@ -230,9 +230,9 @@ def norm_comm(c):
 
 
 class ProcWriters:
-    """Netto-Schreibmenge je Prozessname (write_bytes - cancelled_write_bytes) aus /proc/<pid>/io.
-    Endet ein Prozess, rechnet der Kernel seine Menge dem abräumenden Elternprozess zu - was beim Kind
-    schon gezählt wurde, wird dort wieder abgezogen."""
+    """Net bytes written per process name (write_bytes - cancelled_write_bytes) from /proc/<pid>/io.
+    When a process exits, the kernel adds its amount to the parent that reaps it - what was already
+    counted for the child is subtracted there again."""
 
     def __init__(self):
         self.prev, self.first, self.cred = {}, {}, defaultdict(int)
@@ -288,7 +288,7 @@ def top(d, n, scale=1.0):
 
 
 # ---------------------------------------------------------------------------
-# Sammler: jede Sekunde Laufwerke (für Hänger), alle 5 s eine Zeile, jede Minute eine Minutenzeile
+# Collector: drives every second (for stalls), a row every 5 s, a minute row every minute
 # ---------------------------------------------------------------------------
 class Collector(threading.Thread):
     def __init__(self, conf, store, fsync):
@@ -297,9 +297,9 @@ class Collector(threading.Thread):
         self.stall = float(conf["stall_ms"])
         self.devs = devices(conf["devices"])
         self.writers = ProcWriters()
-        self.live = {}            # letzte 5-s-Werte für die Statusseite
-        self.open_ev = {}         # dev -> laufender Hänger
-        self.closing = []         # beendete Hänger, warten noch auf fsync-Meldungen
+        self.live = {}            # latest 5-s values for the status page
+        self.open_ev = {}         # dev -> ongoing stall
+        self.closing = []         # finished stalls, still waiting for fsync reports
         self.recent_writers = []  # (ts, {comm: bytes/s})
 
     def run(self):
@@ -336,7 +336,7 @@ class Collector(threading.Thread):
                 w["wa_max"] = max(w["wa_max"], wa)
                 w["fa_max"] = max(w["fa_max"], fa)
                 if not self.devs[d]["rot"] and dt >= 0.5:
-                    # Hänger: langsame Anfragen, oder das Gerät hat Anfragen offen und beendet gar keine
+                    # Stall: slow requests, or the device has requests in flight and completes none
                     slow = (dw and wa >= self.stall) or (df and fa >= self.stall) or \
                            (util >= 90 and inflight > 0 and dr + dw + df == 0)
                     self.track_event(d, now, bool(slow), wa, fa)
@@ -434,7 +434,7 @@ class Collector(threading.Thread):
             self.closing.append(self.open_ev.pop(d))
 
     def finish_events(self, now):
-        # 20 s nach dem Ende abschließen: bis dahin sind die fsync-Meldungen der Wartenden eingetroffen
+        # Close 20 s after the end: by then the fsync reports of the waiting processes have arrived
         keep = []
         for ev in self.closing:
             if now - ev["end"] < 20:
@@ -457,7 +457,7 @@ class Collector(threading.Thread):
 
 
 # ---------------------------------------------------------------------------
-# bpftrace: fsync-Aufrufer (alle 5 min zusammengefasst) und einzelne langsame Aufrufe (>= 100 ms)
+# bpftrace: fsync callers (summarized every 5 min) and single slow calls (>= 100 ms)
 # ---------------------------------------------------------------------------
 BPF = r"""
 tracepoint:syscalls:sys_enter_fsync, tracepoint:syscalls:sys_enter_fdatasync,
@@ -502,29 +502,29 @@ class FsyncTracer(threading.Thread):
     def run(self):
         while not STOP.is_set():
             if not shutil_which("bpftrace"):
-                INFO["bpftrace"] = "nicht installiert (apt install bpftrace)"
+                INFO["bpftrace"] = "not installed (apt install bpftrace)"
                 return
             try:
-                # Fehlerausgabe mitlesen: Neuere bpftrace-Versionen melden "Attached N probes" dort, und eine volle,
-                # ungelesene Pipe würde bpftrace blockieren
+                # Read stderr too: newer bpftrace versions report "Attached N probes" there, and a full,
+                # unread pipe would block bpftrace
                 self.proc = subprocess.Popen(["bpftrace", "-B", "none", "-e", BPF], stdout=subprocess.PIPE,
                                              stderr=subprocess.STDOUT, text=True)
             except OSError as e:
-                INFO["bpftrace"] = f"Start fehlgeschlagen: {e}"
+                INFO["bpftrace"] = f"start failed: {e}"
                 return
             maps = defaultdict(dict)
             t_tick = time.time()
-            err = "beendet"
+            err = "exited"
             for line in self.proc.stdout:
                 line = line.rstrip("\n")
                 if "ERROR" in line and "RLIMIT" not in line:
                     err = line
-                # bpftrace bis 0.20: "Attaching N probes...", neuere Versionen: "Attached N probes"
+                # bpftrace up to 0.20: "Attaching N probes...", newer versions: "Attached N probes"
                 if line.startswith("Attach"):
-                    INFO["bpftrace"] = "läuft"
+                    INFO["bpftrace"] = "running"
                     continue
                 if line.startswith("SLOW|") or line == "TICK":
-                    INFO["bpftrace"] = "läuft"
+                    INFO["bpftrace"] = "running"
                 if line.startswith("SLOW|"):
                     p = line.split("|", 3)
                     if len(p) == 4:
@@ -553,7 +553,7 @@ class FsyncTracer(threading.Thread):
             self.proc.wait()
             if STOP.is_set():
                 return
-            INFO["bpftrace"] = f"Fehler: {err[:200]} - neuer Versuch in 5 min"
+            INFO["bpftrace"] = f"error: {err[:200]} - retrying in 5 min"
             STOP.wait(300)
 
     def stop(self):
@@ -573,7 +573,7 @@ def shutil_which(name):
 
 
 # ---------------------------------------------------------------------------
-# SMART, Schreibcache und TRIM (alle 30 min)
+# SMART, write cache and TRIM (every 30 min)
 # ---------------------------------------------------------------------------
 WDSD = re.compile(r"SanDisk|^SD |SDSSD|WDS[0-9]|WD (Blue|Red|Green)")
 
@@ -591,7 +591,7 @@ def attr(sm, num, col=9):
 
 def smart_sample(store, conf):
     if not shutil_which("smartctl"):
-        store.kv_set("smart", {"error": "smartctl nicht installiert (apt install smartmontools)"})
+        store.kv_set("smart", {"error": "smartctl not installed (apt install smartmontools)"})
         return
     t0 = time.time()
     boot_log = run(["journalctl", "-k", "-b", "-o", "cat"]) or run(["dmesg"])
@@ -634,7 +634,7 @@ def smart_sample(store, conf):
             num, den = attr(sm, 233), attr(sm, 241)
             host, nand = den, 1
         elif re.search(r"SAMSUNG|^MZ", model) and attr(sm, 251) and attr(sm, 241):
-            # Samsung (SM883/PM883 u.ä.): NAND- und Host-Schreibmenge in LBAs, umgerechnet in GiB
+            # Samsung (SM883/PM883 and similar): NAND and host writes in LBAs, converted to GiB
             num, den = round(attr(sm, 251) * 512 / 2 ** 30, 2), round(attr(sm, 241) * 512 / 2 ** 30, 2)
             host, nand = den, 1
         elif "FTL_Program_Page_Count" in sm and attr(sm, 247):
@@ -653,7 +653,7 @@ def smart_sample(store, conf):
         store.add("INSERT INTO smart VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                   (now, d, serial, model, int(info["rot"]), int(info["usb"]), poh, used, num, den, host, nand, temp,
                    attr(sm, 5), attr(sm, 199), wc_drive, wc_kernel, wc_boot, sct))
-    # SMART-/hdparm-Befehle laufen am NCQ-Puffer vorbei: Zeitraum merken, um Hänger in dieser Zeit zu kennzeichnen
+    # SMART/hdparm commands bypass the NCQ queue: remember the time span to mark stalls during it
     store.add("INSERT INTO smart_runs VALUES (?, ?)", (round(t0, 1), round(time.time(), 1)))
     store.kv_set("trim", trim_status())
     store.flush()
@@ -720,19 +720,19 @@ def trim_status():
 
 
 # ---------------------------------------------------------------------------
-# Auswertung für die Statusseite
+# Evaluation for the status page
 # ---------------------------------------------------------------------------
 def fmt_days(x):
     if x >= 730:
-        return f"~{x / 365:.1f} Jahre".replace(".", ",")
+        return f"~{x / 365:.1f} years"
     if x >= 60:
-        return f"~{x / 30.4:.0f} Monate"
-    return f"~{x:.0f} Tage"
+        return f"~{x / 30.4:.0f} months"
+    return f"~{x:.0f} days"
 
 
 def smart_view(con):
-    # Nur Laufwerke aus der letzten SMART-Abfrage: Ausgebaute SSDs (andere Seriennummer) verschwinden aus Anzeige,
-    # Befunden und CheckMK. Ihr Verlauf bleibt in der Datenbank (Schreibverstärkung pro Tag).
+    # Only drives from the latest SMART query: removed SSDs (different serial number) disappear from the view,
+    # findings and CheckMK. Their history stays in the database (write amplification per day).
     rows = con.execute("SELECT * FROM smart WHERE ts = (SELECT MAX(ts) FROM smart s2 WHERE s2.serial = smart.serial) "
                        "AND ts >= (SELECT MAX(ts) FROM smart) - 60 ORDER BY dev").fetchall()
     cols = [c[0] for c in con.execute("SELECT * FROM smart LIMIT 0").description]
@@ -776,62 +776,62 @@ def build_status(con, collector, conf):
         if s["rot"]:
             continue
         if s["wc_drive"] == "1" and s["wc_kernel"] == "write through":
-            add("crit", f"{d}: Kernel hält den Schreibcache für aus und schickt keine Flushes - Datenverlust bei "
-                        f"Stromausfall möglich (echo 1 > /sys/block/{d}/device/rescan).")
+            add("crit", f"{d}: the kernel considers the write cache off and sends no flushes - data loss possible "
+                        f"on power failure (echo 1 > /sys/block/{d}/device/rescan).")
         elif s["wc_drive"] == "0" or (s["sct"] and "force disabled" in s["sct"].lower()):
-            add("warn", f"{d}: Schreibcache aus - langsam und hohe Schreibverstärkung."
-                        + (f" Dauerhaft einschalten: smartctl -s wcache-sct,on,p /dev/{d}" if s["sct"] else ""))
+            add("warn", f"{d}: write cache off - slow, with high write amplification."
+                        + (f" Enable permanently: smartctl -s wcache-sct,on,p /dev/{d}" if s["sct"] else ""))
         elif s["wc_boot"] == "disabled" and not (s["sct"] and "force enabled" in s["sct"].lower()):
-            add("info", f"{d}: Schreibcache ist beim Start aus und wird erst danach eingeschaltet."
-                        + (f" Dauerhaft: smartctl -s wcache-sct,on,p /dev/{d}" if s["sct"] else ""))
+            add("info", f"{d}: write cache is off at boot and only switched on afterwards."
+                        + (f" Permanently: smartctl -s wcache-sct,on,p /dev/{d}" if s["sct"] else ""))
         if s["waf_24h"] is not None:
             lvl = "crit" if s["waf_24h"] >= 10 else "warn" if s["waf_24h"] >= 5 else None
             if lvl:
-                add(lvl, f"{d}: Schreibverstärkung {str(s['waf_24h']).replace('.', ',')} in den letzten {s.get('window_h')} h - viele kleine "
-                         f"Sync-Schreibzugriffe/Flushes auf einer SSD ohne Power-Loss-Protection.")
+                add(lvl, f"{d}: write amplification {s['waf_24h']} over the last {s.get('window_h')} h - many small "
+                         f"sync writes/flushes on an SSD without power loss protection.")
         rem = s["remaining_days"] if s["remaining_days"] is not None else s["remaining_lifetime_days"]
         if rem is not None and rem < 730:
-            add("crit" if rem < 365 else "warn", f"{d}: Restlaufzeit bei aktuellem Tempo {fmt_days(rem)}.")
+            add("crit" if rem < 365 else "warn", f"{d}: remaining lifetime at the current rate {fmt_days(rem)}.")
         if s["realloc"]:
-            add("info", f"{d}: {s['realloc']} reallokierte Sektoren.")
+            add("info", f"{d}: {s['realloc']} reallocated sectors.")
         if s["crc"]:
-            add("warn", f"{d}: {s['crc']} CRC-Fehler (Kabel/Backplane/Port prüfen).")
+            add("warn", f"{d}: {s['crc']} CRC errors (check cable/backplane/port).")
 
     ev24 = con.execute("SELECT COUNT(*), SUM(end - start), MAX(MAX(max_w, max_f)) FROM events WHERE start > ?",
                        (now - 86400,)).fetchone()
     long24 = con.execute("SELECT COUNT(*) FROM events WHERE start > ? AND (end - start >= 2 OR MAX(max_w, max_f) >= 1000)",
                          (now - 86400,)).fetchone()[0]
-    # Wie viel der letzten 24 h ist überhaupt aufgezeichnet? (Dienst neu, oder nach Pause)
+    # How much of the last 24 h has been recorded at all? (new service, or after a pause)
     first = con.execute("SELECT MIN(ts) FROM disk WHERE res = 5 AND ts > ?", (now - 86400,)).fetchone()[0] or now
     up = now - first
-    since = "in den letzten 24 h" if up >= 82800 else \
-        f"seit Beginn der Aufzeichnung vor {up / 3600:.0f} h" if up >= 3600 else \
-        f"seit Beginn der Aufzeichnung vor {up / 60:.0f} min"
-    hours = min(24.0, max(up / 3600, 1.0))   # Raten erst ab einer Stunde sinnvoll
+    since = "in the last 24 h" if up >= 82800 else \
+        f"since recording started {up / 3600:.0f} h ago" if up >= 3600 else \
+        f"since recording started {up / 60:.0f} min ago"
+    hours = min(24.0, max(up / 3600, 1.0))   # rates only make sense after an hour
     if long24:
-        add("crit" if long24 / hours >= 1 else "warn", f"{long24} lange Hänger (≥ 2 s oder ≥ 1 s Wartezeit) {since}.")
+        add("crit" if long24 / hours >= 1 else "warn", f"{long24} long stalls (≥ 2 s or ≥ 1 s wait time) {since}.")
     elif ev24[0] and ev24[0] / hours >= 5:
-        add("warn", f"{ev24[0]} kurze Hänger {since} ({ev24[0] / hours:.0f} pro Stunde).")
+        add("warn", f"{ev24[0]} short stalls {since} ({ev24[0] / hours:.0f} per hour).")
 
     trim = json.loads((con.execute("SELECT v FROM kv WHERE k = 'trim'").fetchone() or ["{}"])[0])
     if trim.get("enabled") is False:
-        add("warn", "fstrim.timer ist nicht aktiv: systemctl enable --now fstrim.timer")
+        add("warn", "fstrim.timer is not active: systemctl enable --now fstrim.timer")
     for m in trim.get("mounts", []):
         if trim.get("period", 7) > 1 and m.get("untrimmed_pct", 0) >= 2:
-            add("warn", f"TRIM {m['mount']}: bis zum nächsten Lauf bis zu {str(m['untrimmed_pct']).replace('.', ',')} % der "
-                        f"Kapazität ungetrimmt ({str(m['deleted_gib_day']).replace('.', ',')} GiB/Tag gelöscht) - täglich trimmen: systemctl edit "
-                        f"fstrim.timer, [Timer] OnCalendar= und OnCalendar=daily")
+            add("warn", f"TRIM {m['mount']}: up to {m['untrimmed_pct']} % of the capacity untrimmed until the next "
+                        f"run ({m['deleted_gib_day']} GiB/day deleted) - trim daily: systemctl edit "
+                        f"fstrim.timer, [Timer] OnCalendar= and OnCalendar=daily")
         if m.get("last") and now - m["last"] > (trim.get("period", 7) + 1) * 86400:
-            add("warn", f"TRIM {m['mount']}: letzter Lauf vor {(now - m['last']) / 86400:.0f} Tagen.")
+            add("warn", f"TRIM {m['mount']}: last run {(now - m['last']) / 86400:.0f} days ago.")
 
     psi1h = con.execute("SELECT AVG(psi_io_full), AVG(psi_cpu) FROM sys WHERE res = 60 AND ts > ?",
                         (now - 3600,)).fetchone()
     if psi1h[0] and psi1h[0] >= 10:
-        add("warn", f"IO-Druck: Prozesse waren in der letzten Stunde zu {psi1h[0]:.0f} % komplett durch IO blockiert.")
+        add("warn", f"IO pressure: processes were fully blocked by IO {psi1h[0]:.0f} % of the last hour.")
     if psi1h[1] and psi1h[1] >= 20:
-        add("warn", f"CPU-Druck: Prozesse warteten in der letzten Stunde zu {psi1h[1]:.0f} % auf CPU-Zeit.")
+        add("warn", f"CPU pressure: processes waited for CPU time {psi1h[1]:.0f} % of the last hour.")
     if not any(f["level"] in ("warn", "crit") for f in findings):
-        add("ok", "Keine Auffälligkeiten.")
+        add("ok", "No issues.")
     order = {"crit": 0, "warn": 1, "info": 2, "ok": 3}
     findings.sort(key=lambda f: order[f["level"]])
 
@@ -880,8 +880,8 @@ def event_dict(r):
 
 
 def felt(con, rng, felt_ms):
-    """Hänger in echten Sekunden, so wie Benutzer sie merken: Geräte-Hänger ab felt_ms Wartezeit oder 2 s Dauer,
-    und Anwendungen, die einzeln ab felt_ms auf ein fsync gewartet haben."""
+    """Stalls in real seconds, the way users notice them: device stalls from felt_ms wait time or 2 s duration,
+    and applications that individually waited felt_ms or more for an fsync."""
     now = time.time()
     out = {"felt_ms": felt_ms, "windows": {}}
     for name, secs in (("1h", 3600), ("24h", 86400), ("7d", 604800)):
@@ -965,14 +965,14 @@ def smart_history(con):
 
 
 # ---------------------------------------------------------------------------
-# Textbericht zum Kopieren (z.B. für eine Auswertung im Chat)
+# Text report to copy (e.g. for an analysis in a chat)
 # ---------------------------------------------------------------------------
-def de(v, nd=1):
-    return f"{v:.{nd}f}".replace(".", ",")
+def num(v, nd=1):
+    return f"{v:.{nd}f}"
 
 
 def secs_txt(v):
-    return f"{de(v, 1)} s" if v < 10 else f"{v:.0f} s"
+    return f"{num(v, 1)} s" if v < 10 else f"{v:.0f} s"
 
 
 def ms_txt(v):
@@ -984,38 +984,38 @@ def report(con, collector, conf):
     st = build_status(con, collector, conf)
     fe = felt(con, "7d", float(conf["felt_ms"]))
     fs = fsync_stats(con, "24h")
-    ts = lambda t: time.strftime("%d.%m. %H:%M:%S", time.localtime(t))   # noqa: E731
+    ts = lambda t: time.strftime("%m-%d %H:%M:%S", time.localtime(t))   # noqa: E731
     first = con.execute("SELECT MIN(ts) FROM disk WHERE res = 5").fetchone()[0] or \
         con.execute("SELECT MIN(ts) FROM disk").fetchone()[0] or now
-    L = [f"write-latency-diag Bericht - {st['host']} - {time.strftime('%Y-%m-%d %H:%M')} - Dienst {VERSION}, "
+    L = [f"write-latency-diag report - {st['host']} - {time.strftime('%Y-%m-%d %H:%M')} - service {VERSION}, "
          f"bpftrace {st['bpftrace']}",
-         f"Aufzeichnung seit {ts(first)} ({de((now - first) / 3600)} h), Dienst läuft seit {ts(st['started'])}",
-         "", "BEFUND"]
-    names = {"crit": "KRITISCH", "warn": "PRÜFEN", "info": "HINWEIS", "ok": "OK"}
+         f"Recording since {ts(first)} ({num((now - first) / 3600)} h), service running since {ts(st['started'])}",
+         "", "FINDINGS"]
+    names = {"crit": "CRITICAL", "warn": "CHECK", "info": "NOTE", "ok": "OK"}
     L += [f"  [{names[f['level']]}] {f['text']}" for f in st["findings"]]
 
-    L += ["", f"SPÜRBARE HÄNGER (ab {secs_txt(fe['felt_ms'] / 1000)} Wartezeit oder 2 s Dauer)",
-          "  Zeitraum   Anzahl  zusammen  längster | App ≥1s  zusammen  längste Wartezeit"]
+    L += ["", f"NOTICEABLE STALLS (from {secs_txt(fe['felt_ms'] / 1000)} wait time or 2 s duration)",
+          "  Period     Count     total   longest | App ≥1s     total  longest wait"]
     for k, w in fe["windows"].items():
         L.append(f"  {k:<9} {w['n']:>6}  {secs_txt(w['secs']):>8}  {secs_txt(w['longest']):>8} | {w['app_n']:>7}  "
                  f"{secs_txt(w['app_secs']):>8}  {secs_txt(w['app_max'])}" + (f" ({w['app_who']})" if w["app_who"] else ""))
-    L += ["", "SPÜRBARE HÄNGER EINZELN (neueste zuerst, max. 25)"]
+    L += ["", "NOTICEABLE STALLS, SINGLE (newest first, max. 25)"]
     if not fe["list"]:
-        L.append("  keine")
+        L.append("  none")
     for e in fe["list"][:25]:
         wt = ", ".join(f"{n} {ms_txt(v)}" for n, v in e["waiters"][:4]) or "-"
-        wr = ", ".join(f"{n} {de(v, 2)}" for n, v in e["writers"][:3] if v >= 0.01) or "-"
-        L.append(f"  {ts(e['start'])}  {e['dev']:<6} {secs_txt(e['dur']):>6}  Gerät max {ms_txt(max(e['max_w'], e['max_f'])):>6}"
-                 f"  wartete: {wt}  |  schrieb (MB/s): {wr}" + ("  [während SMART-Abfrage]" if e["smart"] else ""))
+        wr = ", ".join(f"{n} {num(v, 2)}" for n, v in e["writers"][:3] if v >= 0.01) or "-"
+        L.append(f"  {ts(e['start'])}  {e['dev']:<6} {secs_txt(e['dur']):>6}  device max {ms_txt(max(e['max_w'], e['max_f'])):>6}"
+                 f"  waited: {wt}  |  wrote (MB/s): {wr}" + ("  [during SMART query]" if e["smart"] else ""))
 
-    L += ["", "HÄNGER PRO STUNDE (letzte 24 h): alle ab Schwelle / spürbar / spürbare Sekunden"]
+    L += ["", "STALLS PER HOUR (last 24 h): all above threshold / noticeable / noticeable seconds"]
     rows = con.execute(f"SELECT CAST(start / 3600 AS INTEGER) * 3600 h, COUNT(*), SUM({FELT_EV}), "
                        f"SUM(CASE WHEN {FELT_EV} THEN end - start ELSE 0 END) FROM events WHERE start > ? "
                        f"GROUP BY h ORDER BY h", (float(conf["felt_ms"]), float(conf["felt_ms"]), now - 86400)).fetchall()
-    L += [f"  {time.strftime('%d.%m. %H:00', time.localtime(h))}  {n:>4} / {f or 0:>3} / {secs_txt(s or 0)}"
-          for h, n, f, s in rows] or ["  keine"]
+    L += [f"  {time.strftime('%m-%d %H:00', time.localtime(h))}  {n:>4} / {f or 0:>3} / {secs_txt(s or 0)}"
+          for h, n, f, s in rows] or ["  none"]
 
-    L += ["", "MUSTER PRO GERÄT (spürbare Hänger, letzte 24 h): Anzahl, typische Dauer, typischer Abstand"]
+    L += ["", "PATTERN PER DEVICE (noticeable stalls, last 24 h): count, typical duration, typical interval"]
     per = defaultdict(list)
     for dev, start, end in con.execute(f"SELECT dev, start, end FROM events WHERE start > ? AND {FELT_EV} ORDER BY start",
                                        (now - 86400, float(conf["felt_ms"]))):
@@ -1024,14 +1024,14 @@ def report(con, collector, conf):
         ev = per[dev]
         durs = sorted(d for _, d in ev)
         gaps = sorted((b[0] - a[0]) / 60 for a, b in zip(ev, ev[1:]))
-        line = f"  {dev:<6} {len(ev):>3}×  Dauer Median {secs_txt(durs[len(durs) // 2])}"
+        line = f"  {dev:<6} {len(ev):>3}×  duration median {secs_txt(durs[len(durs) // 2])}"
         if gaps:
-            line += (f"  Abstand Median {de(gaps[len(gaps) // 2])} min (min {de(gaps[0])}, max {de(gaps[-1])})")
+            line += (f"  interval median {num(gaps[len(gaps) // 2])} min (min {num(gaps[0])}, max {num(gaps[-1])})")
         L.append(line)
     if not per:
-        L.append("  keine")
+        L.append("  none")
 
-    L += ["", "LAUFWERKE"]
+    L += ["", "DRIVES"]
     for s_ in st["smart"]:
         d = s_["dev"]
         parts = [f"  {d:<5} {s_['model'] or '?'}" + (f"  SN {s_['serial']}" if s_["serial"] != d else "")
@@ -1039,18 +1039,18 @@ def report(con, collector, conf):
         if s_["used"] is not None:
             rem = []
             if s_["remaining_days"] is not None:
-                rem.append(f"aktuell {fmt_days(s_['remaining_days'])}")
+                rem.append(f"current {fmt_days(s_['remaining_days'])}")
             if s_["remaining_lifetime_days"] is not None:
-                rem.append(f"Ø {fmt_days(s_['remaining_lifetime_days'])}")
-            parts.append(f"Verschleiß {s_['used']} %" + (f" (Rest {', '.join(rem)})" if rem else ""))
+                rem.append(f"avg {fmt_days(s_['remaining_lifetime_days'])}")
+            parts.append(f"wear {s_['used']} %" + (f" (remaining {', '.join(rem)})" if rem else ""))
         if s_.get("waf_24h") is not None:
-            parts.append(f"WAF {de(s_['waf_24h'])} in {s_.get('window_h')} h (Host {de(s_['host_day'] or 0)} GiB/Tag"
-                         + (f", NAND {s_['nand_day']} GiB/Tag" if s_.get("nand_day") else "") + ")")
+            parts.append(f"WAF {num(s_['waf_24h'])} in {s_.get('window_h')} h (host {num(s_['host_day'] or 0)} GiB/day"
+                         + (f", NAND {s_['nand_day']} GiB/day" if s_.get("nand_day") else "") + ")")
         elif s_.get("waf_total") is not None:
-            parts.append(f"WAF gesamt {de(s_['waf_total'])}")
+            parts.append(f"WAF total {num(s_['waf_total'])}")
         if s_["wc_drive"] or s_["sct"] or s_["wc_boot"]:
-            parts.append(f"Cache {'an' if s_['wc_drive'] == '1' else 'aus' if s_['wc_drive'] == '0' else '?'}"
-                         f"/Start {s_['wc_boot'] or '?'}/SCT {s_['sct'] or '-'}/Kernel {s_['wc_kernel'] or '?'}")
+            parts.append(f"cache {'on' if s_['wc_drive'] == '1' else 'off' if s_['wc_drive'] == '0' else '?'}"
+                         f"/boot {s_['wc_boot'] or '?'}/SCT {s_['sct'] or '-'}/kernel {s_['wc_kernel'] or '?'}")
         extra = [f"{k} {v}" for k, v in (("Temp", s_["temp"]), ("POH", s_["poh"]), ("Realloc", s_["realloc"]),
                                          ("CRC", s_["crc"])) if v is not None]
         if extra:
@@ -1058,42 +1058,42 @@ def report(con, collector, conf):
         L.append("  ".join(parts))
         l5 = st["last5min"].get(d)
         if l5 and (l5["f_rate"] or l5["w_await"] or l5["max"]):
-            L.append(f"        letzte 5 min: Flush Ø {de(l5['f_await'] or 0, 2)} ms bei {de(l5['f_rate'] or 0)}/s, "
-                     f"Write Ø {de(l5['w_await'] or 0, 2)} ms, max. Wartezeit {ms_txt(l5['max'])}, "
-                     f"Auslastung {de(l5['util'] or 0, 0)} %")
+            L.append(f"        last 5 min: flush avg {num(l5['f_await'] or 0, 2)} ms at {num(l5['f_rate'] or 0)}/s, "
+                     f"write avg {num(l5['w_await'] or 0, 2)} ms, max. wait {ms_txt(l5['max'])}, "
+                     f"utilization {num(l5['util'] or 0, 0)} %")
     for d, i in st["devices"].items():
         if not any(x["dev"] == d for x in st["smart"]):
-            L.append(f"  {d:<5} {i['model'] or '?'}  {'HDD' if i['rot'] else 'SSD'}  (noch keine SMART-Daten)")
+            L.append(f"  {d:<5} {i['model'] or '?'}  {'HDD' if i['rot'] else 'SSD'}  (no SMART data yet)")
 
-    L += ["", "FSYNC-AUFRUFER (letzte 24 h)"]
-    L += [f"  {x['name']:<36} {de(x['per_s'], 2):>6}/s  Ø {ms_txt(x['avg_ms']):>7}  max {ms_txt(x['max_ms'])}"
-          for x in fs["fsync"][:15]] or ["  keine Daten"]
-    L += ["", "SCHREIBER NETTO (letzte 24 h, Ø MB/s): " + (", ".join(f"{n} {de(v, 3)}" for n, v in fs["writers"]) or "-")]
+    L += ["", "FSYNC CALLERS (last 24 h)"]
+    L += [f"  {x['name']:<36} {num(x['per_s'], 2):>6}/s  avg {ms_txt(x['avg_ms']):>7}  max {ms_txt(x['max_ms'])}"
+          for x in fs["fsync"][:15]] or ["  no data"]
+    L += ["", "WRITERS NET (last 24 h, avg MB/s): " + (", ".join(f"{n} {num(v, 3)}" for n, v in fs["writers"]) or "-")]
     p1 = con.execute("SELECT AVG(psi_io_full), AVG(psi_io_some), AVG(psi_cpu), AVG(cpu) FROM sys WHERE res = 60 AND ts > ?",
                      (now - 3600,)).fetchone()
     p24 = con.execute("SELECT AVG(psi_io_full), AVG(psi_io_some), AVG(psi_cpu), AVG(cpu) FROM sys WHERE res = 60 AND ts > ?",
                       (now - 86400,)).fetchone()
     for lbl, p in (("1 h", p1), ("24 h", p24)):
         if p[0] is not None:
-            L.append(f"DRUCK {lbl}: IO komplett {de(p[0])} %, IO teilweise {de(p[1])} %, CPU-Wartezeit {de(p[2])} %, "
-                     f"CPU {de(p[3], 0)} %")
+            L.append(f"PRESSURE {lbl}: IO full {num(p[0])} %, IO some {num(p[1])} %, CPU wait {num(p[2])} %, "
+                     f"CPU {num(p[3], 0)} %")
     tr = st["trim"]
     if tr:
-        L.append("TRIM: " + ("Timer aus" if tr.get("enabled") is False else
-                             f"Zeitplan {tr.get('schedule') or '?'}; " + "; ".join(
-                                 f"{m['mount']}: letzter Lauf {ts(m['last']) if m.get('last') else '?'}"
-                                 + (f", {de(m['deleted_gib_day'])} GiB/Tag gelöscht, bis {de(m['untrimmed_pct'])} % ungetrimmt"
+        L.append("TRIM: " + ("timer off" if tr.get("enabled") is False else
+                             f"schedule {tr.get('schedule') or '?'}; " + "; ".join(
+                                 f"{m['mount']}: last run {ts(m['last']) if m.get('last') else '?'}"
+                                 + (f", {num(m['deleted_gib_day'])} GiB/day deleted, up to {num(m['untrimmed_pct'])} % untrimmed"
                                     if "deleted_gib_day" in m else "") for m in tr.get("mounts", []))))
     runs = con.execute("SELECT COUNT(*), AVG(end - start) FROM smart_runs WHERE start > ?", (now - 86400,)).fetchone()
     if runs[0]:
-        L.append(f"SMART-Abfragen (24 h): {runs[0]}, Ø {de(runs[1] or 0)} s")
+        L.append(f"SMART queries (24 h): {runs[0]}, avg {num(runs[1] or 0)} s")
     return "\n".join(L) + "\n"
 
 
 # ---------------------------------------------------------------------------
-# CheckMK: fertige Local-Check-Zeilen. Die Checks in checkmk/ geben diese Ausgabe weiter, wenn der Dienst läuft,
-# damit Web-Oberfläche und CheckMK auf derselben Messung beruhen. Leere Antwort = noch keine Daten
-# (die Checks messen dann selbst). Service-Namen und Schwellwerte wie in den Checks.
+# CheckMK: ready-made local check lines. The checks in checkmk/ pass this output on when the service is running,
+# so that the web UI and CheckMK rely on the same measurement. Empty response = no data yet
+# (the checks then measure themselves). Service names and thresholds as in the checks.
 # ---------------------------------------------------------------------------
 def checkmk_lines(con, collector, conf, part):
     now = time.time()
@@ -1115,37 +1115,37 @@ def checkmk_lines(con, collector, conf, part):
                 st = 2 if fa >= 50 else 1 if fa >= 10 else 0
             if nw >= 10:
                 st = max(st, 2 if wa >= 100 else 1 if wa >= 20 else 0)
-            out.append(f'{st} "SSD {dev} Latenz" flush_ms={fa:.2f};10;50|write_await_ms={wa:.2f};20;100|'
+            out.append(f'{st} "SSD {dev} Latency" flush_ms={fa:.2f};10;50|write_await_ms={wa:.2f};20;100|'
                        f'flush_per_s={fr:.1f}|write_mbs={wmbs:.2f}|util={util:.1f};;;0;100|max_wait_ms={mx:.1f} '
-                       f'Flush {fa:.2f} ms ({fr:.1f}/s), Write-await {wa:.2f} ms, {wmbs:.2f} MB/s, Auslastung {util:.0f} %, '
-                       f'max. Wartezeit {ms_txt(mx)} (Mittel über {span:.0f} s, vom write-latency-diag Dienst)')
+                       f'Flush {fa:.2f} ms ({fr:.1f}/s), write await {wa:.2f} ms, {wmbs:.2f} MB/s, utilization {util:.0f} %, '
+                       f'max. wait {ms_txt(mx)} (average over {span:.0f} s, from the write-latency-diag service)')
         ps = con.execute("SELECT AVG(psi_io_full), AVG(psi_io_some), AVG(psi_cpu) FROM sys WHERE res = 5 AND ts > ?",
                          (now - 60,)).fetchone()
         if ps[0] is not None:
             st = 2 if ps[0] >= 25 else 1 if ps[0] >= 10 else 0
-            out.append(f'{st} "IO-Druck" psi_io_full={ps[0]:.2f};10;25|psi_io_some={ps[1]:.2f} Prozesse komplett durch IO '
-                       f'blockiert: {de(ps[0])} %, teilweise: {de(ps[1])} % (letzte 60 s)')
+            out.append(f'{st} "IO pressure" psi_io_full={ps[0]:.2f};10;25|psi_io_some={ps[1]:.2f} Processes fully blocked '
+                       f'by IO: {num(ps[0])} %, partially: {num(ps[1])} % (last 60 s)')
             st = 2 if ps[2] >= 40 else 1 if ps[2] >= 20 else 0
-            out.append(f'{st} "CPU-Druck" psi_cpu_some={ps[2]:.2f};20;40 Prozesse warten auf CPU-Zeit: {de(ps[2])} % (letzte 60 s)')
+            out.append(f'{st} "CPU pressure" psi_cpu_some={ps[2]:.2f};20;40 Processes waiting for CPU time: {num(ps[2])} % (last 60 s)')
         wr, n = defaultdict(float), 0
         for (w,) in con.execute("SELECT writers FROM sys WHERE res = 5 AND ts > ?", (now - 60,)):
             n += 1
             for k, v in json.loads(w or "[]"):
                 wr[k] += v
         top3 = sorted(((k, v / max(n, 1)) for k, v in wr.items()), key=lambda kv: -kv[1])
-        txt = ", ".join(f"{k} {v:.2f} MB/s" for k, v in top3[:3] if v >= 0.01) or "kaum Schreibzugriffe"
-        out.append(f'0 "Top-Schreiber" write_total_mbs={sum(v for _, v in top3):.2f} {txt}')
+        txt = ", ".join(f"{k} {v:.2f} MB/s" for k, v in top3[:3] if v >= 0.01) or "hardly any writes"
+        out.append(f'0 "Top writers" write_total_mbs={sum(v for _, v in top3):.2f} {txt}')
         w = felt(con, "1h", float(conf["felt_ms"]))
         h = w["windows"]["1h"]
         st = 2 if h["longest"] >= 5 or h["app_max"] >= 5 else 1 if h["n"] or h["app_n"] else 0
-        txt = (f"letzte Stunde: {h['n']}× spürbar (ab {secs_txt(w['felt_ms'] / 1000)} Wartezeit oder 2 s Dauer), "
-               f"zusammen {secs_txt(h['secs'])}, längster {secs_txt(h['longest'])}")
+        txt = (f"last hour: {h['n']}× noticeable (from {secs_txt(w['felt_ms'] / 1000)} wait time or 2 s duration), "
+               f"total {secs_txt(h['secs'])}, longest {secs_txt(h['longest'])}")
         if h["app_max"]:
-            txt += f"; Anwendung wartete max. {secs_txt(h['app_max'])}" + (f" ({h['app_who']})" if h["app_who"] else "")
+            txt += f"; application waited max. {secs_txt(h['app_max'])}" + (f" ({h['app_who']})" if h["app_who"] else "")
         if w.get("last"):
             la = w["last"]
-            txt += f"; zuletzt {time.strftime('%d.%m. %H:%M', time.localtime(la['start']))} {la['dev']} {secs_txt(la['dur'])}"
-        out.append(f'{st} "SSD Hänger" felt_stalls_1h={h["n"]}|felt_secs_1h={h["secs"]}|longest_stall_s={h["longest"]}|'
+            txt += f"; last {time.strftime('%m-%d %H:%M', time.localtime(la['start']))} {la['dev']} {secs_txt(la['dur'])}"
+        out.append(f'{st} "SSD stalls" felt_stalls_1h={h["n"]}|felt_secs_1h={h["secs"]}|longest_stall_s={h["longest"]}|'
                    f'longest_wait_s={h["app_max"]} {txt}')
     elif part == "smart":
         smart = [x for x in smart_view(con) if not x["rot"] and not x["usb"]]
@@ -1155,69 +1155,69 @@ def checkmk_lines(con, collector, conf, part):
             d = x["dev"]
             if d.startswith("sd") and (x["wc_drive"] or x["sct"] or x["wc_boot"]):
                 st = 0
-                txt = f"Laufwerk {'an' if x['wc_drive'] == '1' else 'aus' if x['wc_drive'] == '0' else '?'}"
+                txt = f"Drive {'on' if x['wc_drive'] == '1' else 'off' if x['wc_drive'] == '0' else '?'}"
                 if x["wc_boot"]:
-                    txt += f", beim Start {'an' if x['wc_boot'] == 'enabled' else 'aus'}"
+                    txt += f", at boot {'on' if x['wc_boot'] == 'enabled' else 'off'}"
                 if x["sct"]:
                     txt += f", SCT: {x['sct']}"
                 if x["wc_drive"] == "1" and x["wc_kernel"] == "write through":
                     st = 2
-                    txt += f" - Kernel hält den Cache für aus und schickt keine Flushes: echo 1 > /sys/block/{d}/device/rescan"
+                    txt += f" - kernel considers the cache off and sends no flushes: echo 1 > /sys/block/{d}/device/rescan"
                 elif x["wc_drive"] == "0" or (x["sct"] and "force disabled" in x["sct"].lower()):
                     st = 1
-                    txt += " - Cache aus" + (f". Dauerhaft einschalten: smartctl -s wcache-sct,on,p /dev/{d}" if x["sct"] else "")
+                    txt += " - cache off" + (f". Enable permanently: smartctl -s wcache-sct,on,p /dev/{d}" if x["sct"] else "")
                 elif x["wc_boot"] == "disabled" and not (x["sct"] and "force enabled" in x["sct"].lower()):
-                    txt += " - beim Start aus" + (f"; dauerhaft: smartctl -s wcache-sct,on,p /dev/{d}" if x["sct"] else "")
-                out.append(f'{st} "SSD {d} Schreibcache" write_cache={1 if x["wc_drive"] == "1" else 0};;;0;1 {txt}')
+                    txt += " - off at boot" + (f"; permanently: smartctl -s wcache-sct,on,p /dev/{d}" if x["sct"] else "")
+                out.append(f'{st} "SSD {d} Write cache" write_cache={1 if x["wc_drive"] == "1" else 0};;;0;1 {txt}')
             if x.get("waf_24h") is not None:
                 waf = x["waf_24h"]
                 st = 2 if waf >= 10 else 1 if waf >= 5 else 0
                 perf = f"waf={waf:.2f};5;10|host_gib_day={x['host_day'] or 0}"
-                txt = f"WAF {de(waf)} in den letzten {x.get('window_h')} h, Host {de(x['host_day'] or 0)} GiB/Tag"
+                txt = f"WAF {num(waf)} over the last {x.get('window_h')} h, host {num(x['host_day'] or 0)} GiB/day"
                 if x.get("nand_day"):
                     perf += f"|nand_gib_day={x['nand_day']}"
-                    txt += f", NAND {x['nand_day']} GiB/Tag"
-                out.append(f'{st} "SSD {d} Schreibverstärkung" {perf} {txt} (gesamte Laufzeit: WAF {de(x["waf_total"])})')
+                    txt += f", NAND {x['nand_day']} GiB/day"
+                out.append(f'{st} "SSD {d} Write amplification" {perf} {txt} (whole lifetime: WAF {num(x["waf_total"])})')
             elif x.get("waf_total") is not None:
-                out.append(f'0 "SSD {d} Schreibverstärkung" - Noch kein Vergleichspunkt (ab 1 h Verlauf), '
-                           f'gesamte Laufzeit: WAF {de(x["waf_total"])}')
+                out.append(f'0 "SSD {d} Write amplification" - No reference point yet (needs 1 h of history), '
+                           f'whole lifetime: WAF {num(x["waf_total"])}')
             if x["used"] is not None:
                 rem = x["remaining_days"] if x["remaining_days"] is not None else x["remaining_lifetime_days"]
                 st = 2 if rem is not None and rem < 365 else 1 if rem is not None and rem < 730 else 0
                 perf = f"wear_used={x['used']};;;0;100" + (f"|remaining_days={rem}" if rem is not None else "")
-                txt = f"Verschleiß {x['used']} %"
+                txt = f"Wear {x['used']} %"
                 if x["remaining_days"] is not None:
-                    txt += f", Restlaufzeit bei aktuellem Tempo {fmt_days(x['remaining_days'])}"
+                    txt += f", remaining lifetime at the current rate {fmt_days(x['remaining_days'])}"
                 if x["remaining_lifetime_days"] is not None:
-                    txt += f", bei bisherigem Durchschnitt {fmt_days(x['remaining_lifetime_days'])}"
-                out.append(f'{st} "SSD {d} Verschleiß" {perf} {txt}')
+                    txt += f", at the average so far {fmt_days(x['remaining_lifetime_days'])}"
+                out.append(f'{st} "SSD {d} Wear" {perf} {txt}')
         tr = json.loads((con.execute("SELECT v FROM kv WHERE k = 'trim'").fetchone() or ["{}"])[0])
         if tr.get("enabled") is False:
-            out.append('1 "SSD TRIM" - fstrim.timer ist nicht aktiv: systemctl enable --now fstrim.timer')
+            out.append('1 "SSD TRIM" - fstrim.timer is not active: systemctl enable --now fstrim.timer')
         for m in tr.get("mounts", []):
             p = tr.get("period", 7)
             st, txt = 0, ""
             if m.get("last"):
                 age = (now - m["last"]) / 86400
-                txt = f"letzter Lauf vor {de(age)} Tagen (Zeitplan {tr.get('schedule') or '?'})"
+                txt = f"last run {num(age)} days ago (schedule {tr.get('schedule') or '?'})"
                 if age > p + 1:
-                    st, txt = 1, txt + " - überfällig"
+                    st, txt = 1, txt + " - overdue"
             else:
-                st, txt = 1, "noch kein fstrim-Lauf im Journal"
+                st, txt = 1, "no fstrim run in the journal yet"
             perf = f"trim_age_days={((now - m['last']) / 86400) if m.get('last') else 0:.1f};{p + 1}"
             if "deleted_gib_day" in m:
                 perf += f"|deleted_gib_day={m['deleted_gib_day']}|untrimmed_pct={m['untrimmed_pct']};2"
-                txt += (f", Ø {de(m['deleted_gib_day'])} GiB/Tag gelöscht, bis zum nächsten Lauf bis zu "
-                        f"{de(m['untrimmed_pct'])} % ungetrimmt")
+                txt += (f", avg {num(m['deleted_gib_day'])} GiB/day deleted, up to "
+                        f"{num(m['untrimmed_pct'])} % untrimmed until the next run")
                 if p > 1 and m["untrimmed_pct"] >= 2:
                     st = max(st, 1)
-                    txt += " - täglich trimmen: systemctl edit fstrim.timer, [Timer] OnCalendar= und OnCalendar=daily"
+                    txt += " - trim daily: systemctl edit fstrim.timer, [Timer] OnCalendar= and OnCalendar=daily"
             out.append(f'{st} "SSD TRIM {m["mount"]}" {perf} {txt}')
     return "\n".join(out) + ("\n" if out else "")
 
 
 # ---------------------------------------------------------------------------
-# Web-Oberfläche
+# Web UI
 # ---------------------------------------------------------------------------
 class Handler(BaseHTTPRequestHandler):
     server_version = f"write-latency-diag/{VERSION}"
@@ -1264,7 +1264,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.send(200, report(con, srv.collector, srv.conf), "text/plain; charset=utf-8")
                     return
                 else:
-                    self.send(404, "nicht gefunden", "text/plain; charset=utf-8")
+                    self.send(404, "not found", "text/plain; charset=utf-8")
                     return
             finally:
                 con.close()
@@ -1276,7 +1276,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 # ---------------------------------------------------------------------------
-# Selbst-Update (täglich): neue Version prüfen, ersetzen, beenden - systemd startet neu
+# Self-update (daily): check for a new version, replace, exit - systemd restarts the service
 # ---------------------------------------------------------------------------
 def self_update(conf):
     url = f"{conf['update_url']}/service/wlat-service.py"
@@ -1284,13 +1284,13 @@ def self_update(conf):
         with urllib.request.urlopen(url, timeout=30) as r:
             new = r.read()
         compile(new, "wlat-service.py", "exec")
-    except Exception as e:   # noqa: BLE001 - Netz/Syntax: einfach beim nächsten Mal wieder versuchen
-        INFO["update"] = f"Update-Prüfung fehlgeschlagen: {str(e)[:120]}"
+    except Exception as e:   # noqa: BLE001 - network/syntax: simply try again next time
+        INFO["update"] = f"update check failed: {str(e)[:120]}"
         return False
     me = os.path.realpath(__file__)
     with open(me, "rb") as f:
         if f.read() == new:
-            INFO["update"] = f"aktuell (geprüft {time.strftime('%d.%m. %H:%M')})"
+            INFO["update"] = f"up to date (checked {time.strftime('%m-%d %H:%M')})"
             return False
     if os.path.exists(os.path.join(os.path.dirname(me), ".git")):
         return False
@@ -1299,7 +1299,7 @@ def self_update(conf):
         f.write(new)
     os.chmod(tmp, 0o755)
     os.replace(tmp, me)
-    log("Neue Version installiert, starte neu")
+    log("New version installed, restarting")
     return True
 
 
@@ -1317,8 +1317,8 @@ def main():
     srv.daemon_threads = True
     srv.conf, srv.collector = conf, collector
     threading.Thread(target=srv.serve_forever, daemon=True).start()
-    log(f"write-latency-diag Dienst {VERSION} läuft: http://{conf['bind']}:{conf['port']}/  "
-        f"Datenbank {conf['db']}, Geräte {', '.join(collector.devs)}")
+    log(f"write-latency-diag service {VERSION} running: http://{conf['bind']}:{conf['port']}/  "
+        f"database {conf['db']}, devices {', '.join(collector.devs)}")
 
     def handle(sig, frame):
         STOP.set()
@@ -1346,13 +1346,13 @@ def main():
     if tracer:
         tracer.stop()
     store.flush()
-    log("beendet")
+    log("stopped")
     sys.exit(0)
 
 
 PAGE = r"""<!doctype html>
-<html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Schreiblatenz</title>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Write latency</title>
 <style>
 :root{--bg:#f6f7f9;--card:#fff;--fg:#1d2330;--mut:#667085;--line:#e3e6eb;--ok:#1a7f4b;--warn:#b26b00;--crit:#c2272d;--info:#2f6fbf;--grid:#eceef2}
 @media (prefers-color-scheme:dark){:root{--bg:#14171c;--card:#1d2128;--fg:#e6e8ec;--mut:#98a1b0;--line:#2c323b;--ok:#3fbf7f;--warn:#e0a030;--crit:#ef5b5b;--info:#6aa6ef;--grid:#262b33}}
@@ -1379,27 +1379,27 @@ th{color:var(--mut);font-weight:600}td.num{text-align:right;font-variant-numeric
 .tag{font-size:11px;padding:1px 6px;border-radius:9px;border:1px solid var(--line);color:var(--mut);white-space:nowrap}
 select{background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:3px 6px}
 </style></head><body>
-<header><h1>Schreiblatenz <span id="host" class="mut"></span></h1><span id="meta" class="mut small"></span></header>
+<header><h1>Write latency <span id="host" class="mut"></span></h1><span id="meta" class="mut small"></span></header>
 <main>
-<h2>Befund</h2><div id="findings"></div>
-<h2>Spürbare Hänger <span class="mut small" id="feltdef"></span></h2>
+<h2>Findings</h2><div id="findings"></div>
+<h2>Noticeable stalls <span class="mut small" id="feltdef"></span></h2>
 <div class="grid" id="felttiles"></div><div id="feltlast" class="small" style="margin:8px 0"></div>
-<div class="card"><h3>Spürbare Sekunden pro Stunde</h3><div class="chart" style="height:160px"><canvas id="feltchart"></canvas><div class="tip"></div></div>
-<div class="legend"><span><span class="dot" style="background:#c2272d"></span>Summe der Hänger (s)</span><span><span class="dot" style="background:#2f6fbf"></span>längste Wartezeit einer Anwendung (s)</span></div>
-<h3 style="margin-top:14px">Einzeln <span class="mut small" id="feltcount"></span></h3><div class="scroll" style="max-height:420px;overflow-y:auto"><table id="felttab"></table></div></div>
-<h2>Laufwerke</h2><div id="cards" class="grid"></div>
+<div class="card"><h3>Noticeable seconds per hour</h3><div class="chart" style="height:160px"><canvas id="feltchart"></canvas><div class="tip"></div></div>
+<div class="legend"><span><span class="dot" style="background:#c2272d"></span>sum of stalls (s)</span><span><span class="dot" style="background:#2f6fbf"></span>longest wait of an application (s)</span></div>
+<h3 style="margin-top:14px">Single stalls <span class="mut small" id="feltcount"></span></h3><div class="scroll" style="max-height:420px;overflow-y:auto"><table id="felttab"></table></div></div>
+<h2>Drives</h2><div id="cards" class="grid"></div>
 <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-top:22px">
-<h2 style="margin:0">Verlauf</h2><div class="ranges" id="ranges"></div></div>
+<h2 style="margin:0">History</h2><div class="ranges" id="ranges"></div></div>
 <div class="grid wide" style="margin-top:8px" id="charts"></div>
-<h2>Hänger <select id="evmin"><option value="0">alle</option><option value="200">≥ 200 ms</option><option value="500" selected>≥ 500 ms</option><option value="1000">≥ 1 s</option></select></h2>
+<h2>Stalls <select id="evmin"><option value="0">all</option><option value="200">≥ 200 ms</option><option value="500" selected>≥ 500 ms</option><option value="1000">≥ 1 s</option></select></h2>
 <div class="card"><div class="chart" style="height:120px"><canvas id="evchart"></canvas><div class="tip"></div></div>
 <div class="scroll"><table id="evtab"></table></div></div>
-<h2>fsync-Aufrufer und Schreiber <span class="mut small" id="fsspan"></span></h2>
+<h2>fsync callers and writers <span class="mut small" id="fsspan"></span></h2>
 <div class="grid mid"><div class="card scroll"><table id="fstab"></table></div><div class="card scroll"><table id="wrtab"></table></div></div>
-<h2>Schreibverstärkung pro Tag</h2><div class="card"><div class="chart" style="height:180px"><canvas id="wafchart"></canvas><div class="tip"></div></div><div class="legend" id="waflegend"></div></div>
-<h2>Rohdaten zum Kopieren</h2>
-<div class="card"><div style="display:flex;gap:8px;align-items:center;margin-bottom:8px"><button id="rawcopy" class="btn">Kopieren</button><button id="rawload" class="btn">Neu laden</button><span id="rawmsg" class="mut small"></span>
-<span class="mut small" style="margin-left:auto">auch abrufbar unter <code>/api/report</code></span></div>
+<h2>Write amplification per day</h2><div class="card"><div class="chart" style="height:180px"><canvas id="wafchart"></canvas><div class="tip"></div></div><div class="legend" id="waflegend"></div></div>
+<h2>Raw data to copy</h2>
+<div class="card"><div style="display:flex;gap:8px;align-items:center;margin-bottom:8px"><button id="rawcopy" class="btn">Copy</button><button id="rawload" class="btn">Reload</button><span id="rawmsg" class="mut small"></span>
+<span class="mut small" style="margin-left:auto">also available at <code>/api/report</code></span></div>
 <textarea id="raw" readonly spellcheck="false" style="width:100%;height:360px;font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:8px;white-space:pre;overflow:auto"></textarea></div>
 </main>
 <script>
@@ -1409,10 +1409,10 @@ function localStorageGet(k){try{return localStorage.getItem(k)}catch(e){return n
 function localStorageSet(k,v){try{localStorage.setItem(k,v)}catch(e){}}
 const $=s=>document.querySelector(s);
 function el(tag,attrs,...kids){const e=document.createElement(tag);for(const[k,v]of Object.entries(attrs||{})){if(k==='class')e.className=v;else if(k==='style')e.style.cssText=v;else e.setAttribute(k,v)}for(const c of kids){if(c==null)continue;e.append(c.nodeType?c:document.createTextNode(String(c)))}return e}
-const fmtT=t=>new Date(t*1000).toLocaleString('de-DE',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'});
-const fmtD=d=>d>=730?'~'+(d/365).toFixed(1)+' Jahre':d>=60?'~'+Math.round(d/30.4)+' Monate':'~'+Math.round(d)+' Tage';
-const ms=v=>v==null?'–':v>=1000?(v/1000).toFixed(1).replace('.',',')+' s':v.toFixed(v<10?1:0).replace('.',',')+' ms';
-const mbs=l=>l.filter(w=>w[1]>=0.01).map(w=>w[0]+' '+w[1].toFixed(2).replace('.',',')).join(', ')||'–';
+const fmtT=t=>new Date(t*1000).toLocaleString('en-GB',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'});
+const fmtD=d=>d>=730?'~'+(d/365).toFixed(1)+' years':d>=60?'~'+Math.round(d/30.4)+' months':'~'+Math.round(d)+' days';
+const ms=v=>v==null?'–':v>=1000?(v/1000).toFixed(1)+' s':v.toFixed(v<10?1:0)+' ms';
+const mbs=l=>l.filter(w=>w[1]>=0.01).map(w=>w[0]+' '+w[1].toFixed(2)).join(', ')||'–';
 async function J(u){const r=await fetch(u);return r.json()}
 
 function chart(canvas,series,opt){
@@ -1422,7 +1422,7 @@ function chart(canvas,series,opt){
   const fg=cs.getPropertyValue('--mut'),grid=cs.getPropertyValue('--grid');
   const L=48,R=10,T=8,B=22,pw=W-L-R,ph=H-T-B;let x0=opt.x0,x1=opt.x1,ymax=0;
   for(const s of series)for(let i=0;i<s.t.length;i++){if(x0==null||s.t[i]<x0)x0=s.t[i];if(x1==null||s.t[i]>x1)x1=s.t[i];if(s.v[i]>ymax)ymax=s.v[i]}
-  if(opt.ymin!=null)ymax=Math.max(ymax,opt.ymin);if(!ymax)ymax=1;if(x0==null||!series.some(s=>s.t.length)){c.fillStyle=fg;c.font='12px system-ui';c.fillText(opt.empty||'noch keine Daten',L+8,T+20);return}
+  if(opt.ymin!=null)ymax=Math.max(ymax,opt.ymin);if(!ymax)ymax=1;if(x0==null||!series.some(s=>s.t.length)){c.fillStyle=fg;c.font='12px system-ui';c.fillText(opt.empty||'no data yet',L+8,T+20);return}
   if(x1<=x0)x1=x0+1;const log=opt.log&&ymax>10;
   const yv=v=>log?Math.log10(Math.max(v,1))/Math.log10(ymax*1.1):v/(ymax*1.08);
   const X=t=>L+(t-x0)/(x1-x0)*pw,Y=v=>T+ph-yv(v)*ph;
@@ -1430,7 +1430,7 @@ function chart(canvas,series,opt){
   const ticks=log?[1,10,100,1000,10000,100000].filter(v=>v<=ymax*1.1):[0,.25,.5,.75,1].map(f=>f*ymax*1.08);
   for(const v of ticks){const y=Math.round(Y(v))+.5;c.beginPath();c.moveTo(L,y);c.lineTo(W-R,y);c.stroke();c.fillText(opt.fmt?opt.fmt(v):(+v.toPrecision(3)).toString(),4,y+4)}
   const span=x1-x0,nt=Math.max(2,Math.floor(pw/110));let lastR=-1e9;for(let i=0;i<=nt;i++){const t=x0+span*i/nt,d=new Date(t*1000);
-    const s=span>1296000?d.toLocaleDateString('de-DE',{day:'2-digit',month:'2-digit'}):span>172800?d.toLocaleDateString('de-DE',{day:'2-digit',month:'2-digit'})+' '+d.toLocaleTimeString('de-DE',{hour:'2-digit'}):d.toLocaleTimeString('de-DE',{hour:'2-digit',minute:'2-digit'});const lw=c.measureText(s).width,lx=Math.max(L-10,Math.min(X(t)-lw/2,W-R-lw));if(lx<lastR+8)continue;c.fillText(s,lx,H-6);lastR=lx+lw}
+    const s=span>1296000?d.toLocaleDateString('en-GB',{day:'2-digit',month:'2-digit'}):span>172800?d.toLocaleDateString('en-GB',{day:'2-digit',month:'2-digit'})+' '+d.toLocaleTimeString('en-GB',{hour:'2-digit'}):d.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'});const lw=c.measureText(s).width,lx=Math.max(L-10,Math.min(X(t)-lw/2,W-R-lw));if(lx<lastR+8)continue;c.fillText(s,lx,H-6);lastR=lx+lw}
   series.forEach((s,k)=>{c.strokeStyle=s.color||COLORS[k%COLORS.length];c.lineWidth=1.4;
     if(s.bars){c.fillStyle=c.strokeStyle;const bw=Math.max(2,(s.bars/(x1-x0))*pw-1);for(let i=0;i<s.t.length;i++){if(!s.v[i])continue;const y=Y(s.v[i]);c.fillRect(X(s.t[i]),y,bw,T+ph-y)}return}
     c.beginPath();let pen=false,gap=opt.gap||Infinity;
@@ -1445,28 +1445,28 @@ function chart(canvas,series,opt){
   canvas.onmouseleave=()=>tip.style.display='none';
 }
 
-function finding(f){const lbl={ok:'OK',warn:'Prüfen',crit:'Kritisch',info:'Hinweis'}[f.level];return el('div',{class:'f '+f.level},el('b',{},lbl+': '),f.text)}
+function finding(f){const lbl={ok:'OK',warn:'Check',crit:'Critical',info:'Note'}[f.level];return el('div',{class:'f '+f.level},el('b',{},lbl+': '),f.text)}
 
 function card(s,st){
   const lv=(st.live.disk||{})[s.dev]||{},l5=st.last5min[s.dev]||{};const kv=el('div',{class:'kv'});
   const add=(k,v)=>{kv.append(el('span',{},k),el('span',{},v))};
   let lvl='ok';
   if(!s.rot){
-    if(s.waf_24h!=null){add('WAF (letzte '+s.window_h+' h)',s.waf_24h+(s.host_day!=null?' · Host '+s.host_day+' GiB/Tag':''));if(s.waf_24h>=10)lvl='crit';else if(s.waf_24h>=5&&lvl==='ok')lvl='warn'}
-    else if(s.waf_total!=null)add('WAF (gesamt)',s.waf_total+' – 24-h-Wert folgt');
-    if(s.used!=null){let r=s.remaining_days!=null?'aktuell '+fmtD(s.remaining_days):'';if(s.remaining_lifetime_days!=null)r+=(r?', ':'')+'Ø '+fmtD(s.remaining_lifetime_days);add('Verschleiß',s.used+' %'+(r?' · Rest '+r:''))}
-    if(s.wc_drive||s.wc_boot||s.sct)add('Schreibcache',(s.wc_drive==='1'?'an':s.wc_drive==='0'?'aus':'?')+(s.wc_boot?', beim Start '+(s.wc_boot==='enabled'?'an':'aus'):'')+(s.sct?' · SCT: '+s.sct:''));
-  } else add('Typ','HDD'+(s.usb?' (USB)':''));
-  if(l5.f_await!=null){add('Flush Ø (5 min)',ms(l5.f_await)+' · '+l5.f_rate.toFixed(1)+'/s');add('max. Wartezeit (5 min)',ms(l5.max));
+    if(s.waf_24h!=null){add('WAF (last '+s.window_h+' h)',s.waf_24h+(s.host_day!=null?' · host '+s.host_day+' GiB/day':''));if(s.waf_24h>=10)lvl='crit';else if(s.waf_24h>=5&&lvl==='ok')lvl='warn'}
+    else if(s.waf_total!=null)add('WAF (total)',s.waf_total+' – 24 h value follows');
+    if(s.used!=null){let r=s.remaining_days!=null?'current '+fmtD(s.remaining_days):'';if(s.remaining_lifetime_days!=null)r+=(r?', ':'')+'avg '+fmtD(s.remaining_lifetime_days);add('Wear',s.used+' %'+(r?' · remaining '+r:''))}
+    if(s.wc_drive||s.wc_boot||s.sct)add('Write cache',(s.wc_drive==='1'?'on':s.wc_drive==='0'?'off':'?')+(s.wc_boot?', at boot '+(s.wc_boot==='enabled'?'on':'off'):'')+(s.sct?' · SCT: '+s.sct:''));
+  } else add('Type','HDD'+(s.usb?' (USB)':''));
+  if(l5.f_await!=null){add('Flush avg (5 min)',ms(l5.f_await)+' · '+l5.f_rate.toFixed(1)+'/s');add('Max. wait (5 min)',ms(l5.max));
     if(!s.rot&&l5.max>=1000)lvl='crit';else if(!s.rot&&l5.max>=200&&lvl==='ok')lvl='warn'}
-  if(lv.w_mbs!=null)add('Schreiben',lv.w_mbs.toFixed(2)+' MB/s · Auslastung '+Math.round(lv.util)+' %');
-  if(s.temp!=null)add('Temperatur',s.temp+' °C'+(s.poh?' · '+s.poh+' h':''));
+  if(lv.w_mbs!=null)add('Writes',lv.w_mbs.toFixed(2)+' MB/s · utilization '+Math.round(lv.util)+' %');
+  if(s.temp!=null)add('Temperature',s.temp+' °C'+(s.poh?' · '+s.poh+' h':''));
   return el('div',{class:'card'},el('h3',{},el('span',{},el('span',{class:'dot b-'+(s.rot?'mut':lvl)}),s.dev+' '),el('span',{class:'mut small'},s.model)),el('div',{class:'mut small',style:'margin-bottom:6px'},s.serial),kv);
 }
 
 async function loadStatus(){
   const st=await J('api/status');$('#host').textContent=st.host;
-  $('#meta').textContent='Version '+st.version+' · läuft seit '+fmtT(st.started)+' · bpftrace: '+st.bpftrace+(st.update?' · Update: '+st.update:'')+' · Stand '+fmtT(st.now);
+  $('#meta').textContent='Version '+st.version+' · running since '+fmtT(st.started)+' · bpftrace: '+st.bpftrace+(st.update?' · update: '+st.update:'')+' · as of '+fmtT(st.now);
   $('#findings').replaceChildren(...st.findings.map(finding));
   const smart=st.smart.length?st.smart:Object.entries(st.devices).map(([d,i])=>({dev:d,model:i.model,rot:i.rot,usb:i.usb,serial:''}));
   $('#cards').replaceChildren(...smart.map(s=>card(s,st)));
@@ -1477,67 +1477,67 @@ function legend(names){return names.map((n,k)=>el('span',{},el('span',{class:'do
 
 async function loadCharts(){
   const s=await J('api/series?range='+RANGE),devs=Object.keys(s.disk).sort(),gap=s.bucket*3;
-  const box=$('#charts');box.replaceChildren(chartCard('c1','Max. Wartezeit je Gerät (ms, logarithmisch)'),chartCard('c2','Flushes pro Sekunde'),chartCard('c3','Schreiben (MB/s)'),chartCard('c4','Druck (PSI) und CPU (%)'));
+  const box=$('#charts');box.replaceChildren(chartCard('c1','Max. wait per device (ms, logarithmic)'),chartCard('c2','Flushes per second'),chartCard('c3','Writes (MB/s)'),chartCard('c4','Pressure (PSI) and CPU (%)'));
   const mk=k=>devs.map((d,i)=>({name:d,color:COLORS[i%COLORS.length],t:s.disk[d].t,v:s.disk[d][k]}));
   const o={x0:s.since,x1:s.now,gap};
   chart($('#c1'),mk('lat_max'),{...o,log:true,fmt:ms,ymin:10,thresholds:[{v:200,color:'#b26b00'},{v:1000,color:'#c2272d'}]});$('#c1l').replaceChildren(...legend(devs));
   chart($('#c2'),mk('f_rate'),o);$('#c2l').replaceChildren(...legend(devs));
   chart($('#c3'),mk('w_mbs'),o);$('#c3l').replaceChildren(...legend(devs));
-  const sy=s.sys,ss=[['IO komplett blockiert','psi_io_full'],['IO teilweise','psi_io_some'],['CPU-Wartezeit','psi_cpu'],['CPU-Auslastung','cpu']].map(([n,k],i)=>({name:n,color:COLORS[i],t:sy.t||[],v:sy[k]||[]}));
+  const sy=s.sys,ss=[['IO fully blocked','psi_io_full'],['IO partially','psi_io_some'],['CPU wait','psi_cpu'],['CPU utilization','cpu']].map(([n,k],i)=>({name:n,color:COLORS[i],t:sy.t||[],v:sy[k]||[]}));
   chart($('#c4'),ss,{...o,ymin:5});$('#c4l').replaceChildren(...legend(ss.map(x=>x.name)));
 }
 
-const sec=v=>v>=100?Math.round(v)+' s':v>=10?v.toFixed(0)+' s':v.toFixed(1).replace('.',',')+' s';
+const sec=v=>v>=100?Math.round(v)+' s':v>=10?v.toFixed(0)+' s':v.toFixed(1)+' s';
 async function loadFelt(){
   const rng=['1h','6h','24h'].includes(RANGE)?'7d':RANGE,f=await J('api/felt?range='+rng);
-  $('#feltdef').textContent='(ab '+sec(f.felt_ms/1000)+' Wartezeit oder 2 s Dauer)';
-  const lbl={'1h':'Letzte Stunde','24h':'Letzte 24 Stunden','7d':'Letzte 7 Tage'};
+  $('#feltdef').textContent='(from '+sec(f.felt_ms/1000)+' wait time or 2 s duration)';
+  const lbl={'1h':'Last hour','24h':'Last 24 hours','7d':'Last 7 days'};
   $('#felttiles').replaceChildren(...Object.entries(f.windows).map(([k,w])=>{
     const lv=w.n===0&&w.app_n===0?'ok':(w.longest>=5||w.app_max>=5)?'crit':'warn';
     return el('div',{class:'card'},el('h3',{},el('span',{},el('span',{class:'dot b-'+lv}),lbl[k])),
-      el('div',{class:'big'},w.n+'× ',el('small',{},'zusammen '+sec(w.secs))),
-      el('div',{class:'kv',style:'margin-top:6px'},el('span',{},'längster Hänger'),el('span',{},w.n?sec(w.longest):'–'),
-        el('span',{},'Anwendung wartete'),el('span',{},w.app_n?w.app_n+'× ≥ '+sec(f.felt_ms/1000)+', zusammen '+sec(w.app_secs):'nie ≥ '+sec(f.felt_ms/1000)),
-        el('span',{},'längste Wartezeit'),el('span',{},w.app_max?sec(w.app_max)+(w.app_who?' ('+w.app_who+')':''):'–')))}));
-  const l=f.last;$('#feltlast').replaceChildren(l?el('span',{},el('b',{},'Zuletzt: '),fmtT(l.start)+' – '+sec(l.dur)+' auf '+l.dev+
-    (l.waiters.length?', es warteten: '+l.waiters.slice(0,3).map(w=>w[0]+' '+sec(w[1]/1000)).join(', '):'')):el('span',{class:'mut'},'Noch kein spürbarer Hänger aufgezeichnet.'));
-  const h=f.hours;chart($('#feltchart'),[{name:'Hänger',color:'#c2272d',bars:3600,t:h.map(x=>x.t),v:h.map(x=>x.secs)},{name:'längste Wartezeit',color:'#2f6fbf',t:h.filter(x=>x.app_max).map(x=>x.t),v:h.filter(x=>x.app_max).map(x=>x.app_max)}],
-    {dots:true,ymin:1,x0:f.since,x1:f.now,gap:3600,fmt:v=>sec(+v),empty:'keine spürbaren Hänger'});
-  $('#feltcount').textContent='('+f.list.length+(f.list.length>=200?'+':'')+' im Zeitraum, neueste zuerst)';
-  const t=$('#felttab');t.replaceChildren(el('tr',{},...['Zeit','Gerät','Dauer','max. Wartezeit','Wer wartete (fsync)','Wer schrieb (MB/s)',''].map(h=>el('th',{},h))));
-  if(!f.list.length)t.append(el('tr',{},el('td',{colspan:7,class:'mut'},'Keine spürbaren Hänger in diesem Zeitraum.')));
+      el('div',{class:'big'},w.n+'× ',el('small',{},'total '+sec(w.secs))),
+      el('div',{class:'kv',style:'margin-top:6px'},el('span',{},'longest stall'),el('span',{},w.n?sec(w.longest):'–'),
+        el('span',{},'application waited'),el('span',{},w.app_n?w.app_n+'× ≥ '+sec(f.felt_ms/1000)+', total '+sec(w.app_secs):'never ≥ '+sec(f.felt_ms/1000)),
+        el('span',{},'longest wait'),el('span',{},w.app_max?sec(w.app_max)+(w.app_who?' ('+w.app_who+')':''):'–')))}));
+  const l=f.last;$('#feltlast').replaceChildren(l?el('span',{},el('b',{},'Last: '),fmtT(l.start)+' – '+sec(l.dur)+' on '+l.dev+
+    (l.waiters.length?', waiting: '+l.waiters.slice(0,3).map(w=>w[0]+' '+sec(w[1]/1000)).join(', '):'')):el('span',{class:'mut'},'No noticeable stall recorded yet.'));
+  const h=f.hours;chart($('#feltchart'),[{name:'stalls',color:'#c2272d',bars:3600,t:h.map(x=>x.t),v:h.map(x=>x.secs)},{name:'longest wait',color:'#2f6fbf',t:h.filter(x=>x.app_max).map(x=>x.t),v:h.filter(x=>x.app_max).map(x=>x.app_max)}],
+    {dots:true,ymin:1,x0:f.since,x1:f.now,gap:3600,fmt:v=>sec(+v),empty:'no noticeable stalls'});
+  $('#feltcount').textContent='('+f.list.length+(f.list.length>=200?'+':'')+' in this period, newest first)';
+  const t=$('#felttab');t.replaceChildren(el('tr',{},...['Time','Device','Duration','Max. wait','Who waited (fsync)','Who wrote (MB/s)',''].map(h=>el('th',{},h))));
+  if(!f.list.length)t.append(el('tr',{},el('td',{colspan:7,class:'mut'},'No noticeable stalls in this period.')));
   for(const x of f.list)t.append(el('tr',{},el('td',{},fmtT(x.start)),el('td',{},x.dev),el('td',{class:'num'},sec(x.dur)),
     el('td',{class:'num'},ms(Math.max(x.max_w,x.max_f))),el('td',{},x.waiters.map(w=>w[0]+' '+ms(w[1])).join(', ')||'–'),
-    el('td',{},mbs(x.writers)),el('td',{},x.smart?el('span',{class:'tag',title:'Zeitgleich mit einer SMART-Abfrage des Dienstes'},'SMART'):'')));
+    el('td',{},mbs(x.writers)),el('td',{},x.smart?el('span',{class:'tag',title:'At the same time as a SMART query of the service'},'SMART'):'')));
 }
-async function loadRaw(){const r=await fetch('api/report');$('#raw').value=await r.text();$('#rawmsg').textContent='Stand '+new Date().toLocaleTimeString('de-DE')}
+async function loadRaw(){const r=await fetch('api/report');$('#raw').value=await r.text();$('#rawmsg').textContent='as of '+new Date().toLocaleTimeString('en-GB')}
 async function copyRaw(){const ta=$('#raw');let ok=false;
   try{if(window.isSecureContext&&navigator.clipboard){await navigator.clipboard.writeText(ta.value);ok=true}}catch(e){}
   if(!ok){ta.focus();ta.select();try{ok=document.execCommand('copy')}catch(e){}ta.setSelectionRange(0,0)}
-  $('#rawmsg').textContent=ok?'kopiert':'Kopieren nicht möglich - bitte markieren und manuell kopieren'}
+  $('#rawmsg').textContent=ok?'copied':'Copying not possible - please select and copy manually'}
 async function loadEvents(){
   const rng=['1h','6h','24h'].includes(RANGE)?'24h':RANGE,e=await J('api/events?range='+rng+'&min_ms='+$('#evmin').value);
-  const ph=e.per_hour;chart($('#evchart'),[{name:'Hänger pro Stunde',t:ph.map(x=>x.t),v:ph.map(x=>x.n)}],{dots:true,ymin:1,x0:e.since,x1:e.now,gap:3600,empty:'keine Hänger'});
-  const t=$('#evtab');t.replaceChildren(el('tr',{},...['Zeit','Gerät','Dauer','max. Wartezeit','Wer schrieb (MB/s)','Wer wartete (fsync)',''].map(h=>el('th',{},h))));
-  if(!e.events.length)t.append(el('tr',{},el('td',{colspan:7,class:'mut'},'Keine Hänger in diesem Zeitraum.')));
+  const ph=e.per_hour;chart($('#evchart'),[{name:'stalls per hour',t:ph.map(x=>x.t),v:ph.map(x=>x.n)}],{dots:true,ymin:1,x0:e.since,x1:e.now,gap:3600,empty:'no stalls'});
+  const t=$('#evtab');t.replaceChildren(el('tr',{},...['Time','Device','Duration','Max. wait','Who wrote (MB/s)','Who waited (fsync)',''].map(h=>el('th',{},h))));
+  if(!e.events.length)t.append(el('tr',{},el('td',{colspan:7,class:'mut'},'No stalls in this period.')));
   for(const x of e.events)t.append(el('tr',{},el('td',{},fmtT(x.start)),el('td',{},x.dev),el('td',{class:'num'},x.dur.toFixed(0)+' s'),
     el('td',{class:'num'},ms(Math.max(x.max_w,x.max_f))),el('td',{},mbs(x.writers)),
-    el('td',{},x.waiters.map(w=>w[0]+' '+ms(w[1])).join(', ')||'–'),el('td',{},x.smart?el('span',{class:'tag',title:'Zeitgleich mit einer SMART-Abfrage des Dienstes'},'SMART'):'')));
+    el('td',{},x.waiters.map(w=>w[0]+' '+ms(w[1])).join(', ')||'–'),el('td',{},x.smart?el('span',{class:'tag',title:'At the same time as a SMART query of the service'},'SMART'):'')));
 }
 
 async function loadFsync(){
-  const rng=RANGE==='1h'||RANGE==='6h'?'24h':RANGE,f=await J('api/fsync?range='+rng);$('#fsspan').textContent='(letzte '+rng+')';
-  const t=$('#fstab');t.replaceChildren(el('tr',{},...['fsync-Aufrufer','pro s','Ø','max'].map(h=>el('th',{},h))));
-  if(!f.fsync.length)t.append(el('tr',{},el('td',{colspan:4,class:'mut'},'Noch keine Daten (bpftrace fasst alle 5 Minuten zusammen).')));
+  const rng=RANGE==='1h'||RANGE==='6h'?'24h':RANGE,f=await J('api/fsync?range='+rng);$('#fsspan').textContent='(last '+rng+')';
+  const t=$('#fstab');t.replaceChildren(el('tr',{},...['fsync caller','per s','avg','max'].map(h=>el('th',{},h))));
+  if(!f.fsync.length)t.append(el('tr',{},el('td',{colspan:4,class:'mut'},'No data yet (bpftrace summarizes every 5 minutes).')));
   for(const x of f.fsync)t.append(el('tr',{},el('td',{},x.name),el('td',{class:'num'},x.per_s.toFixed(2)),el('td',{class:'num'},ms(x.avg_ms)),el('td',{class:'num'},ms(x.max_ms))));
-  const w=$('#wrtab');w.replaceChildren(el('tr',{},el('th',{},'Schreiber (netto)'),el('th',{},'Ø MB/s')));
-  if(!f.writers.length)w.append(el('tr',{},el('td',{colspan:2,class:'mut'},'Noch keine Daten.')));
+  const w=$('#wrtab');w.replaceChildren(el('tr',{},el('th',{},'Writers (net)'),el('th',{},'avg MB/s')));
+  if(!f.writers.length)w.append(el('tr',{},el('td',{colspan:2,class:'mut'},'No data yet.')));
   for(const[n,v]of f.writers)w.append(el('tr',{},el('td',{},n),el('td',{class:'num'},v.toFixed(3))));
 }
 
 async function loadSmart(){
   const h=await J('api/smart'),names=Object.keys(h);
-  chart($('#wafchart'),names.map((n,i)=>({name:n,color:COLORS[i%COLORS.length],t:h[n].map(x=>x.t),v:h[n].map(x=>x.waf)})),{dots:true,ymin:5,thresholds:[{v:5,color:'#b26b00'},{v:10,color:'#c2272d'}],empty:'noch keine Daten (ab dem zweiten Tag)'});
+  chart($('#wafchart'),names.map((n,i)=>({name:n,color:COLORS[i%COLORS.length],t:h[n].map(x=>x.t),v:h[n].map(x=>x.waf)})),{dots:true,ymin:5,thresholds:[{v:5,color:'#b26b00'},{v:10,color:'#c2272d'}],empty:'no data yet (from the second day on)'});
   $('#waflegend').replaceChildren(...legend(names));
 }
 

@@ -2,22 +2,22 @@
 #
 # write-latency-diag.sh
 #
-# Beobachtet Schreiblatenz und grenzt ein, ob die Wartezeit auf den SSDs
-# (Gerät, Controller, Flush) oder oberhalb davon (CPU, shfs/FUSE, ZFS, btrfs,
-# Locks) entsteht.
+# Observes write latency and narrows down whether the wait happens on the SSDs
+# (device, controller, flush) or above them (CPU, shfs/FUSE, ZFS, btrfs,
+# locks).
 #
-# Liest nur /proc und /sys. Schreibtests (-t / -S) schreiben ausschließlich
-# eine temporäre Testdatei in das angegebene Verzeichnis und löschen sie danach.
+# Reads only /proc and /sys. Write tests (-t / -S) write nothing but a
+# temporary test file in the given directory and delete it afterwards.
 #
 
-VERSION="1.13"
+VERSION="1.14"
 
-# Zahlen immer mit Punkt verarbeiten: Mit deutscher Locale gibt awk sonst "3,000" aus, bash-printf lehnt "3.5" ab
-# und Vergleiche werden zu Textvergleichen. Texte bleiben in der Sprache des Systems.
+# Always process numbers with a dot: with a German or other locale awk would print "3,000", bash printf would reject
+# "3.5" and comparisons would turn into string comparisons.
 if [ -n "${LC_ALL:-}" ]; then export LANG="$LC_ALL"; unset LC_ALL; fi
 export LC_NUMERIC=C
 
-PASSIVE=""            # Dauer der passiven Beobachtung in Sekunden
+PASSIVE=""            # duration of the passive observation in seconds
 INTERVAL=1
 TEST_RUNTIME=30
 TEST_SIZE="256M"
@@ -27,7 +27,7 @@ DEVRE='^(sd[a-z]+|nvme[0-9]+n[0-9]+|vd[a-z]+|xvd[a-z]+)$'
 SKIP_STATIC=0
 QUIET=0
 TRACE=1
-STATE_DIR="/var/lib/write-latency-diag"   # SMART-Verlauf für die aktuelle Schreibverstärkung
+STATE_DIR="/var/lib/write-latency-diag"   # SMART history for the current write amplification
 TARGETS=()
 AUTO_UPDATE=1
 UPDATE_URL="${WLAT_UPDATE_URL:-https://raw.githubusercontent.com/Commifreak/write-latency-diag/main}"
@@ -48,37 +48,37 @@ esac
 
 usage() {
   cat <<EOF
-write-latency-diag.sh $VERSION - Schreiblatenz: SSD oder CPU/Software?
+write-latency-diag.sh $VERSION - write latency: SSD or CPU/software?
 
-Aufruf: $0 [Optionen]
+Usage: $0 [options]
 
-  -d SEK     Passiv beobachten (Standard: 60 s, wenn kein -t angegeben ist).
-             Währenddessen das Problem auslösen/abwarten. Ctrl+C beendet
-             vorzeitig und zeigt trotzdem die Auswertung.
-  -t DIR     Aktiver Test: 4k-Schreiben mit O_SYNC (QD1, wie Datenbanken/
-             Docker) in DIR, während gemessen wird. Mehrfach angeben, um
-             Pfade zu vergleichen, z.B. -t /srv/data/test -t /var/lib/docker/test
-  -r SEK     Laufzeit je aktivem Test (Standard: $TEST_RUNTIME)
-  -S GRÖSSE  Zusätzlich sequentiellen Dauerschreibtest im ersten -t DIR
-             (z.B. 20G) - zeigt Einbrüche durch vollen SLC-Cache.
-             Achtung: schreibt GRÖSSE auf die SSD.
-  -i SEK     Messintervall (Standard: $INTERVAL)
-  -D REGEX   Nur diese Geräte beobachten (Standard: $DEVRE)
-  -o DIR     Basisverzeichnis für Report/CSV (Standard: $OUTBASE)
-  -n         Systemcheck überspringen
-  -q         Nur auffällige Intervalle ausgeben (für lange Läufe)
-  -T         Kein bpftrace-Tracing (fsync-Aufrufer, beendete Prozesse)
-  -U         Kein automatisches Update (Skript, CheckMK-Checks, Dienst)
+  -d SEC     Observe passively (default: 60 s if no -t is given).
+             Trigger or wait for the problem meanwhile. Ctrl+C stops
+             early and still shows the analysis.
+  -t DIR     Active test: 4k writes with O_SYNC (QD1, like databases/
+             Docker) in DIR while measuring. Give it several times to
+             compare paths, e.g. -t /srv/data/test -t /var/lib/docker/test
+  -r SEC     Runtime per active test (default: $TEST_RUNTIME)
+  -S SIZE    Additional sustained sequential write test in the first -t DIR
+             (e.g. 20G) - shows drops caused by a full SLC cache.
+             Caution: writes SIZE to the SSD.
+  -i SEC     Sampling interval (default: $INTERVAL)
+  -D REGEX   Observe only these devices (default: $DEVRE)
+  -o DIR     Base directory for report/CSV (default: $OUTBASE)
+  -n         Skip the system check
+  -q         Print only conspicuous intervals (for long runs)
+  -T         No bpftrace tracing (fsync callers, exited processes)
+  -U         No automatic update (script, CheckMK checks, service)
 
-  --install-service    Dienst mit Web-Oberfläche installieren und starten (Port 81)
-  --uninstall-service  Dienst entfernen (Daten und Konfiguration bleiben)
-  --check-disk DEV     Neue oder gebrauchte SSD vor dem Einbau prüfen: SMART, Selbsttests,
-             Flush-Latenz (PLP), Vollschreiben mit Prüfsummen, Leistung und Dauerlast wie
-             im Betrieb (-r SEK, Standard 3600). LÖSCHT DAS GANZE LAUFWERK.
-             Mit -o DIR landen Report und Kurzfassung dort, z.B. -o /root
-  -h         Hilfe
+  --install-service    Install and start the service with web UI (port 81)
+  --uninstall-service  Remove the service (data and configuration are kept)
+  --check-disk DEV     Check a new or used SSD before installing it: SMART, self-tests,
+             flush latency (PLP), full write with checksums, performance and sustained load
+             as in production (-r SEC, default 3600). ERASES THE WHOLE DRIVE.
+             With -o DIR the report and summary go there, e.g. -o /root
+  -h         Help
 
-Beispiele:
+Examples:
   $0 -d 300
   $0 -d 86400 -q -i 5
   $0 -t /srv/.lattest
@@ -106,32 +106,32 @@ while getopts "d:t:r:S:i:D:o:nqTUh" opt; do
 done
 
 # ---------------------------------------------------------------------------
-# Automatisches Update: Skript und, falls der CheckMK-Agent installiert ist, die Local Checks
-# auf den Stand von GitHub (main) bringen. Abschalten mit -U oder WLAT_NO_UPDATE=1.
+# Automatic update: bring the script and, if the CheckMK agent is installed, the local checks
+# to the state on GitHub (main). Disable with -U or WLAT_NO_UPDATE=1.
 # ---------------------------------------------------------------------------
 UPDATE_MSGS=()
-fetch() { # url ziel
+fetch() { # url target
   if command -v curl >/dev/null 2>&1; then curl -fsSL --max-time 15 -o "$2" "$1" 2>/dev/null
   elif command -v wget >/dev/null 2>&1; then wget -q -T 15 -O "$2" "$1" 2>/dev/null
   else return 1; fi
 }
-# Nur vollständige, syntaktisch korrekte Bash-Skripte übernehmen (abgebrochener Download, Fehlerseite)
+# Only accept complete, syntactically correct bash scripts (aborted download, error page)
 valid_script() { [ -s "$1" ] && head -1 "$1" | grep -q '^#!/bin/bash' && bash -n "$1" 2>/dev/null; }
 
 self_update() {
   local self tmp new
-  [ "${WLAT_UPDATED:-}" = 1 ] && return   # gerade aktualisiert und neu gestartet
+  [ "${WLAT_UPDATED:-}" = 1 ] && return   # just updated and restarted
   self=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null)
   [ -f "$self" ] && [ -w "$self" ] || return
-  [ -e "$(dirname "$self")/.git" ] && return   # Git-Arbeitskopie: lokale Änderungen nicht überschreiben
+  [ -e "$(dirname "$self")/.git" ] && return   # Git working copy: do not overwrite local changes
   tmp=$(mktemp "$(dirname "$self")/.wlat-update.XXXXXX" 2>/dev/null) || return
   if ! fetch "$UPDATE_URL/write-latency-diag.sh" "$tmp"; then
-    UPDATE_MSGS+=("Update: GitHub nicht erreichbar - nutze die vorhandene Version $VERSION.")
+    UPDATE_MSGS+=("Update: GitHub not reachable - using the existing version $VERSION.")
   elif valid_script "$tmp" && ! cmp -s "$tmp" "$self"; then
     new=$(sed -n 's/^VERSION="\(.*\)"/\1/p' "$tmp" | head -1)
     chmod --reference="$self" "$tmp" 2>/dev/null || chmod 755 "$tmp"
     if mv -f "$tmp" "$self"; then
-      exec env WLAT_UPDATED=1 WLAT_UPDATE_MSG="Skript aktualisiert: $VERSION -> ${new:-?}" bash "$self" "${ORIG_ARGS[@]}"
+      exec env WLAT_UPDATED=1 WLAT_UPDATE_MSG="Script updated: $VERSION -> ${new:-?}" bash "$self" "${ORIG_ARGS[@]}"
     fi
   fi
   rm -f "$tmp"
@@ -141,7 +141,7 @@ cmk_update() {
   local name dest tmp fresh
   [ -d "${CMK_LOCAL%/local}" ] && [ "$(id -u)" -eq 0 ] || return
   for name in write_latency write_latency_smart; do
-    # Vorhandene Installation an ihrem Ort aktualisieren, sonst Standardort (der langsame Teil alle 30 min)
+    # Update an existing installation in place, otherwise the default location (the slow part every 30 min)
     dest=$(find "$CMK_LOCAL" -maxdepth 2 -type f -name "$name" 2>/dev/null | head -1)
     fresh=0
     if [ -z "$dest" ]; then
@@ -151,18 +151,18 @@ cmk_update() {
     tmp=$(mktemp 2>/dev/null) || return
     if fetch "$UPDATE_URL/checkmk/$name" "$tmp" && valid_script "$tmp" && ! cmp -s "$tmp" "$dest"; then
       mkdir -p "$(dirname "$dest")" && install -m 755 "$tmp" "$dest" &&
-        UPDATE_MSGS+=("CheckMK-Check $([ $fresh = 1 ] && echo installiert || echo aktualisiert): $dest")
+        UPDATE_MSGS+=("CheckMK check $([ $fresh = 1 ] && echo installed || echo updated): $dest")
     fi
     rm -f "$tmp"
   done
-  [ ${#UPDATE_MSGS[@]} -gt 0 ] && grep -q 'CheckMK-Check installiert' <<<"${UPDATE_MSGS[*]}" &&
-    UPDATE_MSGS+=("Neue CheckMK-Checks: in CheckMK die Services des Hosts neu erkennen lassen.")
+  [ ${#UPDATE_MSGS[@]} -gt 0 ] && grep -q 'CheckMK check installed' <<<"${UPDATE_MSGS[*]}" &&
+    UPDATE_MSGS+=("New CheckMK checks: run a service discovery for the host in CheckMK.")
 }
 
-# Dienst mit Web-Oberfläche (service/wlat-service.py): installieren, aktualisieren, entfernen
+# Service with web UI (service/wlat-service.py): install, update, remove
 py_valid() { [ -s "$1" ] && python3 -c 'import sys; compile(open(sys.argv[1], "rb").read(), sys.argv[1], "exec")' "$1" 2>/dev/null; }
 
-service_fetch() { # ziel: lokale Kopie aus einer Git-Arbeitskopie bevorzugen, sonst von GitHub
+service_fetch() { # target: prefer the local copy from a Git working copy, otherwise GitHub
   local local_copy
   local_copy="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/service/wlat-service.py"
   if [ -f "$local_copy" ] && [ -e "$(dirname "$local_copy")/../.git" ]; then cp "$local_copy" "$1"
@@ -175,50 +175,50 @@ service_update() {
   tmp=$(mktemp) || return
   if service_fetch "$tmp" && py_valid "$tmp" && ! cmp -s "$tmp" "$SVC_FILE"; then
     install -m 755 "$tmp" "$SVC_FILE" && systemctl try-restart write-latency-diag.service 2>/dev/null &&
-      UPDATE_MSGS+=("Dienst aktualisiert und neu gestartet: $SVC_FILE")
+      UPDATE_MSGS+=("Service updated and restarted: $SVC_FILE")
   fi
   rm -f "$tmp"
 }
 
 service_install() {
   local tmp port ip
-  [ "$(id -u)" -eq 0 ] || { echo "Bitte als root starten (sudo)." >&2; exit 1; }
-  [ -d /run/systemd/system ] || { echo "Der Dienst braucht systemd (z.B. Ubuntu, Debian)." >&2; exit 1; }
-  command -v python3 >/dev/null 2>&1 || { echo "python3 fehlt: apt install python3" >&2; exit 1; }
+  [ "$(id -u)" -eq 0 ] || { echo "Please run as root (sudo)." >&2; exit 1; }
+  [ -d /run/systemd/system ] || { echo "The service needs systemd (e.g. Ubuntu, Debian)." >&2; exit 1; }
+  command -v python3 >/dev/null 2>&1 || { echo "python3 missing: apt install python3" >&2; exit 1; }
   tmp=$(mktemp)
   if ! service_fetch "$tmp" || ! py_valid "$tmp"; then
-    echo "Konnte den Dienst nicht laden ($UPDATE_URL/service/wlat-service.py)." >&2; rm -f "$tmp"; exit 1
+    echo "Could not load the service ($UPDATE_URL/service/wlat-service.py)." >&2; rm -f "$tmp"; exit 1
   fi
   install -D -m 755 "$tmp" "$SVC_FILE"; rm -f "$tmp"
   if [ ! -f "$SVC_CONF" ]; then
     cat > "$SVC_CONF" <<'CONF'
-# write-latency-diag Dienst - Änderungen wirken nach: systemctl restart write-latency-diag
-# Web-Oberfläche (ohne Login, nur lesend - nur im LAN erreichbar machen)
+# write-latency-diag service - changes take effect after: systemctl restart write-latency-diag
+# Web UI (no login, read-only - make it reachable only in the LAN)
 bind = 0.0.0.0
 port = 81
-# Datenbank: 5-Sekunden-Werte 7 Tage, Minutenwerte 90 Tage, Hänger 365 Tage
+# Database: 5-second values 7 days, minute values 90 days, stalls 365 days
 db = /var/lib/write-latency-diag/metrics.db
 keep_5s_days = 7
 keep_1m_days = 90
 keep_events_days = 365
-# Ab dieser Wartezeit zählt eine Sekunde als Hänger
+# From this wait time on a second counts as a stall
 stall_ms = 100
-# Spürbar für Benutzer: ab dieser Wartezeit (oder Hänger ab 2 s Dauer)
+# Noticeable for users: from this wait time on (or stalls lasting 2 s or more)
 felt_ms = 1000
-# fsync-Aufrufer per bpftrace aufzeichnen (1/0)
+# Record fsync callers with bpftrace (1/0)
 bpftrace = 1
-# Täglich auf neue Version prüfen (1/0)
+# Check daily for a new version (1/0)
 auto_update = 1
 CONF
   fi
   port=$(sed -n 's/^ *port *= *\([0-9]*\).*/\1/p' "$SVC_CONF" | tail -1); port=${port:-81}
   if ! systemctl is-active -q write-latency-diag.service && command -v ss >/dev/null 2>&1 &&
      ss -ltnH "sport = :$port" 2>/dev/null | grep -q .; then
-    echo "Achtung: Port $port ist schon belegt. Port in $SVC_CONF ändern, dann: systemctl restart write-latency-diag" >&2
+    echo "Caution: port $port is already in use. Change the port in $SVC_CONF, then: systemctl restart write-latency-diag" >&2
   fi
   cat > "$SVC_UNIT" <<UNIT
 [Unit]
-Description=write-latency-diag: Schreiblatenz-Aufzeichnung mit Web-Oberfläche
+Description=write-latency-diag: write latency recording with web UI
 After=network.target
 
 [Service]
@@ -235,29 +235,29 @@ UNIT
   sleep 2
   ip=$(hostname -I 2>/dev/null | awk '{print $1}')
   if systemctl is-active -q write-latency-diag.service; then
-    echo "Dienst läuft: http://${ip:-<server-ip>}:$port/"
+    echo "Service running: http://${ip:-<server-ip>}:$port/"
   else
-    echo "Dienst startet nicht - Details: journalctl -u write-latency-diag -n 30" >&2
+    echo "Service does not start - details: journalctl -u write-latency-diag -n 30" >&2
   fi
   for t in bpftrace smartctl hdparm; do
-    command -v $t >/dev/null 2>&1 || echo "Empfohlen: $t fehlt (apt install $( [ $t = smartctl ] && echo smartmontools || echo $t ))"
+    command -v $t >/dev/null 2>&1 || echo "Recommended: $t is missing (apt install $( [ $t = smartctl ] && echo smartmontools || echo $t ))"
   done
-  echo "Stoppen: systemctl stop write-latency-diag   Dauerhaft aus: systemctl disable --now write-latency-diag"
-  echo "Konfiguration: $SVC_CONF"
+  echo "Stop: systemctl stop write-latency-diag   Disable permanently: systemctl disable --now write-latency-diag"
+  echo "Configuration: $SVC_CONF"
   exit 0
 }
 
 service_uninstall() {
-  [ "$(id -u)" -eq 0 ] || { echo "Bitte als root starten (sudo)." >&2; exit 1; }
+  [ "$(id -u)" -eq 0 ] || { echo "Please run as root (sudo)." >&2; exit 1; }
   systemctl disable --now write-latency-diag.service 2>/dev/null
   rm -f "$SVC_UNIT"; rm -rf "$SVC_DIR"; systemctl daemon-reload 2>/dev/null
-  echo "Dienst entfernt. Daten und Konfiguration sind noch da: /var/lib/write-latency-diag/metrics.db, $SVC_CONF"
+  echo "Service removed. Data and configuration are still there: /var/lib/write-latency-diag/metrics.db, $SVC_CONF"
   exit 0
 }
 
-# Verschleiß in % (0 = neu) aus den SMART-Daten: zuerst der standardisierte Wert (ATA Device Statistics,
-# NVMe "Percentage Used"), sonst herstellerspezifisch.
-wear_used() { # dev smartctl-ausgabe(-i -A) wdsd
+# Wear in % (0 = new) from the SMART data: first the standardized value (ATA Device Statistics,
+# NVMe "Percentage Used"), otherwise vendor-specific.
+wear_used() { # dev smartctl-output(-i -A) wdsd
   local u
   u=$(smartctl -l devstat "$1" 2>/dev/null | awk '/Percentage Used Endurance Indicator/ {print $4 + 0; exit}')
   [ -n "$u" ] || u=$(awk -v wdsd="$3" '
@@ -268,10 +268,10 @@ wear_used() { # dev smartctl-ausgabe(-i -A) wdsd
 }
 
 # ---------------------------------------------------------------------------
-# --check-disk: neue oder gebrauchte SSD vor dem Einbau prüfen. Das Laufwerk wird dabei gelöscht.
-# Ablauf: SMART vorher, kurzer Selbsttest, TRIM, Flush-Latenz (PLP), Vollschreiben mit Prüfsummen,
-# Leistung im vollen Zustand, Dauerlast wie im Betrieb, langer Selbsttest, SMART nachher, TRIM.
-# Hänger erkennt die Dauerlast nach denselben Regeln wie der Dienst (stall_ms, felt_ms, Lücke < 3 s).
+# --check-disk: check a new or used SSD before installing it. The drive gets erased.
+# Steps: SMART before, short self-test, TRIM, flush latency (PLP), full write with checksums,
+# performance when full, sustained load as in production, long self-test, SMART after, TRIM.
+# The sustained load detects stalls with the same rules as the service (stall_ms, felt_ms, gap < 3 s).
 # ---------------------------------------------------------------------------
 DC_STALL=100
 DC_FELT=1000
@@ -280,10 +280,10 @@ DC_ABORT=0
 DC_STOP=""
 dc_section() { printf '\n=== %s ===\n' "$*"; }
 dc_info() { printf '      %s\n' "$*"; }
-dc_res() { # stufe text (crit, warn, hint, ok)
+dc_res() { # level text (crit, warn, hint, ok)
   DC_RES+=("$1|$2")
   case $1 in
-    crit) printf '  [KRITISCH] %s\n' "$2" ;;
+    crit) printf '  [CRITICAL] %s\n' "$2" ;;
     warn) printf '  [!]  %s\n' "$2" ;;
     hint) printf '  [?]  %s\n' "$2" ;;
     *)    printf '  [ok] %s\n' "$2" ;;
@@ -293,28 +293,28 @@ dc_smart() { smartctl "${DC_SMOPT[@]}" "$@" "$DC_DEV"; }
 dc_attr() { awk -v id="$2" '$1 == id && NF >= 10 { print $10 + 0; exit }' "$1"; }
 dc_devstat() { awk -v n="$2" '$1 ~ /^0x/ && index($0, n) { print $4 + 0; exit }' "$1"; }
 dc_nvme() { awk -v n="$2" 'index($0, n ":") == 1 { v = substr($0, length(n) + 2); gsub(/[ ,%]/, "", v); sub(/\[.*/, "", v); print v + 0; exit }' "$1"; }
-dc_de() { awk -v x="$1" -v f="${2:-%.1f}" 'BEGIN { s = sprintf(f, x); gsub(/\./, ",", s); print s }'; }
-dc_ds() { awk -v d="$DC_NAME" '$3 == d { print $6, $10; exit }' /proc/diskstats; }   # gelesene, geschriebene Sektoren
+dc_num() { awk -v x="$1" -v f="${2:-%.1f}" 'BEGIN { printf f "\n", x }'; }
+dc_ds() { awk -v d="$DC_NAME" '$3 == d { print $6, $10; exit }' /proc/diskstats; }   # sectors read, written
 
-dc_snap() { # name: SMART im Standardformat (für die Auswertung) und vollständig (für die Akte)
+dc_snap() { # name: SMART in the standard format (for the analysis) and complete (for the record)
   dc_smart -i -H -A -l error -l selftest -l devstat > "$OUT/smart-$1.txt" 2>&1
   dc_smart -x > "$OUT/smart-$1-x.txt" 2>&1
 }
 
-dc_written() { # SMART-Datei: geschriebene Bytes laut Laufwerk (leer, wenn unbekannt)
+dc_written() { # SMART file: bytes written according to the drive (empty if unknown)
   local f=$1 lss v
   lss=$(sed -n 's/^Sector Sizes\{0,1\}: *\([0-9]*\) bytes logical.*/\1/p' "$f" | head -1)
   v=$(dc_devstat "$f" "Logical Sectors Written")
   if [ -n "$v" ]; then echo $(( v * ${lss:-512} )); return; fi
   v=$(dc_nvme "$f" "Data Units Written")
   if [ -n "$v" ]; then echo $(( v * 512000 )); return; fi
-  # Samsung zählt in Attribut 241 LBAs, andere Hersteller GiB oder 32 MiB - nur bei Samsung verwenden
+  # Samsung counts LBAs in attribute 241, other vendors GiB or 32 MiB - use only for Samsung
   if grep -qE '^(Device Model|Model Number): *(SAMSUNG|MZ)' "$f"; then
     v=$(dc_attr "$f" 241); [ -n "$v" ] && echo $(( v * 512 ))
   fi
 }
 
-dc_terse() { # fio-terse-datei richtung(r/w) -> "iops mb_s mean_ms p50_ms p99_ms p999_ms max_ms fehler"
+dc_terse() { # fio-terse-file direction(r/w) -> "iops mb_s mean_ms p50_ms p99_ms p999_ms max_ms errors"
   awk -F';' -v dir="$2" '$1 == 3 {
     if (dir == "r") { i = $8; b = $7; m = $16; x = $15; split($24, a, "="); split($30, p, "="); split($32, q, "=") }
     else            { i = $49; b = $48; m = $57; x = $56; split($65, a, "="); split($71, p, "="); split($73, q, "=") }
@@ -322,7 +322,7 @@ dc_terse() { # fio-terse-datei richtung(r/w) -> "iops mb_s mean_ms p50_ms p99_ms
     exit }' "$1"
 }
 
-dc_ticker() { # text gesamt_bytes intervall: Fortschritt im Hintergrund, bis $DC_TICK existiert
+dc_ticker() { # text total_bytes interval: progress in the background until $DC_TICK exists
   local r0 w0 r1 w1 t0 t1 lr lw lt
   read -r r0 w0 < <(dc_ds); t0=$(date +%s); lr=$r0; lw=$w0; lt=$t0
   while [ ! -e "$DC_TICK" ]; do
@@ -331,17 +331,17 @@ dc_ticker() { # text gesamt_bytes intervall: Fortschritt im Hintergrund, bis $DC
     read -r r1 w1 < <(dc_ds)
     awk -v txt="$1" -v tot="$2" -v r="$((r1 - r0))" -v w="$((w1 - w0))" -v dr="$((r1 - lr))" -v dw="$((w1 - lw))" \
         -v dt="$((t1 - lt))" -v el="$((t1 - t0))" 'BEGIN {
-      s = sprintf("      [%d min] %s: geschrieben %.0f GB", el / 60, txt, w * 512 / 1e9)
+      s = sprintf("      [%d min] %s: written %.0f GB", el / 60, txt, w * 512 / 1e9)
       if (tot > 0) s = s sprintf(" (%.0f %%)", 100 * w * 512 / tot)
-      s = s sprintf(", gelesen %.0f GB", r * 512 / 1e9)
+      s = s sprintf(", read %.0f GB", r * 512 / 1e9)
       if (tot > 0) s = s sprintf(" (%.0f %%)", 100 * r * 512 / tot)
-      s = s sprintf(" - gerade %.0f MB/s schreiben, %.0f MB/s lesen", dw * 512 / 1e6 / dt, dr * 512 / 1e6 / dt)
+      s = s sprintf(" - currently %.0f MB/s writing, %.0f MB/s reading", dw * 512 / 1e6 / dt, dr * 512 / 1e6 / dt)
       print s }'
     lr=$r1; lw=$w1; lt=$t1
   done
 }
 
-dc_sampler() { # ausgabedatei: jede Sekunde die diskstats-Zähler des Laufwerks, bis $DC_STOP existiert
+dc_sampler() { # output file: the drive's diskstats counters every second until $DC_STOP exists
   local up
   while [ ! -e "$DC_STOP" ]; do
     read -r up _ < /proc/uptime
@@ -350,68 +350,68 @@ dc_sampler() { # ausgabedatei: jede Sekunde die diskstats-Zähler des Laufwerks,
   done > "$1"
 }
 
-dc_selftest() { # short|long max_minuten
+dc_selftest() { # short|long max_minutes
   local kind=$1 max=$2 n t0 last=-1 rem res
-  if [ "$DC_NVME" = 1 ]; then dc_res hint "Selbsttest ($kind) bei NVMe nicht eingebaut - übersprungen."; return; fi
-  dc_smart -t "$kind" > "$OUT/selbsttest-$kind.txt" 2>&1
-  if ! grep -qiE 'has begun|Testing has begun|will complete' "$OUT/selbsttest-$kind.txt"; then
-    dc_res hint "Selbsttest ($kind) ließ sich nicht starten (Adapter?) - siehe $OUT/selbsttest-$kind.txt"; return
+  if [ "$DC_NVME" = 1 ]; then dc_res hint "Self-test ($kind) not implemented for NVMe - skipped."; return; fi
+  dc_smart -t "$kind" > "$OUT/selftest-$kind.txt" 2>&1
+  if ! grep -qiE 'has begun|Testing has begun|will complete' "$OUT/selftest-$kind.txt"; then
+    dc_res hint "Self-test ($kind) could not be started (adapter?) - see $OUT/selftest-$kind.txt"; return
   fi
   t0=$(date +%s)
   while :; do
     sleep 10
-    if [ $DC_ABORT -eq 1 ]; then dc_smart -X >/dev/null 2>&1; dc_info "Selbsttest abgebrochen."; return; fi
+    if [ $DC_ABORT -eq 1 ]; then dc_smart -X >/dev/null 2>&1; dc_info "Self-test aborted."; return; fi
     n=$(dc_smart -c 2>/dev/null | sed -n 's/^Self-test execution status: *( *\([0-9]*\)).*/\1/p' | head -1)
     [ -n "$n" ] || n=0
     [ "$n" -ge 240 ] 2>/dev/null || break
     rem=$(( (n - 240) * 10 ))
-    if [ "$kind" = long ] && [ "$rem" != "$last" ]; then dc_info "[$(( ($(date +%s) - t0) / 60 )) min] noch $rem % des Selbsttests"; last=$rem; fi
+    if [ "$kind" = long ] && [ "$rem" != "$last" ]; then dc_info "[$(( ($(date +%s) - t0) / 60 )) min] $rem % of the self-test remaining"; last=$rem; fi
     if [ $(( $(date +%s) - t0 )) -gt $(( max * 60 )) ]; then
-      dc_smart -X >/dev/null 2>&1; dc_res warn "Selbsttest ($kind) nach $max min nicht fertig - abgebrochen."; return
+      dc_smart -X >/dev/null 2>&1; dc_res warn "Self-test ($kind) not finished after $max min - aborted."; return
     fi
   done
   res=$(dc_smart -l selftest 2>/dev/null | awk '/^# *1 / { sub(/^# *1 +/, ""); gsub(/  +/, "  "); print; exit }')
   if grep -q 'Completed without error' <<<"$res"; then
-    dc_res ok "Selbsttest ($kind) ohne Fehler ($(( ($(date +%s) - t0 + 30) / 60 )) min)."
+    dc_res ok "Self-test ($kind) without errors ($(( ($(date +%s) - t0 + 30) / 60 )) min)."
   elif [ -z "$res" ]; then
-    dc_res hint "Selbsttest ($kind): kein Ergebnis im Protokoll."
+    dc_res hint "Self-test ($kind): no result in the log."
   else
-    dc_res crit "Selbsttest ($kind) mit Fehler: $res"
+    dc_res crit "Self-test ($kind) with error: $res"
   fi
 }
 
-dc_smart_eval() { # SMART-Datei vorher
+dc_smart_eval() { # SMART file before
   local f=$1 h v used poh pc por wr
   h=$(sed -n 's/^SMART overall-health self-assessment test result: *//p; s/^SMART Health Status: *//p' "$f" | head -1)
   case "$h" in
-    PASSED|OK) dc_res ok "SMART-Gesamtzustand: $h" ;;
-    "") dc_res hint "SMART-Gesamtzustand nicht lesbar (Adapter? smartctl -d sat versuchen)" ;;
-    *) dc_res crit "SMART-Gesamtzustand: $h" ;;
+    PASSED|OK) dc_res ok "SMART overall health: $h" ;;
+    "") dc_res hint "SMART overall health not readable (adapter? try smartctl -d sat)" ;;
+    *) dc_res crit "SMART overall health: $h" ;;
   esac
   while IFS='|' read -r lv tx; do [ -n "$lv" ] && dc_res "$lv" "$tx"; done < <(awk '$1 ~ /^[0-9]+$/ && NF >= 10 {
-      if ($6 + 0 > 0 && $4 + 0 <= $6 + 0) print "crit|SMART " $1 " " $2 ": Wert " $4 + 0 " hat den Grenzwert " $6 + 0 " erreicht"
-      else if ($9 != "-") print "warn|SMART " $1 " " $2 ": war schon einmal am Grenzwert (" $9 ")" }' "$f")
-  # Zähler, die bei einer gesunden SSD 0 sind
-  for v in "5:reallokierte Sektoren:warn" "179:verbrauchte Reserveblöcke:warn" "181:Programmierfehler:warn" \
-           "182:Löschfehler:warn" "183:Bad Blocks im Betrieb:warn" "187:nicht korrigierbare Lesefehler:warn" \
-           "197:wartende (unlesbare) Sektoren:crit" "198:nicht korrigierbare Sektoren:crit" \
-           "199:Übertragungsfehler (CRC, Kabel/Adapter - steigt der Wert?):hint"; do
+      if ($6 + 0 > 0 && $4 + 0 <= $6 + 0) print "crit|SMART " $1 " " $2 ": value " $4 + 0 " has reached the threshold " $6 + 0
+      else if ($9 != "-") print "warn|SMART " $1 " " $2 ": was at the threshold before (" $9 ")" }' "$f")
+  # Counters that are 0 on a healthy SSD
+  for v in "5:reallocated sectors:warn" "179:used reserve blocks:warn" "181:program errors:warn" \
+           "182:erase errors:warn" "183:runtime bad blocks:warn" "187:uncorrectable read errors:warn" \
+           "197:pending (unreadable) sectors:crit" "198:uncorrectable sectors:crit" \
+           "199:transfer errors (CRC, cable/adapter - is the value rising?):hint"; do
     local id=${v%%:*} rest=${v#*:}; local txt=${rest%:*} lv=${rest##*:} x
     x=$(dc_attr "$f" "$id")
     [ "${x:-0}" -gt 0 ] 2>/dev/null && dc_res "$lv" "SMART $id: $x $txt"
   done
   if [ "$DC_NVME" = 1 ]; then
-    x=$(dc_nvme "$f" "Media and Data Integrity Errors"); [ "${x:-0}" -gt 0 ] && dc_res crit "NVMe: $x Medien-/Datenfehler"
+    x=$(dc_nvme "$f" "Media and Data Integrity Errors"); [ "${x:-0}" -gt 0 ] && dc_res crit "NVMe: $x media/data integrity errors"
     x=$(sed -n 's/^Critical Warning: *//p' "$f" | head -1); [ -n "$x" ] && [ "$x" != 0x00 ] && dc_res crit "NVMe Critical Warning: $x"
   fi
   if grep -q 'No Errors Logged' "$f"; then :
   else
     x=$(sed -n 's/^ATA Error Count: *\([0-9]*\).*/\1/p' "$f" | head -1)
     [ -z "$x" ] && x=$(dc_nvme "$f" "Error Information Log Entries")
-    [ "${x:-0}" -gt 0 ] && dc_res hint "Fehlerprotokoll: $x Einträge (oft vom Vorbesitzer, z.B. nach Stromausfall). Details: $OUT/smart-vorher-x.txt"
+    [ "${x:-0}" -gt 0 ] && dc_res hint "Error log: $x entries (often from the previous owner, e.g. after a power failure). Details: $OUT/smart-before-x.txt"
   fi
   x=$(awk '/^# *[0-9]+ / && !/Completed without error|in progress|Aborted by host|Interrupted/ { n++ } END { print n + 0 }' "$f")
-  [ "$x" -gt 0 ] && dc_res warn "Frühere Selbsttests mit Fehler: $x (siehe smart-vorher.txt)"
+  [ "$x" -gt 0 ] && dc_res warn "Earlier self-tests with errors: $x (see smart-before.txt)"
 
   used=$(wear_used "$DC_DEV" "$(cat "$f")" 0)
   [ -z "$used" ] && [ "$DC_NVME" = 1 ] && used=$(dc_nvme "$f" "Percentage Used")
@@ -420,24 +420,24 @@ dc_smart_eval() { # SMART-Datei vorher
   por=$(awk '$1 == 235 && $2 ~ /POR/ { print $10 + 0; exit }' "$f"); [ -z "$por" ] && por=$(dc_nvme "$f" "Unsafe Shutdowns")
   wr=$(dc_written "$f")
   DC_USED=$used; DC_POH=$poh; DC_W0=$wr
-  dc_info "Betriebsstunden: ${poh:-?}$([ -n "$poh" ] && echo " (~$(dc_de "$(awk -v h="$poh" 'BEGIN{print h/24/365}')") Jahre)")  Einschaltvorgänge: ${pc:-?}${por:+  unerwartete Stromausfälle: $por}"
-  [ -n "$wr" ] && dc_info "Geschrieben: $(dc_de "$(awk -v b="$wr" 'BEGIN{print b/1e12}')") TB$( [ -n "$poh" ] && [ "$poh" -gt 24 ] && echo " (Ø $(awk -v b="$wr" -v h="$poh" 'BEGIN{printf "%.0f", b/1e9/(h/24)}') GB/Tag)")"
-  # Samsung (z.B. SM883/PM883): 251 NAND-Schreibmenge und 241 Host-Schreibmenge, beide in LBAs
+  dc_info "Power-on hours: ${poh:-?}$([ -n "$poh" ] && echo " (~$(dc_num "$(awk -v h="$poh" 'BEGIN{print h/24/365}')") years)")  Power cycles: ${pc:-?}${por:+  unexpected power losses: $por}"
+  [ -n "$wr" ] && dc_info "Written: $(dc_num "$(awk -v b="$wr" 'BEGIN{print b/1e12}')") TB$( [ -n "$poh" ] && [ "$poh" -gt 24 ] && echo " (avg $(awk -v b="$wr" -v h="$poh" 'BEGIN{printf "%.0f", b/1e9/(h/24)}') GB/day)")"
+  # Samsung (e.g. SM883/PM883): 251 NAND writes and 241 host writes, both in LBAs
   local nw hw
   nw=$(dc_attr "$f" 251); hw=$(dc_attr "$f" 241)
   if grep -qE '^(Device Model|Model Number): *(SAMSUNG|MZ)' "$f" && [ "${nw:-0}" -gt 0 ] && [ "${hw:-0}" -gt 0 ]; then
     DC_WAF=$(awk -v n="$nw" -v h="$hw" 'BEGIN { printf "%.2f", n / h }')
-    dc_info "Schreibverstärkung über die Lebensdauer (NAND/Host): $(dc_de "$DC_WAF" %.2f)"
+    dc_info "Write amplification over the lifetime (NAND/host): $(dc_num "$DC_WAF" %.2f)"
   fi
-  if [ -z "$used" ]; then dc_res hint "Verschleiß nicht lesbar."
-  elif [ "$used" -ge 90 ]; then dc_res crit "Verschleiß $used % - die Nennlebensdauer ist fast erreicht."
-  elif [ "$used" -ge 50 ]; then dc_res warn "Verschleiß $used % - mehr als die Hälfte der Nennlebensdauer ist verbraucht."
-  elif [ "$used" -ge 10 ]; then dc_res hint "Verschleiß $used %."
-  else dc_res ok "Verschleiß $used %."
+  if [ -z "$used" ]; then dc_res hint "Wear not readable."
+  elif [ "$used" -ge 90 ]; then dc_res crit "Wear $used % - the rated endurance is almost reached."
+  elif [ "$used" -ge 50 ]; then dc_res warn "Wear $used % - more than half of the rated endurance is used up."
+  elif [ "$used" -ge 10 ]; then dc_res hint "Wear $used %."
+  else dc_res ok "Wear $used %."
   fi
 }
 
-dc_events() { # sampler-datei start_epoch: Hänger nach den Regeln des Dienstes, Ausgabe "start dauer max_ms gefühlt"
+dc_events() { # sampler-file start_epoch: stalls by the service's rules, output "start duration max_ms felt"
   awk -v stall="$DC_STALL" -v felt="$DC_FELT" -v ep="$2" '
     function close_ev() { printf "%.0f %.0f %.0f %d\n", ep + s, e - s, (mw > mf ? mw : mf), ((mw >= felt || mf >= felt || e - s >= 2) ? 1 : 0); open = 0 }
     NR == 1 { pt = $1; pr = $2; pw = $3; pwt = $4; pio = $6; pf = $7; pft = $8; next }
@@ -456,8 +456,8 @@ dc_events() { # sampler-datei start_epoch: Hänger nach den Regeln des Dienstes,
     END { if (open) close_ev() }' "$1"
 }
 
-dc_realistic() { # sekunden
-  local rt=$1 job="$OUT/dauerlast.fio" ep n nf
+dc_realistic() { # seconds
+  local rt=$1 job="$OUT/sustained.fio" ep n nf
   cat > "$job" <<JOB
 [global]
 filename=$DC_DEV
@@ -465,7 +465,7 @@ direct=1
 time_based
 runtime=$rt
 randrepeat=0
-# wie ein Server mit Datenbanken: kleine Sync-Schreibzugriffe (je einer mit Flush), dazu ein Video-Strom und Lesezugriffe
+# like a server with databases: small sync writes (each with a flush), plus a video stream and reads
 [sync]
 rw=randwrite
 bs=4k
@@ -473,15 +473,15 @@ ioengine=psync
 sync=1
 rate_iops=16
 size=2g
-write_lat_log=$OUT/dauerlast
-[strom]
+write_lat_log=$OUT/sustained
+[stream]
 rw=write
 bs=128k
 ioengine=psync
 rate=1m
 offset=10%
 size=20%
-[lesen]
+[reads]
 rw=randread
 bs=4k
 ioengine=psync
@@ -489,63 +489,63 @@ rate_iops=50
 norandommap
 JOB
   DC_STOP="$OUT/.stop"; rm -f "$DC_STOP"
-  ep=$(awk -v now="$(date +%s.%N)" '{ printf "%.3f", now - $1 }' /proc/uptime)   # Epoche zum Zeitpunkt uptime 0
-  dc_sampler "$OUT/dauerlast-diskstats.txt" &
+  ep=$(awk -v now="$(date +%s.%N)" '{ printf "%.3f", now - $1 }' /proc/uptime)   # epoch at uptime 0
+  dc_sampler "$OUT/sustained-diskstats.txt" &
   local sp=$!
-  ( i=0; while [ ! -e "$DC_STOP" ] && [ $i -lt "$rt" ]; do sleep 10; i=$((i + 10)); [ $((i % 600)) -eq 0 ] && [ $i -lt "$rt" ] && printf '      [%d min] Dauerlast läuft, noch %d min\n' $((i / 60)) $(( (rt - i) / 60 )); done ) &
+  ( i=0; while [ ! -e "$DC_STOP" ] && [ $i -lt "$rt" ]; do sleep 10; i=$((i + 10)); [ $((i % 600)) -eq 0 ] && [ $i -lt "$rt" ] && printf '      [%d min] sustained load running, %d min left\n' $((i / 60)) $(( (rt - i) / 60 )); done ) &
   local tp=$!
-  fio --minimal "$job" > "$OUT/dauerlast.terse" 2> "$OUT/dauerlast.err"
+  fio --minimal "$job" > "$OUT/sustained.terse" 2> "$OUT/sustained.err"
   touch "$DC_STOP"; wait "$sp" "$tp" 2>/dev/null; DC_STOP=""
 
-  dc_events "$OUT/dauerlast-diskstats.txt" "$ep" > "$OUT/dauerlast-haenger.txt"
-  n=$(wc -l < "$OUT/dauerlast-haenger.txt"); nf=$(awk '$4 == 1' "$OUT/dauerlast-haenger.txt" | wc -l)
+  dc_events "$OUT/sustained-diskstats.txt" "$ep" > "$OUT/sustained-stalls.txt"
+  n=$(wc -l < "$OUT/sustained-stalls.txt"); nf=$(awk '$4 == 1' "$OUT/sustained-stalls.txt" | wc -l)
   DC_EV=$n; DC_EVF=$nf
-  # Wartezeit jedes einzelnen Sync-Schreibzugriffs (das, was ein Programm spürt)
-  local lat="$OUT/dauerlast_clat.1.log" st
-  [ -f "$lat" ] || lat="$OUT/dauerlast_lat.1.log"
+  # Wait time of every single sync write (what a program notices)
+  local lat="$OUT/sustained_clat.1.log" st
+  [ -f "$lat" ] || lat="$OUT/sustained_lat.1.log"
   st=$(awk -F', *' -v stall="$DC_STALL" -v felt="$DC_FELT" '{ v = $2 / 1e6; n++; if (v > mx) mx = v; if (v >= stall) a++; if (v >= felt) b++ }
        END { printf "%d %.1f %d %d\n", n, mx, a, b }' "$lat" 2>/dev/null)
   read -r DC_SN DC_SMAX DC_SSLOW DC_SFELT <<<"${st:-0 0 0 0}"
-  dc_info "Sync-Schreibzugriffe: ${DC_SN} (16/s), längste Wartezeit $(dc_de "$DC_SMAX" %.0f) ms, ab $DC_STALL ms: $DC_SSLOW, ab $(dc_de "$(awk -v f=$DC_FELT 'BEGIN{print f/1000}')" %.0f) s: $DC_SFELT"
+  dc_info "Sync writes: ${DC_SN} (16/s), longest wait $(dc_num "$DC_SMAX" %.0f) ms, >= $DC_STALL ms: $DC_SSLOW, >= $(dc_num "$(awk -v f=$DC_FELT 'BEGIN{print f/1000}')" %.0f) s: $DC_SFELT"
   if [ "$n" -gt 0 ]; then
-    dc_info "Hänger (Gerät, Regeln wie im Dienst): $n, davon spürbar $nf"
+    dc_info "Stalls (device, same rules as the service): $n, noticeable $nf"
     awk '{ c = "date -d @" $1 " +%H:%M:%S"; c | getline ts; close(c)
-           printf "        %s  %3d s  max %6.0f ms%s\n", ts, $2, $3, ($4 ? "  spürbar" : "") }' "$OUT/dauerlast-haenger.txt" | head -25
+           printf "        %s  %3d s  max %6.0f ms%s\n", ts, $2, $3, ($4 ? "  noticeable" : "") }' "$OUT/sustained-stalls.txt" | head -25
   fi
   if [ "$nf" -ge 3 ]; then
     local md mg
-    md=$(awk '$4 == 1 { print $2 }' "$OUT/dauerlast-haenger.txt" | sort -n | awk '{ a[NR] = $1 } END { print a[int((NR + 1) / 2)] }')
-    mg=$(awk '$4 == 1 { if (p) print ($1 - p) / 60; p = $1 }' "$OUT/dauerlast-haenger.txt" | sort -n | awk '{ a[NR] = $1 } END { print a[int((NR + 1) / 2)] }')
-    dc_info "Muster: Dauer Median $md s, Abstand Median $(dc_de "$mg") min"
+    md=$(awk '$4 == 1 { print $2 }' "$OUT/sustained-stalls.txt" | sort -n | awk '{ a[NR] = $1 } END { print a[int((NR + 1) / 2)] }')
+    mg=$(awk '$4 == 1 { if (p) print ($1 - p) / 60; p = $1 }' "$OUT/sustained-stalls.txt" | sort -n | awk '{ a[NR] = $1 } END { print a[int((NR + 1) / 2)] }')
+    dc_info "Pattern: duration median $md s, interval median $(dc_num "$mg") min"
   fi
   if [ "$nf" -gt 0 ] || [ "${DC_SFELT:-0}" -gt 0 ]; then
-    dc_res crit "Spürbare Hänger unter Dauerlast: $nf (längste Wartezeit $(dc_de "$DC_SMAX" %.0f) ms) - genau das Verhalten, das ersetzt werden soll."
+    dc_res crit "Noticeable stalls under sustained load: $nf (longest wait $(dc_num "$DC_SMAX" %.0f) ms) - exactly the behavior that is to be replaced."
   elif [ "$n" -gt 0 ] || [ "${DC_SSLOW:-0}" -gt 0 ]; then
-    dc_res hint "Kurze Verzögerungen unter Dauerlast, nicht spürbar: $n Hänger am Gerät, $DC_SSLOW Schreibzugriffe ab $DC_STALL ms, längste Wartezeit $(dc_de "$DC_SMAX" %.0f) ms."
+    dc_res hint "Short delays under sustained load, not noticeable: $n stalls on the device, $DC_SSLOW writes >= $DC_STALL ms, longest wait $(dc_num "$DC_SMAX" %.0f) ms."
   else
-    dc_res ok "Keine Hänger in $((rt / 60)) min Dauerlast, längste Wartezeit $(dc_de "$DC_SMAX" %.0f) ms."
+    dc_res ok "No stalls in $((rt / 60)) min of sustained load, longest wait $(dc_num "$DC_SMAX" %.0f) ms."
   fi
 }
 
 disk_check() {
   local dev d real t busy p rot bytes model serial fw sata lss ext force est rt ans
-  [ "$(id -u)" -eq 0 ] || { echo "Bitte als root starten (sudo)." >&2; exit 1; }
+  [ "$(id -u)" -eq 0 ] || { echo "Please run as root (sudo)." >&2; exit 1; }
   for t in fio smartctl blkdiscard lsblk; do
     command -v $t >/dev/null 2>&1 && continue
-    echo "$t fehlt: apt install $(case $t in smartctl) echo smartmontools ;; fio) echo fio ;; *) echo util-linux ;; esac)" >&2; exit 1
+    echo "$t is missing: apt install $(case $t in smartctl) echo smartmontools ;; fio) echo fio ;; *) echo util-linux ;; esac)" >&2; exit 1
   done
-  [ -n "$1" ] || { echo "Aufruf: $0 --check-disk /dev/sdX [-r SEK] [-o DIR]" >&2; exit 1; }
+  [ -n "$1" ] || { echo "Usage: $0 --check-disk /dev/sdX [-r SEC] [-o DIR]" >&2; exit 1; }
   dev=$(readlink -f "$1"); d=${dev##*/}
   if [ ! -b "$dev" ] || [ ! -d "/sys/block/$d" ]; then
-    echo "$1 ist kein ganzes Laufwerk. Bitte das Laufwerk angeben, keine Partition (z.B. /dev/sdf statt /dev/sdf1)." >&2; exit 1
+    echo "$1 is not a whole drive. Please give the drive, not a partition (e.g. /dev/sdf instead of /dev/sdf1)." >&2; exit 1
   fi
-  busy=$(lsblk -nrpo NAME,MOUNTPOINT "$dev" 2>/dev/null | awk 'NF > 1 { print "eingehängt: " $1 " auf " $2 }')
+  busy=$(lsblk -nrpo NAME,MOUNTPOINT "$dev" 2>/dev/null | awk 'NF > 1 { print "mounted: " $1 " on " $2 }')
   for p in "/sys/block/$d"/holders/* "/sys/block/$d/$d"*/holders/*; do
-    [ -e "$p" ] && busy+=$'\n'"wird benutzt von ${p##*/} (RAID/LVM/dm)"
+    [ -e "$p" ] && busy+=$'\n'"used by ${p##*/} (RAID/LVM/dm)"
   done
-  grep -q "^$dev" /proc/swaps 2>/dev/null && busy+=$'\n'"als Swap aktiv"
+  grep -q "^$dev" /proc/swaps 2>/dev/null && busy+=$'\n'"active as swap"
   if [ -n "${busy//$'\n'/}" ]; then
-    echo "$dev ist in Benutzung - Abbruch:" >&2; sed '/^$/d; s/^/  /' <<<"$busy" >&2; exit 1
+    echo "$dev is in use - aborting:" >&2; sed '/^$/d; s/^/  /' <<<"$busy" >&2; exit 1
   fi
 
   DC_DEV=$dev; DC_NAME=$d; DC_SMOPT=(); DC_NVME=0; DC_USB=0
@@ -561,99 +561,99 @@ disk_check() {
   local teep=$!
   trap 'DC_ABORT=1; [ -n "$DC_STOP" ] && touch "$DC_STOP"' INT TERM
 
-  echo "write-latency-diag $VERSION - SSD-Prüfung - $(date '+%F %T') - Ausgabe: $OUT"
+  echo "write-latency-diag $VERSION - SSD check - $(date '+%F %T') - output: $OUT"
   for m in "${UPDATE_MSGS[@]}"; do echo "  $m"; done
-  dc_snap vorher
-  local sm="$OUT/smart-vorher.txt"
+  dc_snap before
+  local sm="$OUT/smart-before.txt"
   model=$(sed -n 's/^\(Device Model\|Model Number\|Product\): *//p' "$sm" | head -1)
   [ -z "$model" ] && model=$(sed 's/ *$//' "/sys/block/$d/device/model" 2>/dev/null)
   serial=$(sed -n 's/^Serial [Nn]umber: *//p' "$sm" | head -1)
   fw=$(sed -n 's/^Firmware Version: *//p' "$sm" | head -1)
   sata=$(sed -n 's/^SATA Version is: *//p' "$sm" | head -1)
-  lss=$(sed -n 's/^Sector Sizes\{0,1\}: *\([0-9]*\) bytes logical, \([0-9]*\) bytes physical.*/\1 logisch \/ \2 physisch/p; s/^Sector Sizes\{0,1\}: *\([0-9]*\) bytes logical\/physical.*/\1 logisch und physisch/p' "$sm" | head -1)
+  lss=$(sed -n 's/^Sector Sizes\{0,1\}: *\([0-9]*\) bytes logical, \([0-9]*\) bytes physical.*/\1 logical \/ \2 physical/p; s/^Sector Sizes\{0,1\}: *\([0-9]*\) bytes logical\/physical.*/\1 logical and physical/p' "$sm" | head -1)
   bytes=$(( $(cat "/sys/block/$d/size") * 512 ))
   rot=$(cat "/sys/block/$d/queue/rotational" 2>/dev/null)
   if grep -q '^Rotation Rate: *Solid State' "$sm"; then rot=0
   elif grep -qE '^Rotation Rate: *[0-9]+ rpm' "$sm"; then rot=1
   elif [ "$DC_NVME" = 1 ]; then rot=0; fi
-  # USB-Adapter melden SSDs oft als rotierend: dort nur abbrechen, wenn SMART eine Drehzahl nennt
+  # USB adapters often report SSDs as rotational: abort there only if SMART reports a rotation rate
   if [ "$rot" = 1 ] && [ -z "${WLAT_TEST_ALL_SSD:-}" ] && { [ $DC_USB -eq 0 ] || grep -qE '^Rotation Rate: *[0-9]+ rpm' "$sm"; }; then
-    echo "$dev ist eine HDD (${model:-Modell unbekannt}) - diese Prüfung ist für SSDs gedacht. Abbruch."; rm -rf "$OUT"; exit 1
+    echo "$dev is an HDD (${model:-model unknown}) - this check is meant for SSDs. Aborting."; rm -rf "$OUT"; exit 1
   fi
 
-  dc_section "Laufwerk"
-  dc_info "Gerät:      $dev  ${model:-?}  SN ${serial:-?}  FW ${fw:-?}"
-  dc_info "Größe:      $(dc_de "$(awk -v b=$bytes 'BEGIN{print b/1e9}')") GB ($(dc_de "$(awk -v b=$bytes 'BEGIN{print b/2^30}')") GiB)${lss:+, Sektoren $lss}"
-  dc_info "Anschluss:  ${sata:-?}$([ $DC_USB -eq 1 ] && echo "  - über USB-Adapter")${DC_SMOPT[*]:+  (SMART über ${DC_SMOPT[*]})}"
-  lsblk -no NAME,SIZE,FSTYPE,LABEL "$dev" 2>/dev/null | sed 's/^/      Inhalt:     /'
+  dc_section "Drive"
+  dc_info "Device:     $dev  ${model:-?}  SN ${serial:-?}  FW ${fw:-?}"
+  dc_info "Size:       $(dc_num "$(awk -v b=$bytes 'BEGIN{print b/1e9}')") GB ($(dc_num "$(awk -v b=$bytes 'BEGIN{print b/2^30}')") GiB)${lss:+, sectors $lss}"
+  dc_info "Interface:  ${sata:-?}$([ $DC_USB -eq 1 ] && echo "  - via USB adapter")${DC_SMOPT[*]:+  (SMART via ${DC_SMOPT[*]})}"
+  lsblk -no NAME,SIZE,FSTYPE,LABEL "$dev" 2>/dev/null | sed 's/^/      Content:    /'
   if [ $DC_USB -eq 1 ]; then
-    dc_res hint "Angeschlossen über USB: Der Adapter verlängert jede Anfrage, manche geben Flush und TRIM nicht richtig weiter. Hänger und Fehler werden trotzdem erkannt, die Flush-Latenz (PLP) aber nur grob. Am besten direkt an SATA prüfen."
+    dc_res hint "Attached via USB: the adapter adds latency to every request, and some do not pass flush and TRIM on correctly. Stalls and errors are still detected, but the flush latency (PLP) only roughly. Best checked directly on SATA."
   fi
   if grep -q '(current: [1-3]\.[0-9] Gb/s)' <<<"$sata" && ! grep -q '(current: 6.0' <<<"$sata"; then
-    dc_res hint "SATA-Link läuft nicht mit 6 Gb/s: $sata - Kabel/Port prüfen."
+    dc_res hint "SATA link is not running at 6 Gb/s: $sata - check cable/port."
   fi
 
   ext=$(dc_smart -c 2>/dev/null | awk '/Extended self-test routine/ { f = 1 } f && /polling time/ { gsub(/[^0-9]/, " "); split($0, a, " "); print a[1] + 0; exit }')
   [ -n "$rt" ] || rt=3600; [ "$R_SET" = 1 ] && rt=$TEST_RUNTIME
   est=$(awk -v b=$bytes -v rt="$rt" -v e="${ext:-0}" 'BEGIN { printf "%.0f", 6 + b / 450e6 / 60 + b / 500e6 / 60 + 3 + rt / 60 + e }')
   echo
-  echo "  Ablauf (zusammen etwa $((est / 60)) h $((est % 60)) min):"
-  echo "    1. SMART-Werte und kurzer Selbsttest            5. Leistung im vollen Zustand (4k, je 30 s)"
-  echo "    2. ganze Fläche trimmen (TRIM)                   6. Dauerlast wie im Betrieb ($((rt / 60)) min), Hänger-Erkennung"
-  echo "    3. Flush-Latenz: wirkt Power-Loss-Protection?    7. langer Selbsttest${ext:+ (~$ext min)}"
-  echo "    4. ganze SSD beschreiben und mit Prüfsummen      8. SMART-Vergleich vorher/nachher, Fläche wieder trimmen"
-  echo "       zurücklesen ($(awk -v b=$bytes 'BEGIN{printf "%.0f", b/1e9}') GB, Dauer-Schreibrate)"
+  echo "  Steps (about $((est / 60)) h $((est % 60)) min in total):"
+  echo "    1. SMART values and short self-test              5. Performance when full (4k, 30 s each)"
+  echo "    2. trim the whole drive (TRIM)                   6. Sustained load as in production ($((rt / 60)) min), stall detection"
+  echo "    3. Flush latency: does power loss protection     7. Long self-test${ext:+ (~$ext min)}"
+  echo "       work?                                         8. SMART comparison before/after, trim the drive again"
+  echo "    4. Write the whole SSD and read it back with checksums ($(awk -v b=$bytes 'BEGIN{printf "%.0f", b/1e9}') GB, sustained write rate)"
   echo
-  echo "  ACHTUNG: Alle Daten auf $dev ($model, SN $serial) werden gelöscht."
+  echo "  CAUTION: All data on $dev ($model, SN $serial) will be erased."
   if [ -n "${WLAT_CONFIRM_DEV:-}" ]; then ans=$WLAT_CONFIRM_DEV
-  else printf '  Zum Bestätigen den Gerätenamen eintippen (%s): ' "$d"; read -r ans; fi
-  if [ "$ans" != "$d" ]; then echo "  Abgebrochen, nichts verändert."; exec >&- 2>&-; wait "$teep" 2>/dev/null; rm -rf "$OUT"; exit 1; fi
+  else printf '  Type the device name to confirm (%s): ' "$d"; read -r ans; fi
+  if [ "$ans" != "$d" ]; then echo "  Cancelled, nothing changed."; exec >&- 2>&-; wait "$teep" 2>/dev/null; rm -rf "$OUT"; exit 1; fi
 
   local dm0 ds0 t_start
   dm0=$(dmesg 2>/dev/null | wc -l); read -r _ ds0 < <(dc_ds); t_start=$(date +%s)
 
-  dc_section "1. SMART vorher"
+  dc_section "1. SMART before"
   dc_smart_eval "$sm"
   dc_selftest short 15
 
   if [ $DC_ABORT -eq 0 ]; then
-    dc_section "2. TRIM über die ganze Fläche"
+    dc_section "2. TRIM over the whole drive"
     force=""; blkdiscard --help 2>&1 | grep -q -- '--force' && force=-f
-    if blkdiscard $force "$dev" 2> "$OUT/trim.err"; then dc_res ok "Ganze Fläche getrimmt - die SSD startet ohne Altlasten."
-    else dc_res hint "TRIM nicht möglich ($(head -1 "$OUT/trim.err")) - bei USB-Adaptern häufig. Die Prüfung läuft trotzdem."; fi
+    if blkdiscard $force "$dev" 2> "$OUT/trim.err"; then dc_res ok "Whole drive trimmed - the SSD starts without leftovers."
+    else dc_res hint "TRIM not possible ($(head -1 "$OUT/trim.err")) - common with USB adapters. The check continues anyway."; fi
   fi
 
   if [ $DC_ABORT -eq 0 ]; then
-    dc_section "3. Flush-Latenz (4k-Schreiben mit O_SYNC, QD1, 60 s)"
+    dc_section "3. Flush latency (4k writes with O_SYNC, QD1, 60 s)"
     local wc r iops mbs mean p50 p99 p999 mx err
     wc=$(cat "/sys/block/$d/queue/write_cache" 2>/dev/null)
     fio --name=flush --filename="$dev" --rw=randwrite --bs=4k --ioengine=psync --direct=1 --sync=1 --size=1g \
         --runtime=60 --time_based --randrepeat=0 --minimal > "$OUT/flush.terse" 2> "$OUT/flush.err"
     read -r iops mbs mean p50 p99 p999 mx err < <(dc_terse "$OUT/flush.terse" w)
     DC_FP50=$p50; DC_FIOPS=$iops
-    dc_info "$(dc_de "${iops:-0}" %.0f) Schreibzugriffe/s, Wartezeit Median $(dc_de "${p50:-0}" %.3f) ms, p99 $(dc_de "${p99:-0}" %.3f) ms, p99,9 $(dc_de "${p999:-0}" %.3f) ms, max $(dc_de "${mx:-0}" %.1f) ms"
-    dc_info "Schreibcache laut Kernel: ${wc:-?}$([ "$wc" = "write through" ] && echo " - der Kernel schickt keine Flushes, gemessen wird nur das Schreiben")"
-    if [ -z "$p50" ]; then dc_res warn "Flush-Test lieferte kein Ergebnis - siehe $OUT/flush.err"
-    elif awk -v x="$p50" 'BEGIN { exit !(x < 0.5) }'; then dc_res ok "Flush wird sofort bestätigt (Median $(dc_de "$p50" %.2f) ms) - Power-Loss-Protection wirkt."
-    elif awk -v x="$p50" 'BEGIN { exit !(x < 2) }'; then dc_res hint "Flush dauert Median $(dc_de "$p50" %.2f) ms - langsamer als bei SSDs mit PLP üblich (< 0,5 ms)$([ $DC_USB -eq 1 ] && echo ", ein Teil ist der USB-Adapter")."
-    else dc_res "$([ $DC_USB -eq 1 ] && echo warn || echo crit)" "Flush dauert Median $(dc_de "$p50" %.1f) ms - so verhält sich eine SSD ohne wirksame Power-Loss-Protection."; fi
-    awk -v x="${mx:-0}" -v s=$DC_STALL 'BEGIN { exit !(x >= s) }' && dc_res warn "Einzelner Schreibzugriff wartete $(dc_de "$mx" %.0f) ms."
+    dc_info "$(dc_num "${iops:-0}" %.0f) writes/s, wait median $(dc_num "${p50:-0}" %.3f) ms, p99 $(dc_num "${p99:-0}" %.3f) ms, p99.9 $(dc_num "${p999:-0}" %.3f) ms, max $(dc_num "${mx:-0}" %.1f) ms"
+    dc_info "Write cache according to the kernel: ${wc:-?}$([ "$wc" = "write through" ] && echo " - the kernel sends no flushes, only the write itself is measured")"
+    if [ -z "$p50" ]; then dc_res warn "Flush test returned no result - see $OUT/flush.err"
+    elif awk -v x="$p50" 'BEGIN { exit !(x < 0.5) }'; then dc_res ok "Flush is acknowledged immediately (median $(dc_num "$p50" %.2f) ms) - power loss protection works."
+    elif awk -v x="$p50" 'BEGIN { exit !(x < 2) }'; then dc_res hint "Flush takes median $(dc_num "$p50" %.2f) ms - slower than usual for SSDs with PLP (< 0.5 ms)$([ $DC_USB -eq 1 ] && echo ", part of it is the USB adapter")."
+    else dc_res "$([ $DC_USB -eq 1 ] && echo warn || echo crit)" "Flush takes median $(dc_num "$p50" %.1f) ms - this is how an SSD without effective power loss protection behaves."; fi
+    awk -v x="${mx:-0}" -v s=$DC_STALL 'BEGIN { exit !(x >= s) }' && dc_res warn "A single write waited $(dc_num "$mx" %.0f) ms."
   fi
 
   if [ $DC_ABORT -eq 0 ]; then
-    dc_section "4. Ganze SSD beschreiben und mit Prüfsummen zurücklesen"
+    dc_section "4. Write the whole SSD and read it back with checksums"
     DC_TICK="$OUT/.tick"; rm -f "$DC_TICK"
-    dc_ticker "Vollschreiben" "$bytes" 300 &
+    dc_ticker "Full write" "$bytes" 300 &
     local tk=$!
-    fio --name=voll --filename="$dev" --rw=write --bs=1M --ioengine=libaio --iodepth=16 --direct=1 --size=100% \
-        --verify=crc32c --verify_state_save=0 --write_bw_log="$OUT/voll" --log_avg_msec=1000 --minimal \
-        > "$OUT/voll.terse" 2> "$OUT/voll.err"
+    fio --name=full --filename="$dev" --rw=write --bs=1M --ioengine=libaio --iodepth=16 --direct=1 --size=100% \
+        --verify=crc32c --verify_state_save=0 --write_bw_log="$OUT/fullwrite" --log_avg_msec=1000 --minimal \
+        > "$OUT/fullwrite.terse" 2> "$OUT/fullwrite.err"
     touch "$DC_TICK"; wait "$tk" 2>/dev/null
     local wr rr verr bw
-    read -r _ wr _ _ _ _ _ err < <(dc_terse "$OUT/voll.terse" w)
-    read -r _ rr _ < <(dc_terse "$OUT/voll.terse" r)
-    verr=$(grep -ciE 'verify|bad magic|crc32c' "$OUT/voll.err")
-    bw=$(ls "$OUT"/voll_bw*.log 2>/dev/null | head -1)
+    read -r _ wr _ _ _ _ _ err < <(dc_terse "$OUT/fullwrite.terse" w)
+    read -r _ rr _ < <(dc_terse "$OUT/fullwrite.terse" r)
+    verr=$(grep -ciE 'verify|bad magic|crc32c' "$OUT/fullwrite.err")
+    bw=$(ls "$OUT"/fullwrite_bw*.log 2>/dev/null | head -1)
     if [ -n "$bw" ]; then
       read -r DC_WMED DC_WMIN DC_WDEC < <(awk -F', *' '$3 == 1 { n++; v[n] = $2 * 1024 / 1e6 }
         END {
@@ -665,92 +665,92 @@ disk_check() {
           dec = ""; for (d = 1; d <= 10; d++) dec = dec (d > 1 ? "/" : "") (k[d] ? sprintf("%.0f", s[d] / k[d]) : "-")
           printf "%.0f %.0f %s\n", c[int((n + 1) / 2)], mn, dec }' "$bw")
     fi
-    dc_info "Schreiben: Median ${DC_WMED:-?} MB/s, langsamste Sekunde ${DC_WMIN:-?} MB/s, Lesen (Prüfung): $(dc_de "${rr:-0}" %.0f) MB/s"
-    [ -n "$DC_WDEC" ] && dc_info "Schreibrate je 10 % der Fläche (MB/s): $DC_WDEC"
-    if [ $DC_ABORT -eq 1 ]; then dc_info "abgebrochen"
-    elif [ "${verr:-0}" -gt 0 ] || [ "${err:-0}" != 0 ]; then dc_res crit "Fehler beim Schreiben/Prüfen (fio-Fehler ${err:-?}, Prüfsummenfehler: $verr) - siehe $OUT/voll.err"
-    else dc_res ok "Ganze Fläche geschrieben und fehlerfrei zurückgelesen."; fi
+    dc_info "Write: median ${DC_WMED:-?} MB/s, slowest second ${DC_WMIN:-?} MB/s, read (verify): $(dc_num "${rr:-0}" %.0f) MB/s"
+    [ -n "$DC_WDEC" ] && dc_info "Write rate per 10 % of the drive (MB/s): $DC_WDEC"
+    if [ $DC_ABORT -eq 1 ]; then dc_info "aborted"
+    elif [ "${verr:-0}" -gt 0 ] || [ "${err:-0}" != 0 ]; then dc_res crit "Errors while writing/verifying (fio error ${err:-?}, checksum errors: $verr) - see $OUT/fullwrite.err"
+    else dc_res ok "Whole drive written and read back without errors."; fi
     if [ -n "$DC_WMED" ] && [ "$DC_WMED" -gt 0 ] && [ $(( DC_WMIN * 100 / DC_WMED )) -lt 30 ]; then
-      dc_res hint "Schreibrate bricht zeitweise auf ${DC_WMIN} MB/s ein (Median ${DC_WMED} MB/s) - typisch für einen vollen SLC-Cache, bei MLC-SSDs mit PLP ungewöhnlich."
+      dc_res hint "Write rate drops at times to ${DC_WMIN} MB/s (median ${DC_WMED} MB/s) - typical for a full SLC cache, unusual for MLC SSDs with PLP."
     fi
   fi
 
   if [ $DC_ABORT -eq 0 ]; then
-    dc_section "5. Leistung im vollen Zustand (4k, je 30 s)"
+    dc_section "5. Performance when full (4k, 30 s each)"
     local spec name rw qd eng dir
-    for spec in "Lesen-QD32:randread:32:libaio:r" "Schreiben-QD32:randwrite:32:libaio:w" "Lesen-QD1:randread:1:psync:r"; do
+    for spec in "Read-QD32:randread:32:libaio:r" "Write-QD32:randwrite:32:libaio:w" "Read-QD1:randread:1:psync:r"; do
       [ $DC_ABORT -eq 1 ] && break
       IFS=: read -r name rw qd eng dir <<<"$spec"
       fio --name="$name" --filename="$dev" --rw="$rw" --bs=4k --ioengine="$eng" --iodepth="$qd" --direct=1 --size=100% \
-          --runtime=30 --time_based --norandommap --randrepeat=0 --minimal > "$OUT/leistung-$name.terse" 2>> "$OUT/leistung.err"
-      read -r iops _ mean _ p99 _ mx _ < <(dc_terse "$OUT/leistung-$name.terse" "$dir")
-      [ "$name" = Schreiben-QD32 ] && DC_WIOPS=$iops
-      dc_info "$(printf '%-15s' "$name") $(printf '%7s' "$(dc_de "${iops:-0}" %.0f)") IOPS, Ø $(dc_de "${mean:-0}" %.2f) ms, p99 $(dc_de "${p99:-0}" %.2f) ms, max $(dc_de "${mx:-0}" %.1f) ms"
+          --runtime=30 --time_based --norandommap --randrepeat=0 --minimal > "$OUT/perf-$name.terse" 2>> "$OUT/perf.err"
+      read -r iops _ mean _ p99 _ mx _ < <(dc_terse "$OUT/perf-$name.terse" "$dir")
+      [ "$name" = Write-QD32 ] && DC_WIOPS=$iops
+      dc_info "$(printf '%-15s' "$name") $(printf '%7s' "$(dc_num "${iops:-0}" %.0f)") IOPS, avg $(dc_num "${mean:-0}" %.2f) ms, p99 $(dc_num "${p99:-0}" %.2f) ms, max $(dc_num "${mx:-0}" %.1f) ms"
     done
   fi
 
   if [ $DC_ABORT -eq 0 ]; then
-    dc_section "6. Dauerlast wie im Betrieb ($((rt / 60)) min): 16 Sync-Schreibzugriffe/s, 1 MB/s Strom, 50 Lesezugriffe/s"
-    dc_info "Die SSD ist jetzt voll beschrieben und ungetrimmt - härter als im Betrieb."
+    dc_section "6. Sustained load as in production ($((rt / 60)) min): 16 sync writes/s, 1 MB/s stream, 50 reads/s"
+    dc_info "The SSD is now completely written and untrimmed - harder than in production."
     dc_realistic "$rt"
   fi
 
-  [ $DC_ABORT -eq 0 ] && { dc_section "7. Langer Selbsttest"; dc_selftest long $(( ${ext:-60} * 3 + 30 )); }
+  [ $DC_ABORT -eq 0 ] && { dc_section "7. Long self-test"; dc_selftest long $(( ${ext:-60} * 3 + 30 )); }
 
-  dc_section "8. SMART nachher"
-  dc_snap nachher
-  local sm2="$OUT/smart-nachher.txt" id a b w1 ds1 dw
+  dc_section "8. SMART after"
+  dc_snap after
+  local sm2="$OUT/smart-after.txt" id a b w1 ds1 dw
   for id in 5 179 181 182 183 187 196 197 198 199; do
     a=$(dc_attr "$sm" $id); b=$(dc_attr "$sm2" $id)
     [ -n "$a" ] && [ -n "$b" ] && [ "$b" -gt "$a" ] || continue
-    if [ $id = 199 ]; then dc_res warn "SMART 199 (Übertragungsfehler) während der Prüfung gestiegen: $a -> $b - Kabel/Adapter prüfen."
-    else dc_res crit "SMART $id $(awk -v id=$id '$1 == id { print $2; exit }' "$sm2") während der Prüfung gestiegen: $a -> $b"; fi
+    if [ $id = 199 ]; then dc_res warn "SMART 199 (transfer errors) rose during the check: $a -> $b - check cable/adapter."
+    else dc_res crit "SMART $id $(awk -v id=$id '$1 == id { print $2; exit }' "$sm2") rose during the check: $a -> $b"; fi
   done
   h=$(sed -n 's/^SMART overall-health self-assessment test result: *//p' "$sm2" | head -1)
-  [ -n "$h" ] && [ "$h" != PASSED ] && dc_res crit "SMART-Gesamtzustand nachher: $h"
+  [ -n "$h" ] && [ "$h" != PASSED ] && dc_res crit "SMART overall health after: $h"
   local kmsg
   local pat=$d port; port=$(grep -o 'ata[0-9]*' <<<"$real" | head -1); [ -n "$port" ] && pat="$d|$port"
   kmsg=$(dmesg 2>/dev/null | tail -n +$((dm0 + 1)) | grep -wE "$pat" | grep -iE 'error|fail|timeout|reset' | head -5)
-  [ -n "$kmsg" ] && dc_res crit "Kernel meldet Fehler am Laufwerk während der Prüfung: $(head -1 <<<"$kmsg")" && sed 's/^/        /' <<<"$kmsg"
+  [ -n "$kmsg" ] && dc_res crit "Kernel reports errors on the drive during the check: $(head -1 <<<"$kmsg")" && sed 's/^/        /' <<<"$kmsg"
   w1=$(dc_written "$sm2"); read -r _ ds1 < <(dc_ds); dw=$(( (ds1 - ds0) * 512 ))
   if [ -n "$DC_W0" ] && [ -n "$w1" ] && [ "$dw" -gt 1000000000 ]; then
     local ratio; ratio=$(awk -v a="$DC_W0" -v b="$w1" -v d="$dw" 'BEGIN { printf "%.0f", 100 * (b - a) / d }')
-    dc_info "Schreibzähler: Kernel $(dc_de "$(awk -v x=$dw 'BEGIN{print x/1e9}')" %.0f) GB, SSD +$(dc_de "$(awk -v a="$DC_W0" -v b="$w1" 'BEGIN{print (b-a)/1e9}')" %.0f) GB ($ratio %)"
-    if [ "$ratio" -lt 80 ] || [ "$ratio" -gt 125 ]; then dc_res hint "Der Schreibzähler der SSD passt nicht zur geschriebenen Menge - die SMART-Werte (Verschleiß, Geschriebenes) sind dann mit Vorsicht zu lesen."
-    else dc_res ok "Schreibzähler der SSD stimmt mit der geschriebenen Menge überein."; fi
+    dc_info "Write counter: kernel $(dc_num "$(awk -v x=$dw 'BEGIN{print x/1e9}')" %.0f) GB, SSD +$(dc_num "$(awk -v a="$DC_W0" -v b="$w1" 'BEGIN{print (b-a)/1e9}')" %.0f) GB ($ratio %)"
+    if [ "$ratio" -lt 80 ] || [ "$ratio" -gt 125 ]; then dc_res hint "The SSD's write counter does not match the amount written - read its SMART values (wear, data written) with caution."
+    else dc_res ok "The SSD's write counter matches the amount written."; fi
   fi
   if [ -n "$DC_WAF" ]; then
     local n1 n2 h1 h2
     n1=$(dc_attr "$sm" 251); n2=$(dc_attr "$sm2" 251); h1=$(dc_attr "$sm" 241); h2=$(dc_attr "$sm2" 241)
     if [ -n "$n2" ] && [ -n "$h2" ] && [ $(( h2 - h1 )) -gt 2000000 ]; then
       DC_WAFT=$(awk -v n=$(( n2 - n1 )) -v h=$(( h2 - h1 )) 'BEGIN { printf "%.2f", n / h }')
-      dc_info "Schreibverstärkung während der Prüfung (NAND/Host): $(dc_de "$DC_WAFT" %.2f)"
+      dc_info "Write amplification during the check (NAND/host): $(dc_num "$DC_WAFT" %.2f)"
       if awk -v x="$DC_WAFT" 'BEGIN { exit !(x >= 3) }'; then
-        dc_res hint "Hohe Schreibverstärkung während der Prüfung ($(dc_de "$DC_WAFT" %.1f)) - bei einer SSD mit PLP sind Werte um 1 üblich."
+        dc_res hint "High write amplification during the check ($(dc_num "$DC_WAFT" %.1f)) - values around 1 are usual for an SSD with PLP."
       fi
     fi
   fi
   if [ $DC_ABORT -eq 0 ]; then
-    blkdiscard $force "$dev" 2>/dev/null && dc_info "Fläche wieder getrimmt - die SSD ist leer und bereit zum Einbau."
+    blkdiscard $force "$dev" 2>/dev/null && dc_info "Drive trimmed again - the SSD is empty and ready to be installed."
   fi
 
-  dc_section "Ergebnis"
+  dc_section "Result"
   local nc=0 nw=0 x verdict
   for x in "${DC_RES[@]}"; do case ${x%%|*} in crit) nc=$((nc + 1)) ;; warn) nw=$((nw + 1)) ;; esac; done
-  if [ $DC_ABORT -eq 1 ]; then verdict="ABGEBROCHEN (Ergebnis unvollständig)"
-  elif [ $nc -gt 0 ]; then verdict="NICHT BESTANDEN"
-  elif [ $nw -gt 0 ]; then verdict="BESTANDEN MIT AUFFÄLLIGKEITEN"
-  else verdict="BESTANDEN"; fi
+  if [ $DC_ABORT -eq 1 ]; then verdict="ABORTED (result incomplete)"
+  elif [ $nc -gt 0 ]; then verdict="FAILED"
+  elif [ $nw -gt 0 ]; then verdict="PASSED WITH FINDINGS"
+  else verdict="PASSED"; fi
   echo "  $verdict"
   for x in "${DC_RES[@]}"; do
-    case ${x%%|*} in crit) echo "   - [KRITISCH] ${x#*|}" ;; warn) echo "   - [!] ${x#*|}" ;; hint) echo "   - [?] ${x#*|}" ;; esac
+    case ${x%%|*} in crit) echo "   - [CRITICAL] ${x#*|}" ;; warn) echo "   - [!] ${x#*|}" ;; hint) echo "   - [?] ${x#*|}" ;; esac
   done
   local line
-  line="$(date '+%F %H:%M')  $d  ${model:-?}  SN ${serial:-?}  FW ${fw:-?}  Verschleiß ${DC_USED:-?} %  ${DC_POH:-?} h  $( [ -n "$DC_W0" ] && echo "$(dc_de "$(awk -v b="$DC_W0" 'BEGIN{print b/1e12}')") TB geschrieben  ")$([ -n "$DC_WAF" ] && echo "WAF $(dc_de "$DC_WAF" %.2f)${DC_WAFT:+ (Prüfung $(dc_de "$DC_WAFT" %.2f))}  ")Flush $([ -n "$DC_FP50" ] && dc_de "$DC_FP50" %.2f || echo ?) ms  4k-Schreiben QD32 $([ -n "$DC_WIOPS" ] && dc_de "$DC_WIOPS" %.0f || echo ?) IOPS  Schreiben ${DC_WMED:-?} MB/s (min ${DC_WMIN:-?})  Hänger ${DC_EV:-?}/spürbar ${DC_EVF:-?}  => $verdict"
+  line="$(date '+%F %H:%M')  $d  ${model:-?}  SN ${serial:-?}  FW ${fw:-?}  wear ${DC_USED:-?} %  ${DC_POH:-?} h  $( [ -n "$DC_W0" ] && echo "$(dc_num "$(awk -v b="$DC_W0" 'BEGIN{print b/1e12}')") TB written  ")$([ -n "$DC_WAF" ] && echo "WAF $(dc_num "$DC_WAF" %.2f)${DC_WAFT:+ (check $(dc_num "$DC_WAFT" %.2f))}  ")flush $([ -n "$DC_FP50" ] && dc_num "$DC_FP50" %.2f || echo ?) ms  4k write QD32 $([ -n "$DC_WIOPS" ] && dc_num "$DC_WIOPS" %.0f || echo ?) IOPS  write ${DC_WMED:-?} MB/s (min ${DC_WMIN:-?})  stalls ${DC_EV:-?}/noticeable ${DC_EVF:-?}  => $verdict"
   echo
-  echo "  Kurzfassung: $line"
-  echo "$line" >> "$OUTBASE/ssdcheck-kurzfassung.txt"
-  echo "  Report: $OUT/report.txt   Alle Kurzfassungen: $OUTBASE/ssdcheck-kurzfassung.txt   Dauer: $(( ($(date +%s) - t_start) / 60 )) min"
+  echo "  Summary: $line"
+  echo "$line" >> "$OUTBASE/ssdcheck-summary.txt"
+  echo "  Report: $OUT/report.txt   All summaries: $OUTBASE/ssdcheck-summary.txt   Duration: $(( ($(date +%s) - t_start) / 60 )) min"
   exec >&- 2>&-
   wait "$teep" 2>/dev/null
   [ $nc -gt 0 ] && exit 2
@@ -771,14 +771,14 @@ if [ -z "$PASSIVE" ]; then
   if [ ${#TARGETS[@]} -eq 0 ]; then PASSIVE=60; else PASSIVE=0; fi
 fi
 if [ -n "$SEQ_SIZE" ] && [ ${#TARGETS[@]} -eq 0 ]; then
-  echo "-S braucht mindestens ein -t DIR" >&2
+  echo "-S needs at least one -t DIR" >&2
   exit 1
 fi
 
 for t in "${TARGETS[@]}"; do
   mkdir -p "$t" 2>/dev/null
   if ! touch "$t/.wlat-probe" 2>/dev/null; then
-    echo "Kann nicht in '$t' schreiben." >&2
+    echo "Cannot write to '$t'." >&2
     exit 1
   fi
   rm -f "$t/.wlat-probe"
@@ -787,9 +787,9 @@ done
 HAVE_FIO=0
 command -v fio >/dev/null 2>&1 && [ -z "${NO_FIO:-}" ] && HAVE_FIO=1
 HAVE_BT=0
-# Rotierende Laufwerke (HDDs): 5-20 ms pro Anfrage und Flush sind dort normal, sie zählen nicht als SSD-Befund
+# Rotational drives (HDDs): 5-20 ms per request and flush are normal there, they do not count as an SSD finding
 ROTDEVS=$(for p in /sys/block/*; do [ "$(cat "$p/queue/rotational" 2>/dev/null)" = 1 ] && printf '%s ' "${p##*/}"; done)
-[ -n "${WLAT_TEST_ALL_SSD:-}" ] && ROTDEVS=""   # nur für Tests in VMs, deren Platten als rotierend gelten
+[ -n "${WLAT_TEST_ALL_SSD:-}" ] && ROTDEVS=""   # only for tests in VMs whose disks count as rotational
 [ $TRACE -eq 1 ] && [ "$(id -u)" -eq 0 ] && command -v bpftrace >/dev/null 2>&1 && HAVE_BT=1
 HZ=$(getconf CLK_TCK 2>/dev/null || echo 100)
 
@@ -813,21 +813,21 @@ section() { printf '\n=== %s ===\n' "$*"; }
 info()    { printf '      %s\n' "$*"; }
 ok()      { printf '  [ok] %s\n' "$*"; }
 warn()    { printf '  [!]  %s\n' "$*"; WARN+=("$*"); }
-hint()    { printf '  [?]  %s\n' "$*"; WARN+=("(prüfen) $*"); }
+hint()    { printf '  [?]  %s\n' "$*"; WARN+=("(check) $*"); }
 
 declare -A ROLE
-SYSBLOCK=${WLAT_TEST_SYSBLOCK:-/sys/block}   # nur für Tests der RAID-/Boot-Prüfungen in VMs ohne md
-declare -A DEVPOH        # Betriebsstunden je Laufwerk (SMART), für die Prüfung der RAID10-Spiegelgruppen
-MDMEMBERS=""          # physische Laufwerke in mdadm-Arrays (für die Auswertung)
+SYSBLOCK=${WLAT_TEST_SYSBLOCK:-/sys/block}   # only for tests of the RAID/boot checks in VMs without md
+declare -A DEVPOH        # power-on hours per drive (SMART), for checking the RAID10 mirror groups
+MDMEMBERS=""          # physical drives in mdadm arrays (for the analysis)
 
-# Die SMART-Zähler gelten für die ganze Lebensdauer. Jeder Lauf speichert sie, damit der
-# nächste Lauf die Schreibverstärkung seit dem letzten Messpunkt zeigt (aktueller Zustand).
+# The SMART counters cover the whole lifetime. Every run saves them so that the
+# next run shows the write amplification since the last data point (current state).
 waf_history() { # dev serial num den host_gib nand_in_gib(0/1)
   local f="$STATE_DIR/smart-history.csv" now prev
-  WH_RATE=""   # NAND-Schreibmenge pro Tag seit dem Vergleichspunkt (Einheit wie num), für die Verschleiß-Prognose
+  WH_RATE=""   # NAND writes per day since the reference point (same unit as num), for the wear forecast
   [ -n "$2" ] || return
   now=$(date +%s)
-  # bevorzugt einen Messpunkt >= 12 h alt, sonst >= 1 h
+  # preferably a data point >= 12 h old, otherwise >= 1 h
   [ -r "$f" ] && prev=$(awk -F, -v s="$2" -v now="$now" '$2 == s {
       if (now - $1 >= 43200) l12 = $0; else if (now - $1 >= 3600) l1 = $0 }
       END { print (l12 != "" ? l12 : l1) }' "$f")
@@ -836,45 +836,45 @@ waf_history() { # dev serial num den host_gib nand_in_gib(0/1)
       split(l, p, ","); h = (now - p[1]) / 3600
       dn = num - p[3]; dd = den - p[4]; dh = host - p[5]
       c = "date -d @" p[1] " \"+%F %H:%M\""; c | getline ts; close(c)
-      printf "      Seit %s (%.0f h): Host +%.0f GiB", ts, h, dh
+      printf "      Since %s (%.0f h): host +%.0f GiB", ts, h, dh
       if (gib) printf ", NAND +%.0f GiB", dn
-      if (dd > 0) printf "  =>  WAF in diesem Zeitraum %.1f", dn / dd
-      printf "   (Host %.0f GiB/Tag)\n", dh * 24 / h
+      if (dd > 0) printf "  =>  WAF in this period %.1f", dn / dd
+      printf "   (host %.0f GiB/day)\n", dh * 24 / h
       exit (dd > 0 && dn >= 5 * dd) ? 3 : 0 }'
-    [ $? -eq 3 ] && warn "$1: Auch aktuell (seit dem letzten Messpunkt) hohe Schreibverstärkung - die Ursache besteht weiter."
+    [ $? -eq 3 ] && warn "$1: high write amplification also currently (since the last data point) - the cause persists."
     WH_RATE=$(awk -F, -v now="$now" -v num="$3" -v l="$prev" 'BEGIN { split(l, p, ","); d = (now - p[1]) / 86400; if (d > 0 && num > p[3]) printf "%.6f", (num - p[3]) / d }')
   else
-    info "Verlauf: Messpunkt gespeichert ($f). Der nächste Lauf (frühestens in 1 h, aussagekräftig ab ~12 h) zeigt die aktuelle WAF."
+    info "History: data point saved ($f). The next run (at the earliest in 1 h, meaningful from ~12 h) shows the current WAF."
   fi
   mkdir -p "$STATE_DIR" 2>/dev/null && printf '%s,%s,%s,%s,%s\n' "$now" "$2" "$3" "$4" "$5" >> "$f"
 }
 
-# Restlaufzeit: Bei x % Verschleiß nach num NAND-Einheiten reicht das Budget für num*(100-x)/x weitere.
-# "Bisheriger Ø" rechnet mit der ganzen Laufzeit, "aktuelles Tempo" mit der NAND-Rate seit dem letzten Messpunkt.
+# Remaining lifetime: at x % wear after num NAND units, the budget lasts for num*(100-x)/x more.
+# "Average so far" uses the whole lifetime, "current rate" the NAND rate since the last data point.
 wear_forecast() { # dev used% poh num rate_per_day
   [ -n "$2" ] || return
   awk -v u="$2" -v poh="${3:-0}" -v num="${4:-0}" -v r="${5:-0}" '
-    function fmt(d) { return d >= 730 ? sprintf("~%.1f Jahre", d / 365) : d >= 60 ? sprintf("~%.0f Monate", d / 30.4) : sprintf("~%.0f Tage", d) }
+    function fmt(d) { return d >= 730 ? sprintf("~%.1f years", d / 365) : d >= 60 ? sprintf("~%.0f months", d / 30.4) : sprintf("~%.0f days", d) }
     BEGIN {
-      if (u <= 0) { print "      Verschleiß: 0 % (praktisch neu)"; exit }
-      if (u >= 100) { print "      Verschleiß: " u " % - Nennlebensdauer erreicht"; exit 3 }
-      printf "      Verschleiß: %d %% - Restlaufzeit", u
+      if (u <= 0) { print "      Wear: 0 % (practically new)"; exit }
+      if (u >= 100) { print "      Wear: " u " % - rated endurance reached"; exit 3 }
+      printf "      Wear: %d %% - remaining lifetime", u
       lt = (poh > 24) ? (100 - u) / u * poh / 24 : -1
       cur = (r > 0 && num > 0) ? num * (100 - u) / u / r : -1
-      if (lt >= 0) printf " bei bisherigem Ø %s", fmt(lt)
-      if (cur >= 0) printf "%s bei aktuellem Tempo %s", (lt >= 0 ? "," : ""), fmt(cur)
-      if (lt < 0 && cur < 0) printf " unbekannt"
+      if (lt >= 0) printf " at the average so far %s", fmt(lt)
+      if (cur >= 0) printf "%s at the current rate %s", (lt >= 0 ? "," : ""), fmt(cur)
+      if (lt < 0 && cur < 0) printf " unknown"
       print ""
       d = (cur >= 0) ? cur : lt
       exit (d >= 0 && d < 365) ? 3 : (d >= 0 && d < 730) ? 4 : 0 }'
   case $? in
-    3) warn "$1: Bei diesem Tempo ist die SSD in unter einem Jahr am Ende ihrer Nennlebensdauer - Ersatz einplanen." ;;
-    4) hint "$1: Bei diesem Tempo ist die SSD in unter zwei Jahren am Ende ihrer Nennlebensdauer." ;;
+    3) warn "$1: At this rate the SSD reaches the end of its rated endurance in less than a year - plan a replacement." ;;
+    4) hint "$1: At this rate the SSD reaches the end of its rated endurance in less than two years." ;;
   esac
 }
 
-# Abstand in Tagen für einen OnCalendar-Ausdruck. systemd zeigt daily als "*-*-* 00:00:00",
-# weekly als "Mon *-*-* 00:00:00" und monthly als "*-*-01 00:00:00". Unbekanntes: leer (dann gemessen).
+# Interval in days for an OnCalendar expression. systemd shows daily as "*-*-* 00:00:00",
+# weekly as "Mon *-*-* 00:00:00" and monthly as "*-*-01 00:00:00". Unknown: empty (then measured).
 trim_period() {
   case "$1" in
     *..*|*,*) echo "" ;;
@@ -885,13 +885,13 @@ trim_period() {
   esac
 }
 
-# Reicht wöchentliches TRIM? ext4 merkt sich, welche Blockgruppen schon getrimmt sind. Jeder weitere
-# fstrim-Lauf im selben Boot meldet deshalb ungefähr, wie viel seit dem letzten Lauf gelöscht wurde
-# (eher etwas zu viel, weil ganze Gruppen neu getrimmt werden). Der erste Lauf nach einem Neustart
-# gibt den ganzen freien Platz frei und zählt nicht. Bei XFS/btrfs ist die Zahl nicht aussagekräftig.
-# Bis zum nächsten TRIM verhält sich Gelöschtes für die SSD wie belegter Platz. Consumer-SSDs haben nur
-# ~7 % Reserve: Sammelt sich mehr als ~2 % der Kapazität an, lohnt tägliches TRIM.
-trim_advice() { # OnCalendar-Wert des fstrim.timer
+# Is weekly TRIM enough? ext4 remembers which block groups are already trimmed. Every further
+# fstrim run in the same boot therefore reports roughly how much was deleted since the last run
+# (rather a bit too much, because whole groups are trimmed again). The first run after a reboot
+# releases all free space and does not count. On XFS/btrfs the number is not meaningful.
+# Until the next TRIM, deleted data behaves like used space for the SSD. Consumer SSDs have only
+# ~7 % spare area: if more than ~2 % of the capacity accumulates, daily TRIM pays off.
+trim_advice() { # OnCalendar value of fstrim.timer
   command -v journalctl >/dev/null 2>&1 || return
   local mnt src size rota res period
   while read -r src mnt; do
@@ -912,7 +912,7 @@ trim_advice() { # OnCalendar-Wert des fstrim.timer
       }
       END {
         if (n == 0) { print "none"; exit }
-        # Median der letzten (bis zu) 5 Läufe
+        # Median of the last (up to) 5 runs
         k = 0; for (i = (n > 5 ? n - 4 : 1); i <= n; i++) { k++; r[k] = R[i]; d[k] = I[i] }
         for (i = 1; i <= k; i++) for (j = i + 1; j <= k; j++) {
           if (r[j] < r[i]) { x = r[i]; r[i] = r[j]; r[j] = x }
@@ -922,7 +922,7 @@ trim_advice() { # OnCalendar-Wert des fstrim.timer
       }')
     [ -n "$res" ] || continue
     if [ "$res" = none ]; then
-      info "TRIM $mnt: noch keine Empfehlung möglich - es braucht mindestens zwei fstrim-Läufe ohne Neustart dazwischen."
+      info "TRIM $mnt: no recommendation possible yet - it needs at least two fstrim runs without a reboot in between."
       continue
     fi
     local rate interval runs
@@ -930,23 +930,23 @@ trim_advice() { # OnCalendar-Wert des fstrim.timer
     [ -n "$period" ] || period=$interval
     awk -v m="$mnt" -v rate="$rate" -v p="$period" -v size="${size:-0}" -v runs="$runs" -v cal="${1:-?}" 'BEGIN {
       back = rate * p; pct = size > 0 ? 100 * back / size : 0
-      printf "      TRIM %s: Ø %.1f GiB/Tag gelöscht (aus %d fstrim-Läufen) - bei Zeitplan \"%s\" bis zu %.0f GiB (%.1f %% der Kapazität) ungetrimmt\n", m, rate / 2^30, runs, cal, back / 2^30, pct
+      printf "      TRIM %s: avg %.1f GiB/day deleted (from %d fstrim runs) - with schedule \"%s\" up to %.0f GiB (%.1f %% of the capacity) untrimmed\n", m, rate / 2^30, runs, cal, back / 2^30, pct
       exit (p > 1 && pct >= 2) ? 3 : (p <= 1 && rate * 7 < 0.02 * size) ? 4 : (p > 1) ? 5 : 0 }'
     case $? in
-      3) hint "TRIM $mnt: Zwischen zwei TRIM-Läufen sammelt sich viel gelöschter Platz an, den die SSD noch für belegt hält (mehr Garbage Collection, höhere Schreibverstärkung). Täglich trimmen: systemctl edit fstrim.timer und dort [Timer] OnCalendar= sowie OnCalendar=daily eintragen." ;;
-      4) info "TRIM $mnt: Es wird wenig gelöscht - wöchentliches TRIM würde hier auch reichen." ;;
-      5) ok "TRIM $mnt: Der Zeitplan reicht - bis zum nächsten Lauf sammelt sich wenig gelöschter Platz an." ;;
+      3) hint "TRIM $mnt: Between two TRIM runs a lot of deleted space accumulates that the SSD still considers used (more garbage collection, higher write amplification). Trim daily: systemctl edit fstrim.timer and add [Timer] OnCalendar= and OnCalendar=daily there." ;;
+      4) info "TRIM $mnt: Little is deleted - weekly TRIM would be enough here as well." ;;
+      5) ok "TRIM $mnt: The schedule is sufficient - little deleted space accumulates until the next run." ;;
     esac
   done < <(awk '$3 == "ext4" && $1 ~ "^/dev/" {print $1, $2}' /proc/mounts | sort -u -k2,2)
 }
 
 # ---------------------------------------------------------------------------
-# Systemcheck
+# System check
 # ---------------------------------------------------------------------------
-# RAID10 near-Layout: Spiegelgruppen anzeigen und prüfen, ob die beiden ältesten SSDs in derselben Gruppe liegen
+# RAID10 near layout: show the mirror groups and check whether the two oldest SSDs are in the same group
 md_groups() { # /sys/block/mdX level
   local md=$1 lvl=$2 s sl part
-  # RAID10 near-Layout: aufeinanderfolgende Slots bilden Spiegelgruppen, die immer dieselben Daten bekommen
+  # RAID10 near layout: consecutive slots form mirror groups that always receive the same data
   if [ "$lvl" = raid10 ]; then
     local layout nc ndev groups
     layout=$(cat "$md/md/layout" 2>/dev/null); ndev=$(cat "$md/md/raid_disks" 2>/dev/null)
@@ -960,8 +960,8 @@ md_groups() { # /sys/block/mdX level
           echo "$((sl / nc)) $part"
         done | sort -n)
       groups=$(awk '{ g[$1] = g[$1] (g[$1] == "" ? "" : "+") $2 } END { for (i = 0; i in g; i++) printf "%s%s", (i ? ", " : ""), g[i] }' <<<"$glist")
-      [ -n "$groups" ] && info "${md##*/}: Spiegelgruppen (bekommen jeweils dieselben Schreibzugriffe): $groups"
-      # Liegen die beiden mit Abstand ältesten SSDs in derselben Gruppe, fallen sie womöglich kurz nacheinander aus
+      [ -n "$groups" ] && info "${md##*/}: mirror groups (each receives the same writes): $groups"
+      # If the two by far oldest SSDs are in the same group, they may fail shortly after each other
       oldpair=$(while read -r g dv; do [ -n "$dv" ] && echo "$g $dv ${DEVPOH[$dv]:-x}"; done <<<"$glist" | awk '
         $3 == "x" { miss = 1 } { g[NR] = $1; p[NR] = $2; h[NR] = $3 + 0 }
         END {
@@ -970,30 +970,30 @@ md_groups() { # /sys/block/mdX level
           b = 0; for (i = 1; i <= NR; i++) if (i != a && (!b || h[i] > h[b])) b = i
           if (g[a] != g[b]) exit
           mo = 0; for (i = 1; i <= NR; i++) if (i != a && i != b && h[i] > mo) mo = h[i]
-          if (h[b] > 2 * mo && h[b] > 8760) printf "%s und %s (%d und %d Betriebsstunden)", p[a], p[b], h[a], h[b] }')
-      [ -n "$oldpair" ] && hint "${md##*/}: Die beiden mit Abstand ältesten SSDs $oldpair bilden eine Spiegelgruppe. Fallen beide aus, bevor eine ersetzt ist, sind die Daten weg - beim nächsten Tausch oder Neuaufbau auf verschiedene Gruppen verteilen."
+          if (h[b] > 2 * mo && h[b] > 8760) printf "%s and %s (%d and %d power-on hours)", p[a], p[b], h[a], h[b] }')
+      [ -n "$oldpair" ] && hint "${md##*/}: The two by far oldest SSDs $oldpair form a mirror group. If both fail before one is replaced, the data is gone - spread them across different groups at the next replacement or rebuild."
     fi
   fi
 }
 
-# Bitmap, mdadm.conf und Reserve am Ende der RAID-Mitglieder
+# Bitmap, mdadm.conf and spare room at the end of the RAID members
 md_extra_checks() { # /sys/block/mdX level
   local md=$1 lvl=$2 s f
   if [[ $lvl =~ ^raid(1|10|4|5|6)$ ]]; then
-    # Ohne Write-Intent-Bitmap muss nach jedem Absturz das ganze Array neu synchronisiert werden
+    # Without a write-intent bitmap the whole array has to be resynchronized after every crash
     if [ "$(cat "$md/md/bitmap/location" 2>/dev/null || echo none)" = none ] && [ "$(cat "$md/size" 2>/dev/null || echo 0)" -gt 200000000 ]; then
-      hint "${md##*/}: keine Write-Intent-Bitmap - nach einem Absturz oder Stromausfall muss das ganze RAID neu synchronisiert werden (Stunden, bremst währenddessen). Nachrüsten im laufenden Betrieb: mdadm --grow --bitmap=internal /dev/${md##*/}"
+      hint "${md##*/}: no write-intent bitmap - after a crash or power failure the whole RAID has to be resynchronized (hours, slows things down meanwhile). Add it while running: mdadm --grow --bitmap=internal /dev/${md##*/}"
     fi
-    # Fehlt das Array in mdadm.conf, setzt es das initramfs womöglich unter anderem Namen (md127) zusammen
+    # If the array is missing from mdadm.conf, the initramfs may assemble it under a different name (md127)
     local mdconf="" uuid
     for f in /etc/mdadm/mdadm.conf /etc/mdadm.conf; do [ -f "$f" ] && { mdconf=$f; break; }; done
     if [ -n "$mdconf" ] && command -v mdadm >/dev/null 2>&1; then
       uuid=$(mdadm --detail --export "/dev/${md##*/}" 2>/dev/null | sed -n 's/^MD_UUID=//p')
       if [ -n "$uuid" ] && ! grep -qi "UUID=$uuid" "$mdconf"; then
-        hint "${md##*/} steht nicht in $mdconf - beim Start wird es womöglich unter anderem Namen oder gar nicht zusammengesetzt. Eintragen: mdadm --detail --scan | grep $uuid >> $mdconf && update-initramfs -u"
+        hint "${md##*/} is not listed in $mdconf - at boot it may be assembled under a different name or not at all. Add it: mdadm --detail --scan | grep $uuid >> $mdconf && update-initramfs -u"
       fi
     fi
-    # Reserve am Ende: Eine Ersatz-SSD gleicher Nenngröße hat nicht immer gleich viele Sektoren
+    # Spare room at the end: a replacement SSD of the same nominal size does not always have as many sectors
     local tight="" part disk free
     for s in "$md"/slaves/*; do
       [ -e "$s" ] || continue
@@ -1006,14 +1006,14 @@ md_extra_checks() { # /sys/block/mdX level
       fi
       [ "$free" -lt 1048576 ] && tight="$tight $part"
     done
-    [ -n "$tight" ] && info "Tipp: Die RAID-Mitglieder von ${md##*/} reichen bis ans Ende der Laufwerke (${tight# }). Eine Ersatz-SSD muss dann mindestens genauso viele Sektoren haben - gleiche Nenngröße reicht nicht immer. Beim nächsten Neuaufbau am Ende etwa 1 GiB frei lassen."
+    [ -n "$tight" ] && info "Tip: The RAID members of ${md##*/} reach up to the end of the drives (${tight# }). A replacement SSD then needs at least as many sectors - the same nominal size is not always enough. Leave about 1 GiB free at the end at the next rebuild."
   fi
 }
 
-# ext4-Einstellungen (Verhalten bei Fehlern, Reserve, Ausrichtung am RAID) und Boot-Ausfallsicherheit bei RAID als /
+# ext4 settings (behavior on errors, reserve, RAID alignment) and boot redundancy with RAID as /
 fs_boot_check() {
   [ "$(id -u)" -eq 0 ] || return
-  section "Dateisystem und Boot"
+  section "File system and boot"
   local src mnt fstype opts real tl eb bc rbc bs st sw md lvl chunk nd layout data es ew any=0
   while read -r src mnt fstype opts; do
     [ "$fstype" = ext4 ] || continue
@@ -1024,16 +1024,16 @@ fs_boot_check() {
     bc=$(sed -n 's/^Block count: *//p' <<<"$tl"); rbc=$(sed -n 's/^Reserved block count: *//p' <<<"$tl")
     bs=$(sed -n 's/^Block size: *//p' <<<"$tl")
     st=$(sed -n 's/^RAID stride: *//p' <<<"$tl"); sw=$(sed -n 's/^RAID stripe width: *//p' <<<"$tl")
-    info "ext4 $mnt ($src): bei Fehlern ${eb:-?}, Reserve für root $(awk -v r="${rbc:-0}" -v b="${bc:-1}" -v s="${bs:-4096}" 'BEGIN { x = sprintf("%.1f", 100 * r / b); sub(/\./, ",", x); printf "%s %% (%.0f GiB)", x, r * s / 2^30 }'), RAID stride ${st:-0} / stripe-width ${sw:-0}"
+    info "ext4 $mnt ($src): on errors ${eb:-?}, reserved for root $(awk -v r="${rbc:-0}" -v b="${bc:-1}" -v s="${bs:-4096}" 'BEGIN { printf "%.1f %% (%.0f GiB)", 100 * r / b, r * s / 2^30 }'), RAID stride ${st:-0} / stripe-width ${sw:-0}"
     if [ "$eb" != Continue ] && grep -qE '(^|,)errors=continue(,|$)' <<<"$opts"; then
-      hint "ext4 $mnt: Im Dateisystem steht '$eb', eingehängt ist es aber noch mit errors=continue (gilt erst nach dem nächsten Einhängen). Sofort übernehmen: mount -o remount,errors=remount-ro $mnt"
+      hint "ext4 $mnt: The file system is set to '$eb', but it is still mounted with errors=continue (takes effect only at the next mount). Apply now: mount -o remount,errors=remount-ro $mnt"
     elif [ "$eb" = Continue ] && ! grep -qE '(^|,)errors=(remount-ro|panic)' <<<"$opts"; then
-      hint "ext4 $mnt: Bei Fehlern im Dateisystem schreibt ext4 weiter ('Continue') - ein Schaden kann sich unbemerkt ausbreiten. Sicherer: tune2fs -e remount-ro $src (bei einem Fehler wird dann nur noch gelesen)."
+      hint "ext4 $mnt: On file system errors ext4 keeps writing ('Continue') - damage can spread unnoticed. Safer: tune2fs -e remount-ro $src (on an error it then only reads)."
     fi
     if awk -v r="${rbc:-0}" -v b="${bc:-1}" -v s="${bs:-4096}" 'BEGIN { exit !(100 * r / b >= 2 && r * s / 2^30 >= 10) }'; then
-      info "Tipp: ext4 $mnt hält $(awk -v r="$rbc" -v s="$bs" 'BEGIN { printf "%.0f", r * s / 2^30 }') GiB für root zurück. Laufen die Dienste ohnehin als root (z.B. Docker), schützt das kaum etwas: tune2fs -m 1 $src"
+      info "Tip: ext4 $mnt reserves $(awk -v r="$rbc" -v s="$bs" 'BEGIN { printf "%.0f", r * s / 2^30 }') GiB for root. If the services run as root anyway (e.g. Docker), this protects hardly anything: tune2fs -m 1 $src"
     fi
-    # Ausrichtung am Software-RAID: stride = Chunk / Blockgröße, stripe-width = stride x Datenlaufwerke
+    # Alignment with software RAID: stride = chunk / block size, stripe-width = stride x data drives
     real=$(readlink -f "$src"); md=${real##*/}
     if [[ $md == md* ]] && [ -f "$SYSBLOCK/$md/md/level" ]; then
       lvl=$(cat "$SYSBLOCK/$md/md/level"); chunk=$(cat "$SYSBLOCK/$md/md/chunk_size" 2>/dev/null); nd=$(cat "$SYSBLOCK/$md/md/raid_disks" 2>/dev/null)
@@ -1047,17 +1047,17 @@ fs_boot_check() {
       if [ -n "$data" ] && [ "${chunk:-0}" -gt 0 ] && [ "${bs:-0}" -gt 0 ]; then
         es=$((chunk / bs)); ew=$((es * data))
         if [ "${st:-0}" != "$es" ] || [ "${sw:-0}" != "$ew" ]; then
-          hint "ext4 $mnt: RAID-Ausrichtung passt nicht zu $md (Chunk $((chunk / 1024)) KiB): stride ${st:-0} statt $es, stripe-width ${sw:-0} statt $ew$( [ "$lvl" = raid10 ] && echo " - bei RAID10 wirkt sich das kaum aus"). Anpassen: tune2fs -E stride=$es,stripe_width=$ew $src"
+          hint "ext4 $mnt: RAID alignment does not match $md (chunk $((chunk / 1024)) KiB): stride ${st:-0} instead of $es, stripe-width ${sw:-0} instead of $ew$( [ "$lvl" = raid10 ] && echo " - with RAID10 this hardly matters"). Adjust: tune2fs -E stride=$es,stripe_width=$ew $src"
         fi
       fi
     fi
   done < <(awk '$1 ~ "^/dev/" { print $1, $2, $3, $4 }' /proc/mounts | sort -u -k1,1)
-  [ $any -eq 0 ] && info "Kein ext4-Dateisystem eingehängt."
+  [ $any -eq 0 ] && info "No ext4 file system mounted."
   boot_check "$(findmnt -no SOURCE / 2>/dev/null)" /etc/fstab /var/cache/debconf/config.dat
 }
 
-# Liegt / auf einem Software-RAID, soll der Server auch ohne die SSD mit der eingehängten EFI-Partition starten
-boot_check() { # quelle-von-/ fstab debconf-datei
+# If / is on a software RAID, the server should also boot without the SSD that holds the mounted EFI partition
+boot_check() { # source-of-/ fstab debconf-file
   local real md disks="" d esps="" n=0 ne=0 opts inst missing="" l p pp
   real=$(readlink -f "$1" 2>/dev/null); md=${real##*/}
   [[ $md == md* ]] && [ -d "$SYSBLOCK/$md/slaves" ] || return
@@ -1065,7 +1065,7 @@ boot_check() { # quelle-von-/ fstab debconf-datei
     [ -e "$p" ] || continue
     d=${p##*/}; [ -e "/sys/class/block/$d/partition" ] && d=$(basename "$(readlink -f "/sys/class/block/$d/..")")
     disks="$disks $d"; n=$((n + 1))
-    # EFI-Partition am GPT-Typ erkennen (blkid liest ihn direkt, ohne udev)
+    # Detect the EFI partition by its GPT type (blkid reads it directly, without udev)
     l=""
     for pp in "/sys/block/$d/$d"*; do
       [ -e "$pp/partition" ] || continue
@@ -1075,20 +1075,20 @@ boot_check() { # quelle-von-/ fstab debconf-datei
   done
   [ "$n" -gt 1 ] || return
   if findmnt -n /boot/efi >/dev/null 2>&1; then
-    info "/ liegt auf $md (${disks# }), EFI-Partitionen auf $ne von $n Laufwerken"
-    [ "$ne" -lt "$n" ] && hint "Nur $ne von $n Laufwerken des RAID haben eine EFI-Partition. Fällt ein Laufwerk mit EFI-Partition aus, startet der Server womöglich nicht. Beim nächsten Neuaufbau auf jedem Laufwerk eine anlegen (Ubuntu-Installer: 'Add As Another Boot Device')."
+    info "/ is on $md (${disks# }), EFI partitions on $ne of $n drives"
+    [ "$ne" -lt "$n" ] && hint "Only $ne of $n drives of the RAID have an EFI partition. If a drive with an EFI partition fails, the server may not boot. Create one on every drive at the next rebuild (Ubuntu installer: 'Add As Another Boot Device')."
     opts=$(awk '$1 !~ /^#/ && $2 == "/boot/efi" { print $4 }' "$2" 2>/dev/null)
     if [ -n "$opts" ] && ! grep -qE '(^|,)nofail(,|$)' <<<"$opts"; then
-      hint "/boot/efi hat in $2 kein 'nofail'. Fällt genau dieses Laufwerk aus, startet der Server im Notfallmodus statt normal vom RAID. In $2 bei /boot/efi '$opts' durch '$opts,nofail' ersetzen."
+      hint "/boot/efi has no 'nofail' in $2. If exactly this drive fails, the server boots into emergency mode instead of normally from the RAID. In $2 replace '$opts' at /boot/efi with '$opts,nofail'."
     fi
-    # Ubuntu/Debian: GRUB-Updates schreiben nur auf die EFI-Partitionen in grub-efi/install_devices
+    # Ubuntu/Debian: GRUB updates only write to the EFI partitions in grub-efi/install_devices
     if [ -r "$3" ] && grep -q '^Name: grub-efi/install_devices$' "$3"; then
       inst=$(sed -n '/^Name: grub-efi\/install_devices$/,/^$/s/^Value: //p' "$3" | tr -d ',' | while read -ra a; do for l in "${a[@]}"; do readlink -f "$l"; done; done)
       for p in $esps; do grep -qx "$p" <<<"$inst" || missing="$missing ${p#/dev/}"; done
       if [ -n "$missing" ]; then
-        hint "GRUB hält bei Updates nicht alle EFI-Partitionen aktuell (fehlen:$missing). Ein Laufwerk mit veralteter EFI-Partition bootet nach einem GRUB-Update womöglich nicht mehr. Ergänzen: dpkg-reconfigure grub-efi-amd64 und alle EFI-Partitionen auswählen."
+        hint "GRUB does not keep all EFI partitions up to date on updates (missing:$missing). A drive with an outdated EFI partition may no longer boot after a GRUB update. Add them: dpkg-reconfigure grub-efi-amd64 and select all EFI partitions."
       else
-        ok "GRUB hält alle $ne EFI-Partitionen aktuell."
+        ok "GRUB keeps all $ne EFI partitions up to date."
       fi
     fi
   fi
@@ -1101,9 +1101,9 @@ static_check() {
   elif [ -f /etc/os-release ]; then
     ver=$(. /etc/os-release 2>/dev/null; echo "$PRETTY_NAME")
   fi
-  section "Systemüberblick"
+  section "System overview"
   info "Host: $(hostname)   Kernel: $(uname -r)   $ver"
-  [ "$(id -u)" -ne 0 ] && warn "Nicht als root gestartet - SMART-Daten und einige Werte fehlen."
+  [ "$(id -u)" -ne 0 ] && warn "Not started as root - SMART data and some values are missing."
 
   # CPU
   local model threads gov drv epp curf maxf
@@ -1114,17 +1114,17 @@ static_check() {
   epp=$(cat /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference 2>/dev/null)
   curf=$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null | awk '{s+=$1;n++} END{if(n) printf "%.0f", s/n/1000}')
   maxf=$(awk '{printf "%.0f", $1/1000}' /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq 2>/dev/null)
-  info "CPU: $model ($threads Threads), Load: $(cut -d' ' -f1-3 /proc/loadavg)"
-  info "Takt: Treiber $drv, Governor $gov${epp:+, EPP $epp}, aktuell Ø ${curf:-?} MHz / max ${maxf:-?} MHz"
+  info "CPU: $model ($threads threads), load: $(cut -d' ' -f1-3 /proc/loadavg)"
+  info "Clock: driver $drv, governor $gov${epp:+, EPP $epp}, current avg ${curf:-?} MHz / max ${maxf:-?} MHz"
   case "$gov" in
     powersave)
       case "$drv" in
         intel_pstate|amd-pstate-epp) ;;
-        *) warn "Governor 'powersave' mit Treiber $drv hält die CPU auf Minimaltakt - erhöht Latenz." ;;
+        *) warn "Governor 'powersave' with driver $drv keeps the CPU at minimum clock - increases latency." ;;
       esac ;;
-    conservative) hint "Governor 'conservative' taktet träge hoch - kurze IO-Bursts laufen auf niedrigem Takt." ;;
+    conservative) hint "Governor 'conservative' clocks up sluggishly - short IO bursts run at a low clock." ;;
   esac
-  [ "$epp" = "power" ] && hint "EPP=power: CPU taktet sehr zurückhaltend hoch. Test: echo balance_performance > /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference"
+  [ "$epp" = "power" ] && hint "EPP=power: the CPU clocks up very reluctantly. Test: echo balance_performance > /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference"
 
   # Dirty page cache
   local memkb dr db dirty_mb
@@ -1132,16 +1132,16 @@ static_check() {
   dr=$(cat /proc/sys/vm/dirty_ratio 2>/dev/null)
   db=$(cat /proc/sys/vm/dirty_bytes 2>/dev/null)
   if [ "${db:-0}" -gt 0 ]; then dirty_mb=$((db / 1048576)); else dirty_mb=$((memkb * dr / 100 / 1024)); fi
-  info "RAM: $((memkb / 1048576)) GB, vm.dirty_ratio=$dr, dirty_background_ratio=$(cat /proc/sys/vm/dirty_background_ratio) (=> bis ~${dirty_mb} MB ungeschriebene Daten)"
-  [ "$dirty_mb" -gt 4096 ] && hint "Großer Dirty-Puffer (~${dirty_mb} MB): bei Dauerschreiblast entstehen lange Schreibstaus, wenn der Puffer voll ist."
-  # Swap: Ausgelagerte Programmteile muss der Kernel beim nächsten Zugriff von der Platte lesen (Seitenfehler)
+  info "RAM: $((memkb / 1048576)) GB, vm.dirty_ratio=$dr, dirty_background_ratio=$(cat /proc/sys/vm/dirty_background_ratio) (=> up to ~${dirty_mb} MB of unwritten data)"
+  [ "$dirty_mb" -gt 4096 ] && hint "Large dirty buffer (~${dirty_mb} MB): under sustained write load long write congestion occurs when the buffer is full."
+  # Swap: the kernel has to read swapped-out program parts back from disk on the next access (page faults)
   local swt swf avail swu swp
   read -r swt swf avail < <(awk '/^SwapTotal/ {t = $2} /^SwapFree/ {f = $2} /^MemAvailable/ {a = $2} END {print t + 0, f + 0, a + 0}' /proc/meminfo)
   swu=$(( (swt - swf) / 1024 )); swp=$(cat /proc/sys/vm/swappiness 2>/dev/null)
   if [ "$swt" -gt 0 ]; then
-    info "Swap: $swu MB von $((swt / 1024)) MB belegt, vm.swappiness=${swp:-?}, verfügbarer RAM $((avail / 1048576)) GB"
+    info "Swap: $swu MB of $((swt / 1024)) MB used, vm.swappiness=${swp:-?}, available RAM $((avail / 1048576)) GB"
     if [ "$swu" -ge 256 ] && [ $((avail / 1024)) -ge $((swu * 4)) ]; then
-      hint "$swu MB liegen im Swap, obwohl $((avail / 1048576)) GB RAM frei sind. Ausgelagerte Programmteile muss der Kernel beim nächsten Zugriff von der Platte lesen (Seitenfehler) - fällt das in einen Hänger der SSD, wartet das Programm. Zurückholen: swapoff -a && swapon -a$( [ "${swp:-60}" -gt 10 ] && echo ". Seltener auslagern: echo vm.swappiness=10 > /etc/sysctl.d/90-swappiness.conf && sysctl --system")"
+      hint "$swu MB are in swap although $((avail / 1048576)) GB of RAM are free. The kernel has to read swapped-out program parts back from disk on the next access (page faults) - if that coincides with an SSD stall, the program waits. Bring them back: swapoff -a && swapon -a$( [ "${swp:-60}" -gt 10 ] && echo ". Swap less often: echo vm.swappiness=10 > /etc/sysctl.d/90-swappiness.conf && sysctl --system")"
     fi
   fi
 
@@ -1160,7 +1160,7 @@ static_check() {
   fi
 
   # Disks
-  section "Laufwerke"
+  section "Drives"
   local p d dev rot sched wc disc ata host spd alpm model fw sm trim sata attrs crc realloc role kind wdsd
   for p in /sys/block/*; do
     d=${p##*/}
@@ -1185,7 +1185,7 @@ static_check() {
       smodel=$(sed -n 's/^\(Device Model\|Model Number\): *//p' <<<"$sm" | head -1)
       sfw=$(sed -n 's/^Firmware Version: *//p' <<<"$sm" | head -1)
       [ -n "$smodel" ] && model=$smodel
-      # sysfs liefert bei SATA nur 4 Zeichen der Firmware-Version
+      # sysfs only provides 4 characters of the firmware version for SATA
       [ -n "$sfw" ] && fw=$sfw
     fi
     printf '\n  %s  %s  (%s GB, %s, FW %s)%s\n' "$d" "${model:-?}" \
@@ -1197,59 +1197,59 @@ static_check() {
     host=$(grep -o 'host[0-9]*' <<<"$real" | head -1)
     [ -n "$ata" ] && spd=$(cat "/sys/class/ata_link/link${ata#ata}/sata_spd" 2>/dev/null)
     [ -n "$host" ] && alpm=$(cat "/sys/class/scsi_host/$host/link_power_management_policy" 2>/dev/null)
-    info "Port: ${ata:-?} ${spd:+Link $spd}  ALPM: ${alpm:-n/a}  Scheduler: ${sched:-?}  Schreibcache: ${wc:-?}  TRIM: $([ "${disc:-0}" -gt 0 ] && echo ja || echo nein)"
+    info "Port: ${ata:-?} ${spd:+Link $spd}  ALPM: ${alpm:-n/a}  Scheduler: ${sched:-?}  Write cache: ${wc:-?}  TRIM: $([ "${disc:-0}" -gt 0 ] && echo yes || echo no)"
 
     if [ -n "$alpm" ] && [ "$alpm" != "max_performance" ] && [ "$alpm" != "keep_firmware_settings" ]; then
-      warn "$d: SATA-Link-Power-Management '$alpm' - Link schläft zwischen Zugriffen, Aufwachen kostet Latenz (typisch nach powertop --auto-tune). Test: echo max_performance > /sys/class/scsi_host/$host/link_power_management_policy"
+      warn "$d: SATA link power management '$alpm' - the link sleeps between accesses, waking up costs latency (typical after powertop --auto-tune). Test: echo max_performance > /sys/class/scsi_host/$host/link_power_management_policy"
     fi
     if [ "$rot" = 0 ] && [ -n "$spd" ] && [ "$spd" != "6.0 Gbps" ] && [ "$spd" != "<unknown>" ]; then
-      warn "$d: SATA-Link läuft nur mit $spd (erwartet 6.0 Gbps) - Kabel/Backplane/Port prüfen."
+      warn "$d: SATA link runs at only $spd (expected 6.0 Gbps) - check cable/backplane/port."
     fi
-    [ "$rot" = 0 ] && [ "${disc:-0}" -eq 0 ] && hint "$d: Gerät/Schicht meldet kein TRIM - ohne TRIM werden SSDs bei Schreiblast langsamer."
-    [ "$wc" = "write through" ] && [ "$rot" = 0 ] && hint "$d: Schreibcache ist 'write through' (aus) - deutlich langsamere Schreibzugriffe."
-    # Der Schreibcache-Schalter (SET FEATURES, hdparm -W) ist laut ATA-Standard flüchtig: Nach dem Einschalten
-    # gilt die Werkseinstellung des Laufwerks, und manche BIOS/UEFI schalten ihn beim Start ab.
-    # Dauerhaft im Laufwerk lässt er sich nur über SCT Feature Control setzen (smartctl -s wcache-sct,on,p).
+    [ "$rot" = 0 ] && [ "${disc:-0}" -eq 0 ] && hint "$d: device/layer reports no TRIM - without TRIM SSDs get slower under write load."
+    [ "$wc" = "write through" ] && [ "$rot" = 0 ] && hint "$d: write cache is 'write through' (off) - much slower writes."
+    # According to the ATA standard the write cache switch (SET FEATURES, hdparm -W) is volatile: after power-on
+    # the drive's factory setting applies, and some BIOS/UEFI switch it off at boot.
+    # It can only be set permanently in the drive via SCT Feature Control (smartctl -s wcache-sct,on,p).
     if [[ $d == sd* ]] && [ "$kind" != USB ] && [ "$(id -u)" -eq 0 ]; then
       local hw="" sct="" boot="" fix wcinfo=""
       command -v hdparm >/dev/null 2>&1 && hw=$(hdparm -W "$dev" 2>/dev/null | sed -n 's/.*write-caching *= *\([01]\).*/\1/p')
       command -v smartctl >/dev/null 2>&1 && sct=$(smartctl -g wcache-sct "$dev" 2>/dev/null | sed -n 's/^SCT Write Cache Control: *//p' | head -1)
       grep -qiE 'not supported|unavailable' <<<"$sct" && sct=""
-      # Erster Eintrag dieses Starts = Zustand bei der Erkennung, bevor udev-Regeln o.ä. eingreifen
+      # First entry of this boot = state at detection, before udev rules or similar intervene
       boot=$( (journalctl -k -b -o cat 2>/dev/null || dmesg 2>/dev/null) | grep -m1 "\[$d\] Write cache:" | sed -n 's/.*Write cache: *\([a-z]*\).*/\1/p')
-      [ -n "$hw" ] && wcinfo="Laufwerk $([ "$hw" = 1 ] && echo an || echo aus)"
-      [ -n "$boot" ] && wcinfo="${wcinfo:+$wcinfo, }beim Start $([ "$boot" = enabled ] && echo an || echo aus)"
+      [ -n "$hw" ] && wcinfo="drive $([ "$hw" = 1 ] && echo on || echo off)"
+      [ -n "$boot" ] && wcinfo="${wcinfo:+$wcinfo, }at boot $([ "$boot" = enabled ] && echo on || echo off)"
       [ -n "$sct" ] && wcinfo="${wcinfo:+$wcinfo, }SCT: $sct"
-      [ -n "$wcinfo" ] && info "Schreibcache: $wcinfo"
+      [ -n "$wcinfo" ] && info "Write cache: $wcinfo"
       if [ -n "$sct" ]; then
-        fix="dauerhaft im Laufwerk einschalten: smartctl -s wcache-sct,on,p $dev (danach Kaltstart und prüfen: journalctl -k -b | grep -i 'write cache')"
+        fix="enable it permanently in the drive: smartctl -s wcache-sct,on,p $dev (then cold boot and check: journalctl -k -b | grep -i 'write cache')"
       else
-        fix="bei jedem Start einschalten, z.B. per udev-Regel mit hdparm -W1 $dev (das Laufwerk kennt kein SCT Feature Control)"
+        fix="enable it at every boot, e.g. with a udev rule running hdparm -W1 $dev (the drive does not support SCT Feature Control)"
       fi
       if grep -qi 'force disabled' <<<"$sct"; then
-        warn "$d: Der Schreibcache ist per SCT dauerhaft abgeschaltet - hdparm -W1 wirkt nicht. Einschalten: smartctl -s wcache-sct,on,p $dev"
+        warn "$d: The write cache is permanently disabled via SCT - hdparm -W1 has no effect. Enable it: smartctl -s wcache-sct,on,p $dev"
       elif [ "$hw" = 0 ]; then
-        warn "$d: Schreibcache im Laufwerk ist AUS - jeder Schreibzugriff geht direkt in den Flash: langsam und bei Consumer-SSDs sehr hohe Schreibverstärkung. Abhilfe: $fix."
+        warn "$d: The drive's write cache is OFF - every write goes straight to flash: slow, and very high write amplification on consumer SSDs. Remedy: $fix."
       elif [ "$hw" = 1 ] && [ "$wc" = "write through" ]; then
-        warn "$d: Das Laufwerk hat den Schreibcache AN, der Kernel hält ihn aber für aus ('write through') und schickt deshalb keine Flushes - bei Stromausfall droht Datenverlust. Abhilfe: echo 1 > /sys/block/$d/device/rescan"
+        warn "$d: The drive has its write cache ON, but the kernel considers it off ('write through') and therefore sends no flushes - data loss is possible on power failure. Remedy: echo 1 > /sys/block/$d/device/rescan"
       elif [ "$boot" = disabled ] && ! grep -qi 'force enabled' <<<"$sct"; then
-        hint "$d: Der Schreibcache ist beim Start aus (BIOS oder Firmware) und wird erst danach eingeschaltet (udev-Regel/hdparm). Greift das einmal nicht, läuft die SSD ohne Cache. Besser: $fix."
+        hint "$d: The write cache is off at boot (BIOS or firmware) and only switched on afterwards (udev rule/hdparm). If that fails once, the SSD runs without cache. Better: $fix."
       fi
     fi
     case "$role" in
       */Parity|*/Data)
-        [ "$rot" = 0 ] && warn "$d: SSD im Unraid-Array ($role). Kein TRIM im Array und jede Schreiboperation erzeugt Paritäts-Read-Modify-Write - SSDs gehören in einen Pool." ;;
+        [ "$rot" = 0 ] && warn "$d: SSD in the Unraid array ($role). No TRIM in the array, and every write causes a parity read-modify-write - SSDs belong in a pool." ;;
     esac
 
     if [ -n "$sm" ]; then
       trim=$(sed -n 's/^TRIM Command: *//p' <<<"$sm")
       sata=$(sed -n 's/^SATA Version is: *//p' <<<"$sm")
       [ -n "$sata$trim" ] && info "SMART: ${sata:+$sata} ${trim:+| TRIM: $trim}"
-      # SanDisk/WD-SSDs: 173 = Ø Löschzyklen, 233 = NAND-Schreibmenge (GiB), 241 = Host-Schreibmenge (GiB).
-      # Ältere smartctl-Datenbanken kennen die Namen nicht und zeigen falsche/Unknown-Bezeichnungen.
+      # SanDisk/WD SSDs: 173 = avg erase count, 233 = NAND writes (GiB), 241 = host writes (GiB).
+      # Older smartctl databases do not know the names and show wrong/Unknown labels.
       wdsd=0
       grep -qE 'SanDisk|^SD |SDSSD|WDS[0-9]|WD (Blue|Red|Green)' <<<"$model" && [ "$rot" = 0 ] && wdsd=1
-      # Für Verschleiß-Attribute ist der normierte Wert (100 = neu) aussagekräftiger als der Rohwert.
+      # For wear attributes the normalized value (100 = new) is more meaningful than the raw value.
       attrs=$(awk -v wdsd=$wdsd '$1 ~ /^(5|9|169|173|177|194|199|202|230|231|232|233|234|241)$/ && NF >= 10 {
           n = $2
           if (wdsd) { if ($1 == 173) n = "Avg_Erase_Count"; else if ($1 == 230) n = "Media_Wearout"; else if ($1 == 233) n = "NAND_GiB_Written"
@@ -1259,11 +1259,11 @@ static_check() {
       [ -n "$attrs" ] && info "SMART: $attrs"
       crc=$(awk '$1==199 {print $10+0}' <<<"$sm")
       realloc=$(awk '$1==5 {print $10+0}' <<<"$sm")
-      [ "${crc:-0}" -gt 0 ] && warn "$d: UDMA_CRC_Error_Count=$crc - Übertragungsfehler (Kabel/Backplane). Fehler kosten Retries und damit Latenz. Steigt der Wert weiter?"
-      [ "${realloc:-0}" -gt 0 ] && warn "$d: $realloc reallokierte Sektoren."
-      # Schreibverstärkung: WAF = num/den, host = Host-Schreibmenge in GiB.
-      # SanDisk/WD: 233 NAND-GiB / 241 Host-GiB. Crucial/Micron: (247 Host- + 248 FTL-Pages) / 247, Host über 246 (LBAs).
-      # Samsung (SM883/PM883 u.ä.): 251 NAND-LBAs / 241 Host-LBAs, hier in GiB umgerechnet.
+      [ "${crc:-0}" -gt 0 ] && warn "$d: UDMA_CRC_Error_Count=$crc - transfer errors (cable/backplane). Errors cost retries and thus latency. Is the value still rising?"
+      [ "${realloc:-0}" -gt 0 ] && warn "$d: $realloc reallocated sectors."
+      # Write amplification: WAF = num/den, host = host writes in GiB.
+      # SanDisk/WD: 233 NAND GiB / 241 host GiB. Crucial/Micron: (247 host + 248 FTL pages) / 247, host via 246 (LBAs).
+      # Samsung (SM883/PM883 and similar): 251 NAND LBAs / 241 host LBAs, converted to GiB here.
       local nand hostw poh erase num="" den="" hgib="" serial nandgib=$wdsd
       poh=$(awk '$1 == 9 && NF >= 10 {print $10 + 0; exit} /^Power On Hours:/ {gsub(",", "", $4); print $4 + 0; exit}' <<<"$sm")
       [ -n "$poh" ] && DEVPOH[$d]=$poh
@@ -1274,40 +1274,40 @@ static_check() {
         if [ "${nand:-0}" -gt 0 ] && [ "${hostw:-0}" -gt 0 ]; then
           num=$nand; den=$hostw; hgib=$hostw
           awk -v n="$nand" -v h="$hostw" -v poh="${poh:-0}" -v e="${erase:-}" 'BEGIN {
-            printf "      Schreibverstärkung (WAF = NAND/Host): %.1f", n / h
-            if (poh > 24) printf "   Host %.0f GiB/Tag, NAND %.0f GiB/Tag", h * 24 / poh, n * 24 / poh
-            if (e != "") printf "   Ø Löschzyklen %s", e
+            printf "      Write amplification (WAF = NAND/host): %.1f", n / h
+            if (poh > 24) printf "   host %.0f GiB/day, NAND %.0f GiB/day", h * 24 / poh, n * 24 / poh
+            if (e != "") printf "   avg erase count %s", e
             print "" }'
         fi
       elif grep -qE 'SAMSUNG|^MZ' <<<"$model" && awk '$1 == 251 && $10 > 0 { a = 1 } $1 == 241 && $10 > 0 { b = 1 } END { exit !(a && b) }' <<<"$sm"; then
         read -r num den < <(awk '$1 == 251 {n = $10} $1 == 241 {h = $10} END { printf "%.2f %.2f\n", n * 512 / 2^30, h * 512 / 2^30 }' <<<"$sm")
         hgib=$den; nandgib=1
         awk -v n="$num" -v h="$den" -v poh="${poh:-0}" 'BEGIN {
-            printf "      Schreibverstärkung (WAF = NAND/Host): %.2f", n / h
-            if (poh > 24) printf "   Host %.0f GiB/Tag, NAND %.0f GiB/Tag", h * 24 / poh, n * 24 / poh
+            printf "      Write amplification (WAF = NAND/host): %.2f", n / h
+            if (poh > 24) printf "   host %.0f GiB/day, NAND %.0f GiB/day", h * 24 / poh, n * 24 / poh
             print "" }'
       elif grep -q 'FTL_Program_Page_Count' <<<"$sm"; then
         read -r num den hgib < <(awk '$1==247 {h=$10} $1==248 {f=$10} $1==246 {l=$10}
           END { if (h > 0) printf "%.0f %.0f %.1f\n", h + f, h, l * 512 / 2^30 }' <<<"$sm")
         [ -n "$den" ] && awk -v n="$num" -v h="$den" -v g="$hgib" -v poh="${poh:-0}" 'BEGIN {
-            printf "      Schreibverstärkung (WAF = (Host+FTL-Pages)/Host-Pages): %.1f", n / h
-            if (poh > 24) printf "   Host %.0f GiB/Tag", g * 24 / poh
+            printf "      Write amplification (WAF = (host+FTL pages)/host pages): %.1f", n / h
+            if (poh > 24) printf "   host %.0f GiB/day", g * 24 / poh
             print "" }'
       fi
       if [ -n "$den" ]; then
         awk -v n="$num" -v h="$den" 'BEGIN { exit !(n >= 5 * h) }' &&
-          warn "$d: interne Schreibverstärkung $(awk -v n="$num" -v h="$den" 'BEGIN{printf "%.0f", n/h}')x - die SSD schreibt intern ein Vielfaches dessen, was das System schreibt. Typisch für viele kleine fsync-Schreibzugriffe (Datenbanken, NVR, Logs) auf Consumer-SSDs ohne Power-Loss-Protection: Die SSD ist dauerhaft mit Garbage Collection beschäftigt (Latenzspitzen) und verschleißt schnell."
+          warn "$d: internal write amplification $(awk -v n="$num" -v h="$den" 'BEGIN{printf "%.0f", n/h}')x - the SSD internally writes a multiple of what the system writes. Typical for many small fsync writes (databases, NVR, logs) on consumer SSDs without power loss protection: the SSD is constantly busy with garbage collection (latency spikes) and wears out quickly."
         waf_history "$d" "$serial" "$num" "$den" "$hgib" "$nandgib"
       fi
       [ "$rot" = 0 ] && wear_forecast "$d" "$(wear_used "$dev" "$sm" "$wdsd")" "$poh" "$num" "$([ -n "$den" ] && echo "$WH_RATE")"
     fi
 
     if [ "$rot" = 0 ] && grep -qiE 'QVO|BX500|A400|SU630|SU650|660p|665p|670p|Crucial P1|P3 Plus|WD ?Green|WDS[0-9]+G[0-9]A|SSD Plus|SDSSDA|Intenso|NV1|NV2|TM8FP' <<<"$model"; then
-      warn "$d: '$model' ist als QLC- und/oder DRAM-lose SSD bekannt - bricht bei Dauerlast stark ein (SLC-Cache voll) und hat oft hohe Flush-Latenz."
+      warn "$d: '$model' is known as a QLC and/or DRAM-less SSD - drops sharply under sustained load (SLC cache full) and often has high flush latency."
     fi
   done
 
-  section "Speicher-Layout"
+  section "Storage layout"
   if command -v lsblk >/dev/null 2>&1; then
     lsblk -e 7 -o NAME,TYPE,FSTYPE,SIZE,MOUNTPOINT 2>/dev/null | sed 's/^/      /'
   fi
@@ -1315,28 +1315,28 @@ static_check() {
   awk '$1 ~ "^/dev/" && $1 !~ "^/dev/loop" && $2 !~ "^/(snap|boot/efi)" && $3 != "squashfs" || $3 == "zfs" || $3 == "fuse.shfs" {
          printf "      %-26s %-8s %s\n", $2, $3, substr($4, 1, 80) }' /proc/mounts
   if grep -q ' /mnt/user fuse.shfs' /proc/mounts; then
-    hint "/mnt/user läuft über shfs (FUSE). Jeder Zugriff dort kostet CPU. Vergleich: -t /mnt/user/<share>/x -t /mnt/<pool>/<share>/x"
+    hint "/mnt/user runs via shfs (FUSE). Every access there costs CPU. Compare: -t /mnt/user/<share>/x -t /mnt/<pool>/<share>/x"
   fi
   if grep -qE ' (ext4|xfs|btrfs) .*(^|,)(sync|dirsync)(,|$)' /proc/mounts 2>/dev/null; then
-    warn "Ein Dateisystem ist mit 'sync' gemountet - jeder Schreibzugriff wartet auf das Gerät."
+    warn "A file system is mounted with 'sync' - every write waits for the device."
   fi
   if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
     if [ "$(systemctl is-enabled fstrim.timer 2>/dev/null)" = "enabled" ]; then
       local cal
       cal=$(systemctl show fstrim.timer -p TimersCalendar --value 2>/dev/null | sed -n 's/.*OnCalendar=\([^;]*[^ ;]\) *;.*/\1/p' | head -1)
-      ok "fstrim.timer aktiv (${cal:-Zeitplan unbekannt})."
+      ok "fstrim.timer active (${cal:-schedule unknown})."
       trim_advice "$cal"
     elif ! grep -qE '(^|,)discard' <(awk '{print $4}' /proc/mounts); then
-      hint "fstrim.timer ist nicht aktiv und kein Dateisystem nutzt 'discard' - ohne TRIM werden SSDs bei Schreiblast langsamer (systemctl enable --now fstrim.timer)."
+      hint "fstrim.timer is not active and no file system uses 'discard' - without TRIM SSDs get slower under write load (systemctl enable --now fstrim.timer)."
     fi
   fi
 
-  # Linux Software-RAID (mdadm). Unraid nutzt eigene md-Treiber ohne /proc/mdstat-Arrays.
+  # Linux software RAID (mdadm). Unraid uses its own md driver without /proc/mdstat arrays.
   if grep -qE '^md[0-9]+ : active' /proc/mdstat 2>/dev/null; then
-    section "Software-RAID (mdadm)"
+    section "Software RAID (mdadm)"
     sed 's/^/      /' /proc/mdstat
     if grep -qE '(resync|recovery|check|reshape) *=' /proc/mdstat; then
-      warn "Ein MD-RAID führt gerade resync/check/recovery aus - das bremst Schreibzugriffe massiv. Ubuntu startet 'checkarray' jeden ersten Sonntag im Monat."
+      warn "An MD RAID is currently running resync/check/recovery - this slows down writes massively. Ubuntu starts 'checkarray' on the first Sunday of every month."
     fi
     local md lvl
     for md in /sys/block/md*; do
@@ -1351,17 +1351,17 @@ static_check() {
       done
       MDMEMBERS="$MDMEMBERS$members"
       local bml; bml=$(cat "$md/md/bitmap/location" 2>/dev/null || echo none)
-      case "$bml" in [+-][0-9]*) bml="intern" ;; none) bml="keine" ;; esac
+      case "$bml" in [+-][0-9]*) bml="internal" ;; none) bml="none" ;; esac
       info "${md##*/}: $lvl, Bitmap: $bml$( [ -f "$md/md/stripe_cache_size" ] && echo ", stripe_cache_size=$(cat "$md/md/stripe_cache_size")")"
       md_groups "$md" "$lvl"
       md_extra_checks "$md" "$lvl"
       case "$lvl" in
         raid1|raid10|raid5|raid6)
-          info "${md##*/}: jedes fsync/Flush geht an alle Mitglieder (${members# }) - die jeweils langsamste SSD bestimmt die Latenz." ;;&
+          info "${md##*/}: every fsync/flush goes to all members (${members# }) - the slowest SSD determines the latency." ;;&
         raid5|raid6)
-          hint "${md##*/} ist $lvl: kleine Schreibzugriffe brauchen Read-Modify-Write für die Parität, und die Paritätsberechnung läuft im Kernel-Thread ${md##*/}_$lvl (CPU). Für viele kleine/Sync-Writes ist RAID10 deutlich schneller."
+          hint "${md##*/} is $lvl: small writes need a read-modify-write for the parity, and the parity calculation runs in the kernel thread ${md##*/}_$lvl (CPU). For many small/sync writes RAID10 is much faster."
           if [ "$(cat "$md/md/stripe_cache_size" 2>/dev/null || echo 0)" -le 256 ]; then
-            hint "${md##*/}: stripe_cache_size ist klein. Test: echo 4096 > $md/md/stripe_cache_size (kostet RAM: 4096 x 4 KB x Anzahl Disks)."
+            hint "${md##*/}: stripe_cache_size is small. Test: echo 4096 > $md/md/stripe_cache_size (costs RAM: 4096 x 4 KB x number of disks)."
           fi ;;
       esac
     done
@@ -1369,7 +1369,7 @@ static_check() {
 
   # LVM / dm-crypt
   if command -v dmsetup >/dev/null 2>&1 && dmsetup table 2>/dev/null | grep -q ' crypt '; then
-    info "dm-crypt (LUKS) aktiv: Verschlüsselung kostet CPU, Threads heißen kcryptd/dmcrypt_write."
+    info "dm-crypt (LUKS) active: encryption costs CPU, the threads are called kcryptd/dmcrypt_write."
   fi
 
   if command -v zpool >/dev/null 2>&1 && [ -n "$(zpool list -H -o name 2>/dev/null)" ]; then
@@ -1378,25 +1378,25 @@ static_check() {
     for pool in $(zpool list -H -o name); do
       info "Pool $pool: ashift=$(zpool get -H -o value ashift "$pool")  $(zfs get -H -o property,value sync,compression,recordsize,atime,encryption "$pool" | awk '{printf "%s=%s  ", $1, $2}')"
       zpool list -v -H -o name,size,alloc,frag,cap,health "$pool" 2>/dev/null | sed 's/^/        /'
-      [ "$(zfs get -H -o value sync "$pool")" = "always" ] && warn "ZFS-Pool $pool: sync=always - jeder Schreibzugriff wartet auf Flush."
+      [ "$(zfs get -H -o value sync "$pool")" = "always" ] && warn "ZFS pool $pool: sync=always - every write waits for a flush."
     done
-    info "Tipp: 'zpool iostat -vl 1' zeigt parallel, ob Zeit in Warteschlangen (syncq/asyncq) oder auf der Disk (disk_wait) entsteht."
+    info "Tip: 'zpool iostat -vl 1' shows in parallel whether time is spent in queues (syncq/asyncq) or on the disk (disk_wait)."
   fi
 
   fs_boot_check
-  section "Kernel-Log (ATA/IO-Fehler)"
+  section "Kernel log (ATA/IO errors)"
   local errs
   errs=$(dmesg 2>/dev/null | grep -Ei 'ata[0-9.]+:.*(error|exception|failed|hard resetting|link down|SError|timeout)|I/O error|blk_update_request|critical medium')
   if [ -n "$errs" ]; then
-    warn "$(wc -l <<<"$errs") ATA/IO-Fehlermeldungen im Kernel-Log (letzte 8 unten). Resets/Timeouts erzeugen Latenzspitzen von Sekunden."
+    warn "$(wc -l <<<"$errs") ATA/IO error messages in the kernel log (last 8 below). Resets/timeouts cause latency spikes of seconds."
     tail -n 8 <<<"$errs" | sed 's/^/        /'
   else
-    ok "Keine ATA/IO-Fehler im Kernel-Log."
+    ok "No ATA/IO errors in the kernel log."
   fi
 }
 
 # ---------------------------------------------------------------------------
-# Sampler (awk, läuft parallel zur Last)
+# Sampler (awk, runs in parallel to the load)
 # ---------------------------------------------------------------------------
 cat > "$OUT/sampler.awk" <<'AWK'
 function uptime_s(   l, a) { l = ""; getline l < "/proc/uptime"; close("/proc/uptime"); split(l, a, " "); return a[1] + 0 }
@@ -1458,9 +1458,9 @@ function read_procs(   cmd, pid, f, line, lp, a, v) {
     close(f)
   }
   close(cmd)
-  # Schreibmenge je Prozess (inkl. beendeter Kindprozesse, die er abgeräumt hat); nur als root vollständig.
-  # Netto: Daten, die vor dem Zurückschreiben wieder gelöscht werden (cancelled_write_bytes), erreichen die Platte nie.
-  # Über grep statt getline: mawk bricht bei Lesefehlern (EACCES) auf /proc/<pid>/io komplett ab.
+  # Bytes written per process (incl. exited child processes it has reaped); complete only as root.
+  # Net: data deleted again before writeback (cancelled_write_bytes) never reaches the disk.
+  # Via grep instead of getline: mawk aborts completely on read errors (EACCES) on /proc/<pid>/io.
   cmd = "grep -s -H -E \"^(cancelled_)?write_bytes\" /proc/[0-9]*/io"
   while ((cmd | getline line) > 0)
     if (split(line, a, "/") >= 4) {
@@ -1517,8 +1517,8 @@ function topw(arr, dt, n,   k, best, bv, s, j, used) {
   }
   return s
 }
-# Hänger als Ereignisse, wie im Dienst: ein Intervall ist langsam, wenn Anfragen >= stall_ms dauern oder das Gerät
-# Anfragen offen hat und gar keine beendet. Aufeinanderfolgende langsame Intervalle (Lücke < 3 s) = ein Hänger.
+# Stalls as events, as in the service: an interval is slow if requests take >= stall_ms or the device
+# has requests in flight and completes none. Consecutive slow intervals (gap < 3 s) = one stall.
 function track(d, t, dt, slow, w) {
   if (slow) {
     if (!(d in Op_s)) { Op_s[d] = t - dt; Op_m[d] = 0 }
@@ -1531,7 +1531,7 @@ function close_ev(d) {
   delete Op_s[d]; delete Op_e[d]; delete Op_m[d]
 }
 function sortn(a, n,   i, j, x) { for (i = 2; i <= n; i++) { x = a[i]; for (j = i - 1; j >= 1 && a[j] > x; j--) a[j + 1] = a[j]; a[j + 1] = x } }
-function wall(t,   c, r) { c = "date -d @" int(start_epoch + t - t0) " '+%d.%m. %H:%M:%S'"; r = ""; c | getline r; close(c); return r }
+function wall(t,   c, r) { c = "date -d @" int(start_epoch + t - t0) " '+%m-%d %H:%M:%S'"; r = ""; c | getline r; close(c); return r }
 function interval(dt,   c, t, b, busy, iow, maxc, maxcn, dtot, pc, pis, pif, p, dd, top, i, d,
                   dw, dws, dwt, dr, drs, drt, df, dft, diot, dtiq, wmbs, rmbs, wa, fa, util, devt, aqu, reqkb,
                   flag, maxdevt, totw, tclock, buf, iflag, wtop, k, V) {
@@ -1563,9 +1563,9 @@ function interval(dt,   c, t, b, busy, iow, maxc, maxcn, dtot, pc, pis, pif, p, 
   }
   top = top3(Cd, dt)
 
-  # Beim Ende eines Prozesses rechnet der Kernel seine gesamte Schreibmenge dem abräumenden Elternprozess zu.
-  # Was bereits beim Kind gezählt wurde, wird dort wieder abgezogen, damit nichts doppelt erscheint.
-  # Kinder vor ihren Eltern abarbeiten, falls beide im selben Intervall enden (z.B. timeout -> dd).
+  # When a process exits, the kernel adds its total writes to the parent that reaps it.
+  # What was already counted for the child is subtracted there again so that nothing appears twice.
+  # Handle children before their parents in case both exit in the same interval (e.g. timeout -> dd).
   delete V
   for (p in P_wbp) if (!(p in P_wb) && (p in P_first)) V[p] = 1
   for (i = 0; i < 50; i++) {
@@ -1582,16 +1582,16 @@ function interval(dt,   c, t, b, busy, iow, maxc, maxcn, dtot, pc, pis, pif, p, 
   for (p in P_wb) if (p in P_wbp) {
     dd = P_wb[p] - P_wbp[p]
     if (dd > 0 && Cred[p] > 0) { c = (Cred[p] < dd) ? Cred[p] : dd; dd -= c; Cred[p] -= c }
-    # Gelöschtes kann ein Intervall später als das Schreiben zählen: in der Summe verrechnen, in der Zeile nicht
+    # Deleted data can count one interval later than the write: offset it in the total, not in the line
     if (dd != 0) Wtot[P_comm[p]] += dd
     if (dd > 0) Wd[P_comm[p]] += dd
   }
   wtop = topw(Wd, dt, 3)
 
-  # Ausgabe sammeln: mit -q nur Intervalle zeigen, in denen ein Gerät auffällt
+  # Collect output: with -q only show intervals in which a device stands out
   tclock = clock()
   buf = sprintf("%-8s %4.0f%% %5.0f%%(c%-3s) %5.0f%% %7s %6s/%-6s   %s\n", tclock, busy, maxc, substr(maxcn, 4), iow, fp(pc), fp(pis), fp(pif), top)
-  if (wtop != "") buf = buf "   schreibt: " wtop "\n"
+  if (wtop != "") buf = buf "   writes: " wtop "\n"
   iflag = 0
 
   maxdevt = 0; totw = 0
@@ -1608,8 +1608,8 @@ function interval(dt,   c, t, b, busy, iow, maxc, maxcn, dtot, pc, pis, pif, p, 
     wa = (dw > 0) ? dwt / dw : 0
     fa = (df > 0) ? dft / df : 0
     util = 100 * diot / (dt * 1000); if (util > 100) util = 100
-    # Summe der Anfragezeiten inkl. Flush (Flushes zählen nicht in io_ticks).
-    # Bei QD1 = Anteil der Zeit, in der auf das Gerät gewartet wird.
+    # Sum of request times incl. flush (flushes do not count in io_ticks).
+    # At QD1 = share of the time spent waiting for the device.
     devt = 100 * (dwt + drt + dft) / (dt * 1000)
     aqu = dtiq / (dt * 1000)
     reqkb = (dw > 0) ? dws * 512 / 1024 / dw : 0
@@ -1625,12 +1625,12 @@ function interval(dt,   c, t, b, busy, iow, maxc, maxcn, dtot, pc, pis, pif, p, 
       A_n[d]++
       A_util[d] += util
       flag = ""
-      # Hohe await-Werte bei hohem Durchsatz sind normale Warteschlange (Writeback),
-      # langsam ist hohe Latenz bei wenig Durchsatz.
-      if (dw >= 5 && ((wa >= 10 && wmbs < 100) || (wa >= 50 && wmbs < 200) || wa >= 1000)) flag = "<< LANGSAM"
-      if (df >= 3 && fa >= 20) flag = "<< LANGSAM (Flush)"
-      # Wenige Anfragen, die aber hunderte ms hängen, während das Gerät voll belegt ist: Stall im Gerät.
-      if (flag == "" && util >= 50 && ((dw > 0 && wa >= 200) || (df > 0 && fa >= 200))) flag = "<< LANGSAM (Stall)"
+      # High await values at high throughput are a normal queue (writeback),
+      # slow means high latency at little throughput.
+      if (dw >= 5 && ((wa >= 10 && wmbs < 100) || (wa >= 50 && wmbs < 200) || wa >= 1000)) flag = "<< SLOW"
+      if (df >= 3 && fa >= 20) flag = "<< SLOW (flush)"
+      # Few requests that hang for hundreds of ms while the device is fully busy: stall in the device.
+      if (flag == "" && util >= 50 && ((dw > 0 && wa >= 200) || (df > 0 && fa >= 200))) flag = "<< SLOW (stall)"
       if (index(" " rotdevs " ", " " d " ")) flag = ""
       if (flag != "") { A_stall[d]++; Nstall++; I_stall[d] = 1; iflag = 1 } else I_fast[d] = 1
       if ((dw >= 5 || wa >= 200) && wa > A_wamax[d]) A_wamax[d] = wa
@@ -1645,13 +1645,13 @@ function interval(dt,   c, t, b, busy, iow, maxc, maxcn, dtot, pc, pis, pif, p, 
   if (iflag) { Nslow++; S_dtslow += dt; for (k in Wd) Wslow[k] += Wd[k] }
   if (!quiet || iflag) {
     if (Nprinted % 20 == 0)
-      printf "%-8s %5s %11s %6s %7s %13s   %s\n", "Zeit", "CPU", "max.Kern", "iowait", "PSIcpu", "PSIio s/f", "Top-Prozesse (% eines Kerns)"
+      printf "%-8s %5s %11s %6s %7s %13s   %s\n", "Time", "CPU", "max.core", "iowait", "PSIcpu", "PSIio s/f", "Top processes (% of a core)"
     Nprinted++
     printf "%s", buf
     fflush()
   }
   if (totw >= 5) { Nact++; S_devt += (maxdevt > 100 ? 100 : maxdevt) }
-  # Intervalle, in denen ein Gerät hängt, während ein anderes gleichzeitig schnell antwortet
+  # Intervals in which one device stalls while another one responds quickly at the same time
   for (d in I_stall) for (i in I_fast) { Nsplit++; break }
 }
 function load_app(f,   line, a) {
@@ -1664,11 +1664,11 @@ function add(side, pts, msg) {
 }
 function summary(   i, d, k, n, x, aw, af, minaw, bf, first, last, tn, tops, wgb, busy, sat, verdict, cnt, avgp, dl, tpa, nst,
                     fn, fsum, flong, FE, pl, pn, pgap, pdur, j, G, U, S, m, c) {
-  printf "\n--- Auswertung: %s (%d Messpunkte à %ss, %s) ---\n", label, N, interval_s, (S_dt < 3600 ? sprintf("%.0f s", S_dt) : sprintf("%.1f h", S_dt / 3600))
-  if (N < 2) { print "  Zu wenige Messpunkte."; return }
+  printf "\n--- Analysis: %s (%d samples of %ss, %s) ---\n", label, N, interval_s, (S_dt < 3600 ? sprintf("%.0f s", S_dt) : sprintf("%.1f h", S_dt / 3600))
+  if (N < 2) { print "  Too few samples."; return }
   busy = S_busy / N; sat = 100 * Nsat / N
-  printf "CPU:  Ø Auslastung %.0f%%, Ø iowait %.0f%% (= Warten auf IO, keine CPU-Last), ein Kern >=95%% in %.0f%% der Intervalle\n", busy, S_iow / N, sat
-  if (N_pc) printf "PSI:  cpu some Ø %.1f%%   io some Ø %.1f%%   io full Ø %.1f%%\n", S_pc / N_pc, S_pis / N_pi, S_pif / N_pi
+  printf "CPU:  avg utilization %.0f%%, avg iowait %.0f%% (= waiting for IO, no CPU load), one core >=95%% in %.0f%% of the intervals\n", busy, S_iow / N, sat
+  if (N_pc) printf "PSI:  cpu some avg %.1f%%   io some avg %.1f%%   io full avg %.1f%%\n", S_pc / N_pc, S_pis / N_pi, S_pif / N_pi
   tops = ""; cnt = 0
   for (k in Ctot) tn[k] = Ctot[k]
   for (i = 1; i <= 6; i++) {
@@ -1682,7 +1682,7 @@ function summary(   i, d, k, n, x, aw, af, minaw, bf, first, last, tn, tops, wgb
     tops = tops sprintf("%s %.0f%%  ", x, avgp)
     delete tn[x]
   }
-  printf "Top-Prozesse (Ø %% eines Kerns): %s\n", (tops == "" ? "-" : tops)
+  printf "Top processes (avg %% of a core): %s\n", (tops == "" ? "-" : tops)
   tops = ""
   for (k in tn) delete tn[k]
   for (k in Wtot) tn[k] = Wtot[k]
@@ -1695,7 +1695,7 @@ function summary(   i, d, k, n, x, aw, af, minaw, bf, first, last, tn, tops, wgb
   }
   for (k in tn) delete tn[k]
   if (tops != "") {
-    printf "Top-Schreiber (Ø über die Phase): %s\n", tops
+    printf "Top writers (avg over the phase): %s\n", tops
     if (Nslow > 0) {
       tops = ""
       for (k in Wslow) tn[k] = Wslow[k]
@@ -1707,12 +1707,12 @@ function summary(   i, d, k, n, x, aw, af, minaw, bf, first, last, tn, tops, wgb
         delete tn[x]
       }
       for (k in tn) delete tn[k]
-      if (tops != "") printf "Schreiber in den %d langsamen Intervallen: %s\n", Nslow, tops
+      if (tops != "") printf "Writers in the %d slow intervals: %s\n", Nslow, tops
     }
-    print "  (Elternprozesse wie systemd, cron oder containerd-shim enthalten die Schreibmenge ihrer beendeten Kindprozesse.)"
+    print "  (Parent processes such as systemd, cron or containerd-shim include the writes of their exited child processes.)"
   }
 
-  printf "\n  %-8s %10s %9s %8s %10s %10s %9s %9s %7s %12s\n", "Gerät", "geschr.", "Ø Req", "Ø await", "max await", "Flush n", "Flush Ø", "Flush max", "Ø util", "Langsam"
+  printf "\n  %-8s %10s %9s %8s %10s %10s %9s %9s %7s %12s\n", "Device", "written", "avg req", "avg wait", "max await", "flush n", "flush avg", "flush max", "avg util", "slow"
   minaw = -1
   for (i = 1; i <= Ndev; i++) {
     d = Dlist[i]
@@ -1728,19 +1728,19 @@ function summary(   i, d, k, n, x, aw, af, minaw, bf, first, last, tn, tops, wgb
   }
 
   if (APP["tool"] != "") {
-    printf "\nAnwendungssicht (%s, %s): ", APP["tool"], APP["what"]
+    printf "\nApplication view (%s, %s): ", APP["tool"], APP["what"]
     if (APP["app_mean_ms"] != "")
     {
       x = ""
       if (APP["app_p99_ms"] != "")
         x = sprintf(", p50 %s ms, p99 %s ms, p99.9 %s ms, max %s ms", APP["app_p50_ms"], APP["app_p99_ms"], APP["app_p999_ms"], APP["app_max_ms"])
-      printf "%s IOPS, Ø %s ms%s\n", APP["app_iops"], APP["app_mean_ms"], x
+      printf "%s IOPS, avg %s ms%s\n", APP["app_iops"], APP["app_mean_ms"], x
     }
     else
       printf "%s MB/s\n", APP["app_bw_mbs"]
   }
 
-  # ---- Hänger-Ereignisse und Muster je SSD ----
+  # ---- Stall events and pattern per SSD ----
   for (d in Op_s) close_ev(d)
   fn = 0; fsum = 0; flong = 0
   for (i = 1; i <= EvN; i++) {
@@ -1748,15 +1748,15 @@ function summary(   i, d, k, n, x, aw, af, minaw, bf, first, last, tn, tops, wgb
     if (Ev_m[i] >= felt_ms || x >= 2) { fn++; FE[fn] = i; fsum += x; if (x > flong) flong = x }
   }
   if (EvN > 0) {
-    printf "\nHänger (SSD, Wartezeit ab %d ms): %d, davon spürbar (ab %.0f s Wartezeit oder 2 s Dauer): %d, zusammen %.0f s, längster %.0f s%s\n",
-      stall_ms, EvN, felt_ms / 1000, fn, fsum, flong, (interval_s > 1 ? sprintf(" (Dauer auf %ss genau)", interval_s) : "")
-    if (fn > 0) printf "  %-17s %-8s %7s  %s\n", "Zeit", "Gerät", "Dauer", "max. Wartezeit"
+    printf "\nStalls (SSD, wait time from %d ms): %d, noticeable (from %.0f s wait time or 2 s duration): %d, total %.0f s, longest %.0f s%s\n",
+      stall_ms, EvN, felt_ms / 1000, fn, fsum, flong, (interval_s > 1 ? sprintf(" (duration accurate to %ss)", interval_s) : "")
+    if (fn > 0) printf "  %-17s %-8s %7s  %s\n", "Time", "Device", "Duration", "max. wait"
     for (k = fn; k >= 1 && k > fn - 25; k--) {
       i = FE[k]
       printf "  %-17s %-8s %6.0fs  %s\n", wall(Ev_s[i]), Ev_d[i], Ev_e[i] - Ev_s[i], (Ev_m[i] >= 1000 ? sprintf("%.1f s", Ev_m[i] / 1000) : sprintf("%.0f ms", Ev_m[i]))
     }
-    if (fn > 25) printf "  (%d ältere spürbare Hänger nicht aufgeführt)\n", fn - 25
-    # Muster: pro SSD typische Dauer und typischer Abstand der spürbaren Hänger
+    if (fn > 25) printf "  (%d older noticeable stalls not listed)\n", fn - 25
+    # Pattern: typical duration and typical interval of the noticeable stalls per SSD
     pl = ""; pn = 0; pgap = 0; pdur = 0
     for (j = 1; j <= Ndev; j++) {
       d = Dlist[j]; n = 0; delete G; delete U
@@ -1764,10 +1764,10 @@ function summary(   i, d, k, n, x, aw, af, minaw, bf, first, last, tn, tops, wgb
       if (n == 0) continue
       for (k = 2; k <= n; k++) G[k - 1] = (S[k] - S[k - 1]) / 60
       sortn(U, n); sortn(G, n - 1)
-      x = sprintf("  Muster %-6s %3d× spürbar, Dauer Median %.0f s", d, n, U[int((n + 1) / 2)])
-      if (n >= 2) x = x sprintf(", Abstand Median %.1f min (min %.1f, max %.1f)", G[int(n / 2)], G[1], G[n - 1])
+      x = sprintf("  Pattern %-6s %3d× noticeable, duration median %.0f s", d, n, U[int((n + 1) / 2)])
+      if (n >= 2) x = x sprintf(", interval median %.1f min (min %.1f, max %.1f)", G[int(n / 2)], G[1], G[n - 1])
       print x
-      # Regelmäßig: mindestens 4 Hänger und die meisten Abstände nahe am Median
+      # Regular: at least 4 stalls and most intervals close to the median
       if (n >= 4) {
         m = G[int(n / 2)]; c = 0
         for (k = 1; k < n; k++) if (G[k] >= 0.6 * m && G[k] <= 1.6 * m) c++
@@ -1776,35 +1776,35 @@ function summary(   i, d, k, n, x, aw, af, minaw, bf, first, last, tn, tops, wgb
     }
   }
 
-  # ---- Bewertung ----
+  # ---- Assessment ----
   Sd = 0; Sc = 0; Fn = 0; bf = -1
   if (mode == "sync" && Nact >= 3) {
     bf = S_devt / Nact
-    printf "Gerätezeit-Anteil während des Tests: %.0f%% (Rest der Wartezeit entsteht oberhalb der SSD)\n", bf
+    printf "Device time share during the test: %.0f%% (the rest of the wait happens above the SSD)\n", bf
     if (APP["app_mean_ms"] != "" && APP["app_mean_ms"] + 0 < 1)
-      printf "Testlatenz Ø %s ms ist gut - kein Engpass bei diesem Muster.\n", APP["app_mean_ms"]
-    else if (bf >= 70) add("SSD", 3, sprintf("Die Testanfragen warten %.0f%% der Zeit auf die SSD selbst - die Latenz entsteht auf dem Gerät.", bf))
-    else if (bf <= 35) add("CPU", 3, sprintf("Nur %.0f%% der Wartezeit entfallen auf die SSD; der Rest geht in CPU/Software verloren (Syscalls, shfs/FUSE, Dateisystem, Locks, Scheduling).", bf))
-    else add("MIX", 1, sprintf("%.0f%% der Wartezeit auf der SSD, der Rest in CPU/Software - beide Seiten tragen bei.", bf))
+      printf "Test latency avg %s ms is good - no bottleneck with this pattern.\n", APP["app_mean_ms"]
+    else if (bf >= 70) add("SSD", 3, sprintf("The test requests wait %.0f%% of the time for the SSD itself - the latency happens on the device.", bf))
+    else if (bf <= 35) add("CPU", 3, sprintf("Only %.0f%% of the wait time is spent on the SSD; the rest is lost in CPU/software (syscalls, shfs/FUSE, file system, locks, scheduling).", bf))
+    else add("MIX", 1, sprintf("%.0f%% of the wait time on the SSD, the rest in CPU/software - both sides contribute.", bf))
   }
   nst = 0
   for (i = 1; i <= Ndev; i++) if (A_stall[Dlist[i]] > 0) nst++
   for (i = 1; i <= Ndev; i++) {
     d = Dlist[i]
     if (!(d in A_n) || A_n[d] < 3) continue
-    if (index(" " rotdevs " ", " " d " ")) continue   # HDDs: Latenzen im ms-Bereich sind dort normal
+    if (index(" " rotdevs " ", " " d " ")) continue   # HDDs: latencies in the ms range are normal there
     x = 100 * A_stall[d] / A_n[d]
-    if (x >= 20) add("SSD", 2, sprintf("%s: in %.0f%% der aktiven Intervalle extrem langsame Schreib-/Flush-Zeiten (max await %.0f ms%s).", d, x, A_wamax[d], A_famax[d] > 0 ? sprintf(", max Flush %.0f ms", A_famax[d]) : ""))
-    else if (x >= 5) add("SSD", 1, sprintf("%s: gelegentliche Schreib-Stalls (%d Intervalle, max await %.0f ms).", d, A_stall[d], A_wamax[d]))
+    if (x >= 20) add("SSD", 2, sprintf("%s: extremely slow write/flush times in %.0f%% of the active intervals (max await %.0f ms%s).", d, x, A_wamax[d], A_famax[d] > 0 ? sprintf(", max flush %.0f ms", A_famax[d]) : ""))
+    else if (x >= 5) add("SSD", 1, sprintf("%s: occasional write stalls (%d intervals, max await %.0f ms).", d, A_stall[d], A_wamax[d]))
     if (T_fios[d] >= 10) {
-      if (AF[d] >= 10) add("SSD", 2, sprintf("%s: Flush (fsync/Cache leeren) dauert Ø %.1f ms - sehr langsam (Consumer-SSD ohne Power-Loss-Protection, SLC-Cache voll oder Firmware).", d, AF[d]))
-      else if (AF[d] >= 3) add("SSD", 1, sprintf("%s: Flush Ø %.1f ms - erhöht (gute SATA-SSDs < 2 ms, Enterprise mit PLP < 0.1 ms).", d, AF[d]))
+      if (AF[d] >= 10) add("SSD", 2, sprintf("%s: flush (fsync/emptying the cache) takes avg %.1f ms - very slow (consumer SSD without power loss protection, SLC cache full or firmware).", d, AF[d]))
+      else if (AF[d] >= 3) add("SSD", 1, sprintf("%s: flush avg %.1f ms - elevated (good SATA SSDs < 2 ms, enterprise with PLP < 0.1 ms).", d, AF[d]))
     }
-    # Hängen mehrere Geräte abwechselnd, ist ein einzelnes "langsamstes" Gerät kein Befund
+    # If several devices stall alternately, a single "slowest" device is not a finding
     if (T_wios[d] >= 50 && minaw > 0 && AW[d] > 3 * minaw && AW[d] > 2 && !(nst >= 2 && A_stall[d] > 0))
-      add("SSD", 1, sprintf("%s ist deutlich langsamer als die übrigen Geräte (Ø await %.2f ms vs. bestes %.2f ms) - dieses Laufwerk gezielt prüfen.", d, AW[d], minaw))
+      add("SSD", 1, sprintf("%s is much slower than the other devices (avg await %.2f ms vs. best %.2f ms) - check this drive specifically.", d, AW[d], minaw))
     if ((mode == "seq" && A_tpn[d] >= 10) || A_tpn[d] >= 30) {
-      # Spitze (3er-Mittel) in der ersten Hälfte vs. Mittel kurz vor Ende (letzte 2 Werte = Abschluss-Flush)
+      # Peak (mean of 3) in the first half vs. mean shortly before the end (last 2 values = final flush)
       first = 0; last = 0
       for (k = 1; k + 2 <= A_tpn[d] / 2; k++) {
         x = (A_tp[d, k] + A_tp[d, k + 1] + A_tp[d, k + 2]) / 3
@@ -1813,7 +1813,7 @@ function summary(   i, d, k, n, x, aw, af, minaw, bf, first, last, tn, tops, wgb
       for (k = 1; k <= 5; k++) last += A_tp[d, A_tpn[d] - 1 - k]
       last /= 5
       if (first > 80 && last < 0.4 * first)
-        add("SSD", 2, sprintf("%s: Schreibrate fällt bei Dauerlast von %.0f auf %.0f MB/s - typisch für vollen SLC-Cache (QLC/TLC-Consumer-SSD) oder fehlendes TRIM.", d, first, last))
+        add("SSD", 2, sprintf("%s: write rate drops under sustained load from %.0f to %.0f MB/s - typical for a full SLC cache (QLC/TLC consumer SSD) or missing TRIM.", d, first, last))
     }
   }
   n = 0; dl = ""; x = 0
@@ -1823,41 +1823,41 @@ function summary(   i, d, k, n, x, aw, af, minaw, bf, first, last, tn, tops, wgb
   }
   if (Nsplit > 0) {
     if (n >= 2)
-      add("SSD", 1, sprintf("Die Stalls wechseln zwischen mehreren SSDs (%s), während die übrigen gleichzeitig schnell antworten. Das Gerät selbst hält an (interne Garbage Collection/Firmware) - kein Kabel-, Controller- oder CPU-Problem, und eher Modell-/Lastverhalten als ein einzelnes defektes Laufwerk.", dl))
+      add("SSD", 1, sprintf("The stalls alternate between several SSDs (%s) while the others respond quickly at the same time. The device itself pauses (internal garbage collection/firmware) - not a cable, controller or CPU problem, and rather model/load behavior than a single defective drive.", dl))
     else
-      add("SSD", 1, sprintf("Nur %s hängt, während die übrigen SSDs gleichzeitig schnell antworten - dieses Laufwerk gezielt prüfen (Firmware, Verschleiß, Kabel/Port tauschen).", dl))
+      add("SSD", 1, sprintf("Only %s stalls while the other SSDs respond quickly at the same time - check this drive specifically (firmware, wear, swap cable/port).", dl))
     if (x >= 1)
-      add("SSD", 0, "Im mdadm-RAID wartet jedes fsync auf alle Mitglieder: ein Stall auf irgendeiner SSD bremst das ganze Array. Mit mehr SSDs im Verbund steigt die Wahrscheinlichkeit, dass gerade eine davon hängt.")
+      add("SSD", 0, "In an mdadm RAID every fsync waits for all members: a stall on any SSD slows down the whole array. With more SSDs in the array the probability rises that one of them is stalling.")
   }
-  if (N_pi && S_pif / N_pi >= 10 && Nstall > 0) add("SSD", 1, sprintf("PSI io full Ø %.0f%%: Prozesse sind regelmäßig komplett durch IO blockiert.", S_pif / N_pi))
-  if (fn > 0) add("SSD", 2, sprintf("%d spürbare Hänger (ab %.0f s Wartezeit oder 2 s Dauer), zusammen %.0f s, längster %.0f s - in dieser Zeit wartet alles, was schreibt.", fn, felt_ms / 1000, fsum, flong))
-  if (pn > 0) add("SSD", 1, sprintf("Regelmäßiger Takt: %s %s etwa alle %.0f min für ~%.0f s an. Schreibt kein Programm in diesem Takt viel (siehe Schreiber), ist das Hintergrundarbeit in der SSD-Firmware - mit Einstellungen nicht abstellbar, nur durch andere SSDs (z.B. mit Power-Loss-Protection).", pl, (pn > 1 ? "halten jeweils" : "hält"), pgap / pn, pdur / pn))
+  if (N_pi && S_pif / N_pi >= 10 && Nstall > 0) add("SSD", 1, sprintf("PSI io full avg %.0f%%: processes are regularly fully blocked by IO.", S_pif / N_pi))
+  if (fn > 0) add("SSD", 2, sprintf("%d noticeable stalls (from %.0f s wait time or 2 s duration), total %.0f s, longest %.0f s - during this time everything that writes waits.", fn, felt_ms / 1000, fsum, flong))
+  if (pn > 0) add("SSD", 1, sprintf("Regular rhythm: %s %s about every %.0f min for ~%.0f s. If no program writes a lot in this rhythm (see writers), this is background work in the SSD firmware - it cannot be switched off with settings, only with other SSDs (e.g. with power loss protection).", pl, (pn > 1 ? "each pause" : "pauses"), pgap / pn, pdur / pn))
 
-  if (mode != "passive" && TOP1 ~ /^(fio|dd)$/) sat = 0   # Testwerkzeug selbst lastet den Kern aus
-  if (sat >= 30) add("CPU", 2, sprintf("Mindestens ein CPU-Kern war in %.0f%% der Intervalle voll ausgelastet%s.", sat, busy < 70 ? " (Single-Thread-Engpass)" : ""))
-  else if (sat >= 10) add("CPU", 1, sprintf("Ein CPU-Kern war in %.0f%% der Intervalle voll ausgelastet.", sat))
+  if (mode != "passive" && TOP1 ~ /^(fio|dd)$/) sat = 0   # the test tool itself saturates the core
+  if (sat >= 30) add("CPU", 2, sprintf("At least one CPU core was fully busy in %.0f%% of the intervals%s.", sat, busy < 70 ? " (single-thread bottleneck)" : ""))
+  else if (sat >= 10) add("CPU", 1, sprintf("One CPU core was fully busy in %.0f%% of the intervals.", sat))
   if (N_pc) {
     x = S_pc / N_pc
-    if (x >= 20) add("CPU", 2, sprintf("PSI cpu Ø %.0f%%: lauffähige Prozesse warten deutlich auf CPU-Zeit.", x))
-    else if (x >= 5) add("CPU", 1, sprintf("PSI cpu Ø %.0f%%: spürbarer CPU-Wettbewerb.", x))
+    if (x >= 20) add("CPU", 2, sprintf("PSI cpu avg %.0f%%: runnable processes wait noticeably for CPU time.", x))
+    else if (x >= 5) add("CPU", 1, sprintf("PSI cpu avg %.0f%%: noticeable CPU contention.", x))
   }
-  if (busy >= 85) add("CPU", 1, sprintf("CPU insgesamt Ø %.0f%% ausgelastet.", busy))
+  if (busy >= 85) add("CPU", 1, sprintf("CPU busy avg %.0f%% overall.", busy))
   for (k in TOP) {
-    if (k == "shfs" && TOP[k] >= 30) add("CPU", 2, sprintf("shfs (FUSE-Schicht von /mnt/user) braucht Ø %.0f%% eines Kerns - Schreiben über /mnt/user ist CPU-gebunden. Abhilfe: direkt /mnt/<pool>/... nutzen bzw. Exclusive Shares.", TOP[k]))
-    else if (k ~ /^(z_wr_iss|z_wr_int|z_rd_int|z_fr_iss|txg_sync|spl_|z_)/ && TOP[k] >= 30) add("CPU", 1, sprintf("ZFS-Thread %s braucht Ø %.0f%% eines Kerns (Kompression/Checksummen/RAIDZ/Verschlüsselung).", k, TOP[k]))
-    else if (k ~ /^(unraidd|mdrecoveryd|md[0-9]+_raid)/ && TOP[k] >= 30) add("CPU", 2, sprintf("RAID-Thread %s braucht Ø %.0f%% eines Kerns (Paritätsberechnung läuft single-threaded).", k, TOP[k]))
-    else if (k ~ /^md[0-9]+_resync/ && TOP[k] >= 5) add("SSD", 1, sprintf("%s läuft (RAID-Resync/Check) und konkurriert mit normalen Schreibzugriffen.", k))
-    else if (k ~ /^(kcryptd|dmcrypt_write)/ && TOP[k] >= 30) add("CPU", 1, sprintf("Verschlüsselung (%s) braucht Ø %.0f%% eines Kerns.", k, TOP[k]))
-    else if (k ~ /^btrfs/ && TOP[k] >= 30) add("CPU", 1, sprintf("btrfs-Thread %s braucht Ø %.0f%% eines Kerns.", k, TOP[k]))
+    if (k == "shfs" && TOP[k] >= 30) add("CPU", 2, sprintf("shfs (FUSE layer of /mnt/user) needs avg %.0f%% of a core - writing via /mnt/user is CPU-bound. Remedy: use /mnt/<pool>/... directly or exclusive shares.", TOP[k]))
+    else if (k ~ /^(z_wr_iss|z_wr_int|z_rd_int|z_fr_iss|txg_sync|spl_|z_)/ && TOP[k] >= 30) add("CPU", 1, sprintf("ZFS thread %s needs avg %.0f%% of a core (compression/checksums/RAIDZ/encryption).", k, TOP[k]))
+    else if (k ~ /^(unraidd|mdrecoveryd|md[0-9]+_raid)/ && TOP[k] >= 30) add("CPU", 2, sprintf("RAID thread %s needs avg %.0f%% of a core (parity calculation runs single-threaded).", k, TOP[k]))
+    else if (k ~ /^md[0-9]+_resync/ && TOP[k] >= 5) add("SSD", 1, sprintf("%s is running (RAID resync/check) and competes with normal writes.", k))
+    else if (k ~ /^(kcryptd|dmcrypt_write)/ && TOP[k] >= 30) add("CPU", 1, sprintf("Encryption (%s) needs avg %.0f%% of a core.", k, TOP[k]))
+    else if (k ~ /^btrfs/ && TOP[k] >= 30) add("CPU", 1, sprintf("btrfs thread %s needs avg %.0f%% of a core.", k, TOP[k]))
   }
 
-  if (Fn == 0) print "\nBefund: keine Auffälligkeiten in diesem Zeitraum."
-  else { print "\nBefund:"; for (i = 1; i <= Fn; i++) print F[i] }
-  if (Sd < 2 && Sc < 2) verdict = "unauffällig"
-  else if (Sd >= Sc + 2) verdict = "SSD/Storage"
-  else if (Sc >= Sd + 2) verdict = "CPU/Software"
-  else verdict = "gemischt"
-  printf "=> Hauptverdacht: %s   (Punkte SSD %d / CPU %d)\n", verdict, Sd, Sc
+  if (Fn == 0) print "\nFindings: no issues in this period."
+  else { print "\nFindings:"; for (i = 1; i <= Fn; i++) print F[i] }
+  if (Sd < 2 && Sc < 2) verdict = "none"
+  else if (Sd >= Sc + 2) verdict = "SSD/storage"
+  else if (Sc >= Sd + 2) verdict = "CPU/software"
+  else verdict = "mixed"
+  printf "=> Main suspect: %s   (points SSD %d / CPU %d)\n", verdict, Sd, Sc
 
   printf "label=%s\nmode=%s\nverdict=%s\nscore_ssd=%d\nscore_cpu=%d\ndev_frac=%s\napp_mean_ms=%s\napp_p99_ms=%s\napp_iops=%s\napp_bw_mbs=%s\n",
     label, mode, verdict, Sd, Sc, (bf < 0 ? "-" : sprintf("%.0f", bf)), APP["app_mean_ms"], APP["app_p99_ms"], APP["app_iops"], APP["app_bw_mbs"] > sumfile
@@ -1887,8 +1887,8 @@ AWK
 echo "time,phase,dev,w_mbs,w_iops,w_await_ms,flush_per_s,flush_await_ms,r_mbs,util_pct,queue,cpu_busy,cpu_iowait,max_core,psi_cpu,psi_io_some,psi_io_full,top_proc,top_writer,top_writer_mbs" > "$CSV"
 
 # ---------------------------------------------------------------------------
-# bpftrace (optional): wer ruft fsync & Co. auf, wie lange dauert es,
-# und wie viel haben Prozesse geschrieben, die während der Messung enden
+# bpftrace (optional): who calls fsync & co., how long does it take,
+# and how much did processes write that exit during the measurement
 # ---------------------------------------------------------------------------
 cat > "$OUT/trace.bt" <<'BT'
 tracepoint:syscalls:sys_enter_fsync,
@@ -1916,8 +1916,8 @@ tracepoint:syscalls:sys_exit_msync
   delete(@start[tid]);
 }
 
-// Jeder Thread meldet beim Ende nur seine eigene Schreibmenge - nichts wird doppelt gezählt.
-// Getrennt davon, wie viel er vor dem Zurückschreiben wieder gelöscht hat (erreicht die Platte nie).
+// On exit every thread reports only its own writes - nothing is counted twice.
+// Separately, how much it deleted again before writeback (never reaches the disk).
 tracepoint:sched:sched_process_exit
 {
   $w = curtask->ioac.write_bytes; $c = curtask->ioac.cancelled_write_bytes;
@@ -1951,12 +1951,12 @@ trace_stop() {
   kill "$BT_PID" 2>/dev/null
   wait "$BT_PID" 2>/dev/null
   BT_PID=""
-  # bpftrace bis 0.20 meldet "Attaching N probes..." auf stdout, neuere Versionen "Attached N probes" auf stderr
+  # bpftrace up to 0.20 reports "Attaching N probes..." on stdout, newer versions "Attached N probes" on stderr
   if ! grep -qE '^Attach(ing|ed)' "$BT_OUT" "$BT_OUT.err" 2>/dev/null; then
-    printf '\nbpftrace-Tracing nicht möglich: %s\n' "$( { grep -v RLIMIT_MEMLOCK "$BT_OUT.err" | grep -m1 -i error; } || tail -1 "$BT_OUT.err")"
+    printf '\nbpftrace tracing not possible: %s\n' "$( { grep -v RLIMIT_MEMLOCK "$BT_OUT.err" | grep -m1 -i error; } || tail -1 "$BT_OUT.err")"
     return
   fi
-  # Läuft ein Prozess noch, waren es nur beendete Threads; die stecken schon in den Top-Schreibern.
+  # If a process is still running, only threads exited; they are already included in the top writers.
   local running
   running=$(cat /proc/[0-9]*/comm 2>/dev/null | sort -u | tr '\n' '|')
   awk -v dur="$dur" -v running="|$running" '
@@ -1970,18 +1970,18 @@ trace_stop() {
     /^@exit_cw\[/  { C[key($0)] = val($0) }
     END {
       if (dur < 1) dur = 1
-      printf "\nfsync-Aufrufer (bpftrace, %d s): insgesamt %.1f pro Sekunde\n", dur, tot / dur
+      printf "\nfsync callers (bpftrace, %d s): %.1f per second in total\n", dur, tot / dur
       if (tot > 0) {
-        printf "  %-36s %8s %7s %8s %9s\n", "Prozess/Thread", "Aufrufe", "pro s", "Ø ms", "max ms"
+        printf "  %-36s %8s %7s %8s %9s\n", "process/thread", "calls", "per s", "avg ms", "max ms"
         for (i = 1; i <= 12; i++) {
           b = ""; bv = 0
           for (k in N) if (!(k in used) && N[k] > bv) { bv = N[k]; b = k }
           if (b == "") break
           used[b] = 1
-          printf "  %-36.36s %8d %7.2f %8.2f %9.1f%s\n", name(b), N[b], N[b] / dur, U[b] / N[b] / 1000, M[b] / 1000, (M[b] >= 200000 ? "  << hängt" : "")
+          printf "  %-36.36s %8d %7.2f %8.2f %9.1f%s\n", name(b), N[b], N[b] / dur, U[b] / N[b] / 1000, M[b] / 1000, (M[b] >= 200000 ? "  << stalls" : "")
           if (i == 1) top = b
         }
-        printf "=> Häufigster fsync-Aufrufer: %s (%.0f%% aller Aufrufe)\n", name(top), 100 * N[top] / tot
+        printf "=> Most frequent fsync caller: %s (%.0f%% of all calls)\n", name(top), 100 * N[top] / tot
       }
       s = ""
       for (i = 1; i <= 8; i++) {
@@ -1989,17 +1989,17 @@ trace_stop() {
         for (k in E) if (!(k in usedE) && index(running, "|" k "|") == 0 && E[k] > bv) { bv = E[k]; b = k }
         if (b == "" || bv < 1048576) break
         usedE[b] = 1
-        s = s sprintf("%s %.2f GB%s  ", b, bv / 1e9, C[b] > 0.1 * bv ? sprintf(" (davon %.2f GB gleich wieder gelöscht)", (C[b] < bv ? C[b] : bv) / 1e9) : "")
+        s = s sprintf("%s %.2f GB%s  ", b, bv / 1e9, C[b] > 0.1 * bv ? sprintf(" (of which %.2f GB deleted right away)", (C[b] < bv ? C[b] : bv) / 1e9) : "")
       }
       if (s != "") {
-        printf "Während der Messung beendete Prozesse (Schreibmenge über ihre ganze Laufzeit): %s\n", s
-        print "  (Steckt oben auch beim Elternprozess, der sie abgeräumt hat, z.B. systemd. Gleich wieder Gelöschtes erreicht die Platte nicht.)"
+        printf "Processes that exited during the measurement (writes over their whole lifetime): %s\n", s
+        print "  (Also included above in the parent process that reaped them, e.g. systemd. Data deleted right away does not reach the disk.)"
       }
     }' "$BT_OUT"
 }
 
 # ---------------------------------------------------------------------------
-# Phasen
+# Phases
 # ---------------------------------------------------------------------------
 PHASE_N=0
 SUMFILES=()
@@ -2029,10 +2029,10 @@ fio_terse_to_app() { # terse-file what
 
 phase_passive() {
   PHASE_N=$((PHASE_N + 1))
-  section "Phase $PHASE_N: passive Beobachtung (${PASSIVE}s) - jetzt das Problem auslösen, Ctrl+C beendet"
-  [ $QUIET -eq 1 ] && info "(-q: es werden nur auffällige Intervalle angezeigt)"
+  section "Phase $PHASE_N: passive observation (${PASSIVE}s) - trigger the problem now, Ctrl+C stops"
+  [ $QUIET -eq 1 ] && info "(-q: only conspicuous intervals are shown)"
   trace_start
-  start_sampler "passiv ${PASSIVE}s" passive "$PASSIVE" ""
+  start_sampler "passive ${PASSIVE}s" passive "$PASSIVE" ""
   wait_sampler
   trace_stop
 }
@@ -2043,7 +2043,7 @@ phase_sync() { # dir
   f="$dir/.wlat-test-$$.bin"
   app="$OUT/phase$PHASE_N.app"
   CUR_FILE=$f
-  section "Phase $PHASE_N: 4k O_SYNC-Schreiben (QD1) in $dir für ${TEST_RUNTIME}s"
+  section "Phase $PHASE_N: 4k O_SYNC writes (QD1) in $dir for ${TEST_RUNTIME}s"
   if [ $HAVE_FIO -eq 1 ]; then
     fio --name=wlat-prep --filename="$f" --rw=randwrite --bs=4k --size="$TEST_SIZE" --create_only=1 >/dev/null 2>&1
     sync
@@ -2077,7 +2077,7 @@ phase_seq() { # dir
   f="$dir/.wlat-seq-$$.bin"
   app="$OUT/phase$PHASE_N.app"
   CUR_FILE=$f
-  section "Phase $PHASE_N: sequentielles Dauerschreiben $SEQ_SIZE in $dir"
+  section "Phase $PHASE_N: sustained sequential write of $SEQ_SIZE in $dir"
   trace_start
   start_sampler "seq $SEQ_SIZE $dir" seq 0 "$app"
   sleep 2
@@ -2100,17 +2100,17 @@ phase_seq() { # dir
 }
 
 # ---------------------------------------------------------------------------
-echo "write-latency-diag $VERSION - $(date '+%F %T') - Ausgabe: $OUT"
+echo "write-latency-diag $VERSION - $(date '+%F %T') - output: $OUT"
 for m in "${UPDATE_MSGS[@]}"; do echo "  $m"; done
 [ $SKIP_STATIC -eq 0 ] && static_check
 
 if [ ${#TARGETS[@]} -gt 0 ] && [ $HAVE_FIO -eq 0 ]; then
-  section "Hinweis"
-  info "fio nicht gefunden - nutze dd als Ersatz (nur Mittelwert, keine Perzentile)."
+  section "Note"
+  info "fio not found - using dd instead (mean only, no percentiles)."
 fi
 if [ $HAVE_BT -eq 0 ] && [ $TRACE -eq 1 ]; then
-  section "Hinweis"
-  info "bpftrace nicht verfügbar (oder nicht root) - ohne Auswertung der fsync-Aufrufer. Installieren: apt install bpftrace"
+  section "Note"
+  info "bpftrace not available (or not root) - no analysis of the fsync callers. Install: apt install bpftrace"
 fi
 
 [ "$PASSIVE" -gt 0 ] 2>/dev/null && phase_passive
@@ -2122,13 +2122,13 @@ done
 [ -n "$CUR_FILE" ] && rm -f "$CUR_FILE"
 
 # ---------------------------------------------------------------------------
-# Gesamtfazit
+# Overall conclusion
 # ---------------------------------------------------------------------------
-section "Zusammenfassung"
-printf '  %-3s %-44s %9s %9s %8s %10s %8s  %s\n' "#" "Phase" "Ø ms" "p99 ms" "IOPS" "SSD-Anteil" "SSD/CPU" "Befund"
+section "Summary"
+printf '  %-3s %-44s %9s %9s %8s %10s %8s  %s\n' "#" "Phase" "avg ms" "p99 ms" "IOPS" "SSD share" "SSD/CPU" "Verdict"
 declare -A MEAN
 for s in "${SUMFILES[@]}"; do
-  [ -f "$s" ] || { echo "  Phase $(basename "$s" .sum | tr -dc 0-9): keine Auswertung (Sampler-Fehler, siehe oben)"; continue; }
+  [ -f "$s" ] || { echo "  Phase $(basename "$s" .sum | tr -dc 0-9): no analysis (sampler error, see above)"; continue; }
   label=$(sed -n 's/^label=//p' "$s")
   mean=$(sed -n 's/^app_mean_ms=//p' "$s")
   printf '  %-3s %-44.44s %9s %9s %8s %10s %8s  %s\n' "$(basename "$s" .sum | tr -dc 0-9)" "$label" "${mean:--}" \
@@ -2138,7 +2138,7 @@ for s in "${SUMFILES[@]}"; do
   [ -n "$mean" ] && MEAN["${label#sync4k }"]=$mean
 done
 
-# /mnt/user vs. direkter Pfad
+# /mnt/user vs. direct path
 for a in "${!MEAN[@]}"; do
   case "$a" in /mnt/user/*|/mnt/user0/*) ;; *) continue ;; esac
   for b in "${!MEAN[@]}"; do
@@ -2146,16 +2146,16 @@ for a in "${!MEAN[@]}"; do
     awk -v a="$a" -v b="$b" -v ma="${MEAN[$a]}" -v mb="${MEAN[$b]}" 'BEGIN {
       if (mb <= 0) exit
       r = ma / mb
-      printf "\n  Vergleich: %s Ø %.2f ms vs. %s Ø %.2f ms => Faktor %.1f\n", a, ma, b, mb, r
-      if (r >= 1.5) print "  => Der Umweg über /mnt/user (shfs/FUSE) kostet deutlich Latenz - das ist CPU/Software, nicht die SSD."
-      else print "  => shfs kostet kaum zusätzliche Latenz."
+      printf "\n  Comparison: %s avg %.2f ms vs. %s avg %.2f ms => factor %.1f\n", a, ma, b, mb, r
+      if (r >= 1.5) print "  => The detour via /mnt/user (shfs/FUSE) costs considerable latency - this is CPU/software, not the SSD."
+      else print "  => shfs adds hardly any latency."
     }'
   done
 done
 
 if [ ${#WARN[@]} -gt 0 ]; then
   echo
-  echo "  Auffälligkeiten aus dem Systemcheck:"
+  echo "  Issues from the system check:"
   for w in "${WARN[@]}"; do echo "   - $w"; done
 fi
 
@@ -2163,9 +2163,9 @@ echo
 if command -v systemctl >/dev/null 2>&1 && systemctl is-active -q write-latency-diag.service 2>/dev/null; then
   sport=$(sed -n 's/^ *port *= *\([0-9]*\).*/\1/p' "$SVC_CONF" 2>/dev/null | tail -1); sport=${sport:-81}
   echo
-  echo "  Der Dienst zeichnet dauerhaft auf: http://$(hostname -I 2>/dev/null | awk '{print $1}'):$sport/"
-  echo "  Bericht über den ganzen Zeitraum: curl -s http://127.0.0.1:$sport/api/report"
+  echo "  The service records continuously: http://$(hostname -I 2>/dev/null | awk '{print $1}'):$sport/"
+  echo "  Report over the whole period: curl -s http://127.0.0.1:$sport/api/report"
 fi
-echo "  Report: $OUT/report.txt   Messwerte: $CSV"
+echo "  Report: $OUT/report.txt   Samples: $CSV"
 exec >&- 2>&-
 wait "$TEE_PID" 2>/dev/null
